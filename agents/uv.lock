@@ -9,6 +9,7 @@ source = { virtual = "." }
 dependencies = [
     { name = "langchain-openai" },
     { name = "langgraph" },
+    { name = "letta-client" },
     { name = "openai" },
     { name = "python-dotenv" },
 ]
@@ -17,6 +18,7 @@ dependencies = [
 requires-dist = [
     { name = "langchain-openai", specifier = ">=1.1.10" },
     { name = "langgraph", specifier = ">=1.0.9" },
+    { name = "letta-client", specifier = ">=1.7.8" },
     { name = "openai", specifier = ">=2.21.0" },
     { name = "python-dotenv", specifier = ">=1.2.1" },
 ]
@@ -369,6 +371,23 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/22/b1/a1514b6fe33dc956bee1e6aba88470999d53a6ed02ec8fd14d6d409b8fb7/langsmith-0.7.6.tar.gz", hash = "sha256:e8646f8429d3c1641c7bae3c01bfdc3dfa27625994b0ef4303714d6b06fe1ef9", size = 1041741, upload-time = "2026-02-21T01:26:34.296Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/89/47/9865e5f0c49d74e3f4ea5697dadf11f2b9c9ae037f0bff599583ebe59189/langsmith-0.7.6-py3-none-any.whl", hash = "sha256:28d256584969db723b68189a7dbb065836572728ab4d9597ec5379fe0a1e1641", size = 325475, upload-time = "2026-02-21T01:26:32.504Z" },
+]
+
+[[package]]
+name = "letta-client"
+version = "1.7.8"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "anyio" },
+    { name = "distro" },
+    { name = "httpx" },
+    { name = "pydantic" },
+    { name = "sniffio" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/bf/90/566b0e3fa914065c04d8984646ed872c01a9490cfbb43a5833511d0a33e3/letta_client-1.7.8.tar.gz", hash = "sha256:51b30cb3ff57afac54a33796105aaaf0c9d7c97258682a89a5b38c1608696e1b", size = 259066, upload-time = "2026-02-05T05:45:38.698Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/4d/b3/2078258921022b97cbdcb4c333bc272dfb0744612ff0f47ea441a153496a/letta_client-1.7.8-py3-none-any.whl", hash = "sha256:00fbca1be82b0962ea3ea54c3c1317c04eaac50c1f033fc95c7b1d04c9007193", size = 378591, upload-time = "2026-02-05T05:45:37.188Z" },
 ]
 
 [[package]]
