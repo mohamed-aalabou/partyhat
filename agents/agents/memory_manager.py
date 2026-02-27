@@ -40,12 +40,15 @@ class MemoryManager:
         return agent
 
     def save_plan(self, plan: dict):
-        """Saving the current smart contract plan to Letta memory."""
+        """Save plan to both agent memory and global shared memory."""
         plan_json = json.dumps(plan, indent=2)
+
         self.client.agents.blocks.update(
             "current_plan", agent_id=self.agent.id, value=plan_json
         )
-        print("Plan saved to Letta memory!")
+        print("Plan saved to agent memory!")
+
+        self.save_to_global_memory(plan)
 
     def get_plan(self) -> dict | None:
         """Retrieving the current plan from Letta memory."""
@@ -60,6 +63,38 @@ class MemoryManager:
         self.client.agents.core_memory.update(
             agent_id=self.agent.id, label="user_context", value=context
         )
+
+    def _get_or_create_global_block(self):
+        """Getting or create from start a shared block accessible by all agents."""
+        # Checking here if the global block already exists
+        existing_blocks = self.client.blocks.list()
+        for block in existing_blocks:
+            if block.label == "global_contract_plan":
+                print(f"Found existing global block: global_contract_plan")
+                return block
+
+        # Creating new one
+        print("Creating global shared block: global_contract_plan")
+        block = self.client.blocks.create(
+            label="global_contract_plan", value="No plan yet.", limit=50000
+        )
+        return block
+
+    def save_to_global_memory(self, plan: dict):
+        """Save plan to global memory, will be accessible by ALL agents."""
+        plan_json = json.dumps(plan, indent=2)
+        global_block = self._get_or_create_global_block()
+
+        self.client.blocks.update(global_block.id, value=plan_json)
+        print("Plan saved to global memory; All agents can now access it!")
+
+    def get_from_global_memory(self) -> dict | None:
+        """Read plan from global memory."""
+        existing_blocks = self.client.blocks.list()
+        for block in existing_blocks:
+            if block.label == "global_contract_plan" and block.value != "No plan yet.":
+                return json.loads(block.value)
+        return None
 
 
 if __name__ == "__main__":
