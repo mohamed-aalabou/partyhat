@@ -78,6 +78,29 @@ Rules:
   and the ERC template confirmed.
 """
 
+UPDATE_SYSTEM_PROMPT = """You are PartyHat's smart contract planning assistant.
+The user has an EXISTING smart contract plan they want to modify.
+
+Here is their current plan:
+{current_plan}
+
+Your job is to:
+1. Understand what changes they want to make
+2. Ask ONE clarifying question at a time if needed
+3. Apply the changes to the existing plan
+4. Output the COMPLETE updated plan (not just the changes)
+
+Rules:
+- Keep everything from the original plan that the user didn't ask to change
+- Ask ONE question at a time if something is unclear
+- For well-known ERC standards, fill in standard details yourself
+- You are ONLY a smart contract planning assistant. Redirect off-topic questions.
+- When you have all the info needed, output EXACTLY this on its own line:
+  PLAN_READY
+  Then immediately output the complete updated plan as valid JSON with the same 
+  structure as the original.
+"""
+
 
 def chatbot(state: PlanningState) -> PlanningState:
     llm = ChatOpenAI(model="gpt-4o", temperature=0.3)
@@ -194,5 +217,89 @@ def run():
             break
 
 
+def update_plan():
+    print("\nPartyHat Plan Updater")
+    print("   (type 'quit' to exit)\n")
+
+    mm = MemoryManager()
+    existing_plan = mm.get_plan()
+
+    if not existing_plan:
+        print("No existing plan found in memory. Run the planning agent first!")
+        return
+
+    print("Found existing plan:")
+    print(f"   Project: {existing_plan['project_name']}")
+    print(f"   Contracts: {[c['name'] for c in existing_plan['contracts']]}")
+    print(
+        f"   Functions: {[f['name'] for c in existing_plan['contracts'] for f in c['functions']]}"
+    )
+    print("\nWhat would you like to change?\n")
+
+    app = build_graph()
+
+    filled_prompt = UPDATE_SYSTEM_PROMPT.format(
+        current_plan=json.dumps(existing_plan, indent=2)
+    )
+
+    state = {"messages": [], "plan_ready": False, "final_plan": None}
+
+    # Overriding system prompt for this session
+    import functools
+
+    original_chatbot = (
+        app.nodes["chatbot"].func if hasattr(app.nodes["chatbot"], "func") else None
+    )
+
+    def update_chatbot(state: PlanningState) -> PlanningState:
+        llm = ChatOpenAI(model="gpt-4o", temperature=0.3)
+        messages = [SystemMessage(content=filled_prompt)] + state["messages"]
+        response = llm.invoke(messages)
+        if "PLAN_READY" in response.content:
+            return {"messages": [response], "plan_ready": True, "final_plan": None}
+        return {"messages": [response], "plan_ready": False, "final_plan": None}
+
+    update_graph = StateGraph(PlanningState)
+    update_graph.add_node("chatbot", update_chatbot)
+    update_graph.add_node("extract_plan", extract_plan)
+    update_graph.set_entry_point("chatbot")
+    update_graph.add_conditional_edges(
+        "chatbot", should_continue, {"extract_plan": "extract_plan", "human_input": END}
+    )
+    update_graph.add_edge("extract_plan", END)
+    update_app = update_graph.compile()
+
+    state = update_app.invoke(state)
+    print(f"Agent: {state['messages'][-1].content}\n")
+
+    while not state.get("final_plan"):
+        user_input = input("You: ").strip()
+        if user_input.lower() == "quit":
+            break
+        if not user_input:
+            continue
+
+        state["messages"].append(HumanMessage(content=user_input))
+        state = update_app.invoke(state)
+
+        last_msg = state["messages"][-1]
+        if hasattr(last_msg, "content") and "PLAN_READY" not in last_msg.content:
+            print(f"\nAgent: {last_msg.content}\n")
+
+        if state.get("final_plan"):
+            print("\n" + "=" * 50)
+            print("Updated Plan Generated!")
+            print("=" * 50)
+            print(json.dumps(state["final_plan"], indent=2))
+            print("=" * 50)
+            mm.save_plan(state["final_plan"])
+            break
+
+
 if __name__ == "__main__":
-    run()
+    import sys
+
+    if len(sys.argv) > 1 and sys.argv[1] == "update":
+        update_plan()
+    else:
+        run()
