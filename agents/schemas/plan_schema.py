@@ -1,5 +1,20 @@
 from typing import Optional
-from pydantic import BaseModel, Field
+from enum import Enum
+from pydantic import BaseModel
+
+
+class PlanStatus(str, Enum):
+    """
+    Lifecycle status of a smart contract plan.
+    Rule: anything except 'deployed' can be freely edited by the user.
+    Once deployed to Avalanche, the contract is immutable.
+    """
+
+    DRAFT = "draft"  # Actively being planned
+    READY = "ready"  # Plan complete, Create agent can start
+    GENERATING = "generating"  # Code being generated
+    TESTING = "testing"  # Tests running
+    DEPLOYED = "deployed"  # On-chain, so locked forever?!
 
 
 # Functions inside a contract
@@ -24,7 +39,7 @@ class ContractFunction(BaseModel):
 
 # The constructor that runs once on deployment
 class Constructor(BaseModel):
-    inputs: list[FunctionInput]  # passed in at deployment time
+    inputs: list[FunctionInput]
     description: str
 
 
@@ -38,16 +53,18 @@ class ContractPlan(BaseModel):
     functions: list[ContractFunction]
 
 
-# Below is the full plan i.e top-level output of the planning agent
+# Top-level output of the planning agent
 class SmartContractPlan(BaseModel):
     project_name: str
     description: str
+    status: PlanStatus = PlanStatus.DRAFT  # always starts as draft
     contracts: list[ContractPlan]
 
 
 EXAMPLE_PLAN = SmartContractPlan(
     project_name="PartyToken",
     description="A simple ERC-20 token with minting and burning capabilities",
+    status=PlanStatus.DRAFT,
     contracts=[
         ContractPlan(
             name="PartyToken",

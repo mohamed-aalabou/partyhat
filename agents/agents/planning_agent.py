@@ -1,305 +1,157 @@
 import os
 import sys
-import json
+import uuid
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from dotenv import load_dotenv
-from typing import Annotated
-from typing_extensions import TypedDict
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
-from langgraph.graph import StateGraph, END
-from langgraph.graph.message import add_messages
-from schemas.plan_schema import SmartContractPlan
+from langchain_core.messages import HumanMessage, SystemMessage
+from langgraph.prebuilt import create_react_agent
+from langgraph.checkpoint.memory import MemorySaver
 
-from memory_manager import MemoryManager
+from agents.planning_tools import PLANNING_TOOLS
 
 load_dotenv()
 
 
-class PlanningState(TypedDict):
-    messages: Annotated[list, add_messages]
-    plan_ready: bool  # True once agent is done
-    final_plan: dict | None
+SYSTEM_PROMPT = """You are PartyHat's smart contract planning assistant.
+Your job is to help users design their smart contract by asking clear, simple
+questions ONE AT A TIME; like a friendly expert, not a form.
 
-
-SYSTEM_PROMPT = """You are PartyHat's smart contract planning assistant. 
-Your job is to help users design their smart contract by asking clear, 
-simple questions ONE AT A TIME like a friendly expert, not a form.
+You have access to tools. Use them actively and consciously:
+- At the start of EVERY conversation, call get_current_plan() to check if work exists
+- Call get_erc_standard() as soon as the user mentions or picks an ERC standard
+- Call save_plan_draft() after collecting each major piece of information. Do NOT wait until the end
+- Call save_reasoning_note() whenever a significant decision is made or clarified
+- Call validate_plan() when you believe you have a complete plan
+- Call publish_final_plan() ONLY after the user explicitly confirms they are happy
 
 Your goal is to collect:
 - Project name and what it does
-- Which ERC standard to use (ERC-20, ERC-721, ERC-1155, or custom)
-- What functions are needed (name, what it does, inputs, outputs, rules/conditions)
+- Which ERC standard (ERC-20, ERC-721, ERC-1155, or custom)
+- What functions are needed (name, description, inputs, outputs, conditions)
 - Constructor inputs (what gets set at deployment)
-- Any contract dependencies (like Ownable, or other contracts in the project)
+- Any dependencies (Ownable, other contracts, etc)
 
 Rules:
-- You are ONLY a smart contract planning assistant. If the user asks anything unrelated 
-  to their smart contract project (general blockchain questions, price questions, 
-  coding help etc), politely decline and redirect them back to planning their contract.
-  Example: "I'm focused on helping you plan your smart contract! Do you have a project 
-  in mind, or shall we continue with what we were working on?"
-- Ask ONE question at a time. Never ask multiple questions in one message.
-- Keep your messages short and conversational.
-- If the user provides all the necessary information in a single message (project name, 
-  ERC template, functions, supply/constructor details, and dependencies), skip the 
-  clarifying questions and output PLAN_READY with the JSON immediately.
-- When you have enough information to build a complete plan, output EXACTLY this on its own line:
-  PLAN_READY
-  Then immediately output the plan as a valid JSON object matching this structure:
-  {
-    "project_name": "...",
-    "description": "...",
-    "contracts": [
-      {
-        "name": "...",
-        "description": "...",
-        "erc_template": "ERC-20" or null,
-        "dependencies": ["..."],
-        "constructor": {
-          "description": "...",
-          "inputs": [{"name": "...", "type": "...", "description": "..."}]
-        },
-        "functions": [
-          {
-            "name": "...",
-            "description": "...",
-            "inputs": [{"name": "...", "type": "...", "description": "..."}],
-            "outputs": [{"type": "...", "description": "..."}],
-            "conditions": ["..."]
-          }
-        ]
-      }
-    ]
-  }
-- Do not output PLAN_READY until you have project name, at least one function, 
-  and the ERC template confirmed.
-"""
+- Ask ONE question at a time. Never ask multiple questions in one message
+- Keep messages short and conversational
+- You are ONLY a smart contract planning assistant; So politely redirect off-topic questions
+- For standard ERC functions, do NOT ask about them since they are already included in the standard
+- Use get_erc_standard() to know which functions are standard before asking about custom ones
+- Save drafts frequently; the user may leave and come back
 
-UPDATE_SYSTEM_PROMPT = """You are PartyHat's smart contract planning assistant.
-The user has an EXISTING smart contract plan they want to modify.
-
-Here is their current plan:
-{current_plan}
-
-Your job is to:
-1. Understand what changes they want to make
-2. Ask ONE clarifying question at a time if needed
-3. Apply the changes to the existing plan
-4. Output the COMPLETE updated plan (not just the changes)
-
-Rules:
-- Keep everything from the original plan that the user didn't ask to change
-- Ask ONE question at a time if something is unclear
-- For well-known ERC standards, fill in standard details yourself
-- You are ONLY a smart contract planning assistant. Redirect off-topic questions.
-- When you have all the info needed, output EXACTLY this on its own line:
-  PLAN_READY
-  Then immediately output the complete updated plan as valid JSON with the same 
-  structure as the original.
+The user can edit their plan at any time as long as the contract is not deployed on-chain.
+If they want changes, load the current plan, apply changes, validate, and save.
 """
 
 
-def chatbot(state: PlanningState) -> PlanningState:
+# Here the MemorySaver stores conversation state in RAM keyed by session_id (thread_id).
+# To swap this later for SqliteSaver or PostgresSaver.
+# The API layer will generate and manage session_ids.
+checkpointer = MemorySaver()
+
+
+def build_planning_agent():
     llm = ChatOpenAI(model="gpt-4o", temperature=0.3)
 
-    messages = [SystemMessage(content=SYSTEM_PROMPT)] + state["messages"]
-    response = llm.invoke(messages)
+    agent = create_react_agent(
+        model=llm,
+        tools=PLANNING_TOOLS,
+        prompt=SYSTEM_PROMPT,
+        checkpointer=checkpointer,  # persisting conversation history
+    )
 
-    if "PLAN_READY" in response.content:
-        return {
-            "messages": [response],
-            "plan_ready": True,
-            "final_plan": None,  # will extract in next step
-        }
-
-    return {"messages": [response], "plan_ready": False, "final_plan": None}
+    return agent
 
 
-# The extractor node
-def extract_plan(state: PlanningState) -> PlanningState:
-    last_message = state["messages"][-1].content
+def chat(
+    agent,
+    session_id: str,
+    user_message: str,
+) -> dict:
+    """
+    Args:
+        agent:        The compiled ReAct agent from build_planning_agent()
+        session_id:   Unique identifier for this user's session (from the API layer)
+        user_message: The user's latest message
 
-    # Handling both PLAN_READY signal and raw JSON/markdown code blocks
-    if "PLAN_READY" in last_message:
-        json_str = last_message.split("PLAN_READY")[-1].strip()
-    else:
-        json_str = last_message
-
-    if "```" in json_str:
-        json_str = json_str.split("```")[1]
-        if json_str.startswith("json"):
-            json_str = json_str[4:]
-
-    json_str = json_str.strip()
-
-    try:
-        raw = json.loads(json_str)
-        plan = SmartContractPlan(**raw)
-        return {"final_plan": plan.model_dump(), "plan_ready": True, "messages": []}
-    except Exception as e:
-        print(f"\n Could not parse plan: {e}")
-        return {"final_plan": None, "plan_ready": False, "messages": []}
-
-
-# A router to decide if we continue chatting or extract the plan already
-def should_continue(state: PlanningState) -> str:
-    last_message = state["messages"][-1].content
-    if (
-        state.get("plan_ready")
-        or "```json" in last_message
-        or "PLAN_READY" in last_message
-    ):
-        return "extract_plan"
-    return "human_input"
-
-
-def build_graph():
-    graph = StateGraph(PlanningState)
-
-    graph.add_node("chatbot", chatbot)
-    graph.add_node("extract_plan", extract_plan)
-
-    graph.set_entry_point("chatbot")
-
-    graph.add_conditional_edges(
-        "chatbot",
-        should_continue,
+    Returns:
         {
-            "extract_plan": "extract_plan",
-            "human_input": END,  # pausing and waiting for user input
-        },
+            "session_id": str,
+            "response": str,        (the agent's reply to show the user)
+            "tool_calls": list,     (which tools were called this turn (for debugging))
+        }
+    """
+    config = {
+        "configurable": {
+            "thread_id": session_id,
+        }
+    }
+
+    result = agent.invoke(
+        {"messages": [HumanMessage(content=user_message)]},
+        config=config,
     )
 
-    graph.add_edge("extract_plan", END)
+    final_message = result["messages"][-1]
+    response_text = final_message.content
 
-    return graph.compile()
+    tool_calls_made = []
+    for msg in result["messages"]:
+        if hasattr(msg, "tool_calls") and msg.tool_calls:
+            for tc in msg.tool_calls:
+                tool_calls_made.append(tc["name"])
+
+    return {
+        "session_id": session_id,
+        "response": response_text,
+        "tool_calls": tool_calls_made,
+    }
 
 
-def run():
-    print("\nWelcome to PartyHat! I'll help you plan your smart contract.")
-    print("   (type 'quit' to exit)\n")
+# CLI runner for local testing only
+def run_cli():
+    """
+    Simple CLI interface for testing the agent locally.
+    """
+    print("\nPartyHat Planning Agent")
+    print("  Type 'quit' to exit")
+    print("  Type 'new' to start a fresh session\n")
 
-    app = build_graph()
-    state = {"messages": [], "plan_ready": False, "final_plan": None}
+    agent = build_planning_agent()
+    session_id = str(uuid.uuid4())
+    print(f"Session ID: {session_id}\n")
 
-    state = app.invoke(state)
-    print(f"Agent: {state['messages'][-1].content}\n")
+    result = chat(agent, session_id, "Hello, I want to plan a smart contract.")
+    print(f"Agent: {result['response']}")
+    if result["tool_calls"]:
+        print(f"  [tools called: {', '.join(result['tool_calls'])}]")
+    print()
 
-    while not state.get("plan_ready") or state.get("final_plan") is None:
+    while True:
         user_input = input("You: ").strip()
-
-        if user_input.lower() == "quit":
-            print("See you later!")
-            break
 
         if not user_input:
             continue
 
-        state["messages"].append(HumanMessage(content=user_input))
-        state = app.invoke(state)
-
-        last_msg = state["messages"][-1]
-        if hasattr(last_msg, "content") and "PLAN_READY" not in last_msg.content:
-            print(f"\nAgent: {last_msg.content}\n")
-
-        if state.get("final_plan"):
-            print("\n" + "=" * 50)
-            print("Smart Contract Plan Generated!")
-            print("=" * 50)
-            print(json.dumps(state["final_plan"], indent=2))
-            print("=" * 50)
-
-            mm = MemoryManager()
-            mm.save_plan(state["final_plan"])
-            break
-
-
-def update_plan():
-    print("\nPartyHat Plan Updater")
-    print("   (type 'quit' to exit)\n")
-
-    mm = MemoryManager()
-    existing_plan = mm.get_plan()
-
-    if not existing_plan:
-        print("No existing plan found in memory. Run the planning agent first!")
-        return
-
-    print("Found existing plan:")
-    print(f"   Project: {existing_plan['project_name']}")
-    print(f"   Contracts: {[c['name'] for c in existing_plan['contracts']]}")
-    print(
-        f"   Functions: {[f['name'] for c in existing_plan['contracts'] for f in c['functions']]}"
-    )
-    print("\nWhat would you like to change?\n")
-
-    app = build_graph()
-
-    filled_prompt = UPDATE_SYSTEM_PROMPT.format(
-        current_plan=json.dumps(existing_plan, indent=2)
-    )
-
-    state = {"messages": [], "plan_ready": False, "final_plan": None}
-
-    # Overriding system prompt for this session
-    import functools
-
-    original_chatbot = (
-        app.nodes["chatbot"].func if hasattr(app.nodes["chatbot"], "func") else None
-    )
-
-    def update_chatbot(state: PlanningState) -> PlanningState:
-        llm = ChatOpenAI(model="gpt-4o", temperature=0.3)
-        messages = [SystemMessage(content=filled_prompt)] + state["messages"]
-        response = llm.invoke(messages)
-        if "PLAN_READY" in response.content:
-            return {"messages": [response], "plan_ready": True, "final_plan": None}
-        return {"messages": [response], "plan_ready": False, "final_plan": None}
-
-    update_graph = StateGraph(PlanningState)
-    update_graph.add_node("chatbot", update_chatbot)
-    update_graph.add_node("extract_plan", extract_plan)
-    update_graph.set_entry_point("chatbot")
-    update_graph.add_conditional_edges(
-        "chatbot", should_continue, {"extract_plan": "extract_plan", "human_input": END}
-    )
-    update_graph.add_edge("extract_plan", END)
-    update_app = update_graph.compile()
-
-    state = update_app.invoke(state)
-    print(f"Agent: {state['messages'][-1].content}\n")
-
-    while not state.get("final_plan"):
-        user_input = input("You: ").strip()
         if user_input.lower() == "quit":
+            print("Session ended.")
             break
-        if not user_input:
-            continue
 
-        state["messages"].append(HumanMessage(content=user_input))
-        state = update_app.invoke(state)
+        if user_input.lower() == "new":
+            session_id = str(uuid.uuid4())
+            print(f"\nNew session started: {session_id}\n")
+            result = chat(agent, session_id, "Hello, I want to plan a smart contract.")
+        else:
+            result = chat(agent, session_id, user_input)
 
-        last_msg = state["messages"][-1]
-        if hasattr(last_msg, "content") and "PLAN_READY" not in last_msg.content:
-            print(f"\nAgent: {last_msg.content}\n")
-
-        if state.get("final_plan"):
-            print("\n" + "=" * 50)
-            print("Updated Plan Generated!")
-            print("=" * 50)
-            print(json.dumps(state["final_plan"], indent=2))
-            print("=" * 50)
-            mm.save_plan(state["final_plan"])
-            break
+        print(f"\nAgent: {result['response']}")
+        if result["tool_calls"]:
+            print(f"  [tools called: {', '.join(result['tool_calls'])}]")
+        print()
 
 
 if __name__ == "__main__":
-    import sys
-
-    if len(sys.argv) > 1 and sys.argv[1] == "update":
-        update_plan()
-    else:
-        run()
+    run_cli()
