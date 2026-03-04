@@ -11,6 +11,8 @@ Tools defined here:
 
 import sys
 import os
+import asyncio
+from typing import List
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -238,6 +240,9 @@ def save_reasoning_note(note: str) -> dict:
         return {"error": f"Could not save reasoning note: {str(e)}"}
 
 
+# Default planning tools; MCP tools can be injected at runtime.
+_mcp_tools: List = []
+
 PLANNING_TOOLS = [
     get_current_plan,
     save_plan_draft,
@@ -245,3 +250,49 @@ PLANNING_TOOLS = [
     publish_final_plan,
     save_reasoning_note,
 ]
+
+
+async def load_planning_tools() -> List:
+    """
+    Async helper to load OpenZeppelin MCP tools via MultiServerMCPClient.
+
+    This should be called from an async context (e.g. FastAPI startup event),
+    not at import time.
+    """
+    try:
+        from langchain_mcp_adapters.client import MultiServerMCPClient
+
+        client = MultiServerMCPClient(
+            {
+                "openzeppelin": {
+                    "transport": "http",
+                    "url": "https://mcp.openzeppelin.com/contracts/solidity/mcp",
+                }
+            }
+        )
+
+        tools = await client.get_tools(server_name="openzeppelin")
+        # Log tool names for visibility
+        tool_names = [getattr(t, "name", repr(t)) for t in tools]
+        print("OpenZeppelin MCP tools loaded:", tool_names)
+        return tools
+    except Exception as e:
+        print(f"Warning: OpenZeppelin MCP tools could not be loaded: {e}")
+        return []
+
+
+def set_planning_mcp_tools(tools: List) -> None:
+    """
+    Inject MCP tools into the global PLANNING_TOOLS list.
+
+    Call this after load_planning_tools() has completed.
+    """
+    global _mcp_tools, PLANNING_TOOLS
+    _mcp_tools = tools or []
+    PLANNING_TOOLS = _mcp_tools + [
+        get_current_plan,
+        save_plan_draft,
+        validate_plan,
+        publish_final_plan,
+        save_reasoning_note,
+    ]

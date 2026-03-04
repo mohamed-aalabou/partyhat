@@ -8,6 +8,13 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from dotenv import load_dotenv
 from letta_client import Letta
 
+try:
+    # Prefer TOON for token-efficient storage, but fall back to JSON if unavailable
+    from toon import encode as toon_encode, decode as toon_decode
+except Exception:  # pragma: no cover - extremely unlikely in production environment
+    toon_encode = None  # type: ignore[assignment]
+    toon_decode = None  # type: ignore[assignment]
+
 load_dotenv(
     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
 )
@@ -25,6 +32,44 @@ class MemoryManager:
         self.user_block_label = f"user:{user_id}"
         self.global_block_label = "global_agent_log"
 
+    def _serialize(self, data: dict) -> str:
+        """
+        Serialize the in-memory JSON-compatible dict to a string.
+
+        Prefers TOON for token-efficiency, but falls back to JSON. Also used by
+        other agent tools when they update the shared user block.
+        """
+        if toon_encode is not None:
+            try:
+                return toon_encode(data)
+            except Exception:
+                # If TOON encoding fails for any reason, fall back to JSON
+                return json.dumps(data, indent=2)
+        return json.dumps(data, indent=2)
+
+    def _deserialize(self, value: str) -> dict:
+        """
+        Parse the stored string value back into a JSON-compatible dict.
+
+        Supports both TOON (preferred for new data) and legacy JSON-encoded
+        blocks for backwards compatibility.
+        """
+        if not value:
+            return {}
+
+        if toon_decode is not None:
+            try:
+                return toon_decode(value)
+            except Exception:
+                # Backwards-compatibility path for existing JSON blocks
+                try:
+                    return json.loads(value)
+                except Exception:
+                    # If neither decoder works, propagate the original error
+                    raise
+
+        return json.loads(value)
+
     def _get_or_create_user_block(self):
         """Get or create the user-scoped memory block."""
         existing = self.client.blocks.list()
@@ -33,35 +78,144 @@ class MemoryManager:
                 return block
 
         print(f"Creating user memory block: {self.user_block_label}")
+        initial_value = {
+            # Who the user is — for the AI to personalise interactions
+            "user_id": self.user_id,
+            "profile": {
+                "name": None,
+                "experience_level": None,  # "beginner", "intermediate", "expert"
+                "preferred_language": None,
+            },
+            # AI-relevant preferences that will be learned over time
+            "preferences": {
+                "preferred_erc": None,
+                "preferred_license": None,
+                "preferred_chain": None,
+            },
+            # Per-agent state slices
+            "agents": {
+                # Planning agent state (backwards-compatible with previous layout)
+                "planning": {
+                    "current_plan": None,
+                    "plan_history": [],
+                    "reasoning_notes": [],
+                    "sessions": [],
+                },
+                # Additional agents can extend these sections as needed
+                "coding": {
+                    "artifacts": [],
+                    "sessions": [],
+                    "notes": [],
+                },
+                "testing": {
+                    "test_plans": [],
+                    "last_test_results": [],
+                    "sessions": [],
+                },
+                "deployment": {
+                    "targets": [],
+                    "deployments": [],
+                    "sessions": [],
+                },
+                "audit": {
+                    "issues": [],
+                    "risk_notes": [],
+                    "sessions": [],
+                },
+            },
+        }
+
         return self.client.blocks.create(
             label=self.user_block_label,
-            value=json.dumps(
-                {
-                    # Who the user is — for the AI to personalise interactions
-                    "user_id": self.user_id,
-                    "profile": {
-                        "name": None,
-                        "experience_level": None,  # "beginner", "intermediate", "expert"
-                        "preferred_language": None,
-                    },
-                    # AI-relevant preferences that will be learned over time
-                    "preferences": {
-                        "preferred_erc": None,
-                        "preferred_license": None,
-                        "preferred_chain": None,
-                    },
-                    # User's current active plan
-                    "current_plan": None,
-                    # History of all previous plan versions
-                    "plan_history": [],
-                    # Some reasoning notes i.e WHY decisions were made across all sessions
-                    "reasoning_notes": [],
-                    # Session history i.e summary of each past session
-                    "sessions": [],
-                }
-            ),
+            value=self._serialize(initial_value),
             limit=50000,
         )
+
+    def _ensure_agents_structure(self, data: dict) -> None:
+        """
+        Ensure that the 'agents' container and known agent slices exist.
+        Also performs a light, backwards-compatible migration from the old
+        top-level planning keys into agents['planning'] if present.
+        """
+        agents = data.setdefault("agents", {})
+
+        planning_state = agents.setdefault(
+            "planning",
+            {
+                "current_plan": None,
+                "plan_history": [],
+                "reasoning_notes": [],
+                "sessions": [],
+            },
+        )
+
+        # Backwards-compatibility: migrate legacy top-level planning fields
+        if "current_plan" in data and planning_state.get("current_plan") is None:
+            planning_state["current_plan"] = data.get("current_plan")
+        if "plan_history" in data and not planning_state.get("plan_history"):
+            planning_state["plan_history"] = data.get("plan_history", [])
+        if "reasoning_notes" in data and not planning_state.get("reasoning_notes"):
+            planning_state["reasoning_notes"] = data.get("reasoning_notes", [])
+        if "sessions" in data and not planning_state.get("sessions"):
+            planning_state["sessions"] = data.get("sessions", [])
+
+        agents.setdefault(
+            "coding",
+            {
+                "artifacts": [],
+                "sessions": [],
+                "notes": [],
+            },
+        )
+        agents.setdefault(
+            "testing",
+            {
+                "test_plans": [],
+                "last_test_results": [],
+                "sessions": [],
+            },
+        )
+        agents.setdefault(
+            "deployment",
+            {
+                "targets": [],
+                "deployments": [],
+                "sessions": [],
+            },
+        )
+        agents.setdefault(
+            "audit",
+            {
+                "issues": [],
+                "risk_notes": [],
+                "sessions": [],
+            },
+        )
+
+    def _get_agent_state(self, data: dict, agent_name: str) -> dict:
+        """
+        Return the mutable state dict for a given agent inside the user block,
+        ensuring the agents container exists.
+        """
+        self._ensure_agents_structure(data)
+        return data["agents"].setdefault(agent_name, {})
+
+    def get_agent_state(self, agent_name: str) -> dict:
+        """
+        Public helper to read the state slice for a given agent.
+        """
+        data, _ = self._read_user_block()
+        self._ensure_agents_structure(data)
+        return data["agents"].get(agent_name, {})
+
+    def set_agent_state(self, agent_name: str, state: dict) -> None:
+        """
+        Public helper to replace the state slice for a given agent.
+        """
+        data, block = self._read_user_block()
+        self._ensure_agents_structure(data)
+        data["agents"][agent_name] = state
+        self.client.blocks.update(block.id, value=self._serialize(data))
 
     def _get_or_create_global_block(self):
         """
@@ -76,19 +230,19 @@ class MemoryManager:
         print(f"Creating global memory block: {self.global_block_label}")
         return self.client.blocks.create(
             label=self.global_block_label,
-            value=json.dumps({"agent_log": []}),
+            value=self._serialize({"agent_log": []}),
             limit=100000,
         )
 
     def _read_user_block(self):
         """Read and parse the user block. Returns (data dict, block object)."""
         block = self._get_or_create_user_block()
-        return json.loads(block.value), block
+        return self._deserialize(block.value), block
 
     def _read_global_block(self):
         """Read and parse the global block. Returns (data dict, block object)."""
         block = self._get_or_create_global_block()
-        return json.loads(block.value), block
+        return self._deserialize(block.value), block
 
     def save_plan(self, plan: dict) -> None:
         """
@@ -99,28 +253,34 @@ class MemoryManager:
             plan: The SmartContractPlan as a dict (from model.model_dump())
         """
         data, block = self._read_user_block()
+        planning_state = self._get_agent_state(data, "planning")
 
-        # Archiving the previous plan before overwriting
-        if data["current_plan"] is not None:
-            data["plan_history"].append(
+        if planning_state.get("current_plan") is not None:
+            planning_state.setdefault("plan_history", [])
+            planning_state["plan_history"].append(
                 {
                     "archived_at": datetime.utcnow().isoformat(),
-                    "plan": data["current_plan"],
+                    "plan": planning_state["current_plan"],
                 }
             )
 
-        data["current_plan"] = plan
-        self.client.blocks.update(block.id, value=json.dumps(data, indent=2))
+        planning_state["current_plan"] = plan
+        self.client.blocks.update(block.id, value=self._serialize(data))
 
     def get_plan(self) -> dict | None:
         """Retrieve the current plan from user memory."""
         data, _ = self._read_user_block()
-        return data.get("current_plan")
+        self._ensure_agents_structure(data)
+        planning_state = data["agents"]["planning"]
+        # Prefer the agent slice but fall back to legacy top-level key
+        return planning_state.get("current_plan") or data.get("current_plan")
 
     def get_plan_history(self) -> list:
         """Retrieve all previous versions of the plan."""
         data, _ = self._read_user_block()
-        return data.get("plan_history", [])
+        self._ensure_agents_structure(data)
+        planning_state = data["agents"]["planning"]
+        return planning_state.get("plan_history") or data.get("plan_history", [])
 
     def save_user_profile(
         self,
@@ -138,7 +298,7 @@ class MemoryManager:
         if preferred_language is not None:
             data["profile"]["preferred_language"] = preferred_language
 
-        self.client.blocks.update(block.id, value=json.dumps(data, indent=2))
+        self.client.blocks.update(block.id, value=self._serialize(data))
 
     def get_user_profile(self) -> dict:
         data, _ = self._read_user_block()
@@ -148,7 +308,7 @@ class MemoryManager:
 
         data, block = self._read_user_block()
         data["preferences"][key] = value
-        self.client.blocks.update(block.id, value=json.dumps(data, indent=2))
+        self.client.blocks.update(block.id, value=self._serialize(data))
 
     def get_user_preferences(self) -> dict:
         data, _ = self._read_user_block()
@@ -163,32 +323,42 @@ class MemoryManager:
             note: Plain English explanation of a decision or preference
         """
         data, block = self._read_user_block()
-        data["reasoning_notes"].append(
+        planning_state = self._get_agent_state(data, "planning")
+        planning_state.setdefault("reasoning_notes", [])
+        planning_state["reasoning_notes"].append(
             {
                 "timestamp": datetime.utcnow().isoformat(),
                 "note": note,
             }
         )
-        self.client.blocks.update(block.id, value=json.dumps(data, indent=2))
+        self.client.blocks.update(block.id, value=self._serialize(data))
 
     def get_reasoning_notes(self) -> list:
         data, _ = self._read_user_block()
-        return data.get("reasoning_notes", [])
+        self._ensure_agents_structure(data)
+        planning_state = data["agents"]["planning"]
+        return planning_state.get("reasoning_notes") or data.get(
+            "reasoning_notes", []
+        )
 
     def save_session_summary(self, summary: str) -> None:
 
         data, block = self._read_user_block()
-        data["sessions"].append(
+        planning_state = self._get_agent_state(data, "planning")
+        planning_state.setdefault("sessions", [])
+        planning_state["sessions"].append(
             {
                 "timestamp": datetime.utcnow().isoformat(),
                 "summary": summary,
             }
         )
-        self.client.blocks.update(block.id, value=json.dumps(data, indent=2))
+        self.client.blocks.update(block.id, value=self._serialize(data))
 
     def get_session_history(self) -> list:
         data, _ = self._read_user_block()
-        return data.get("sessions", [])
+        self._ensure_agents_structure(data)
+        planning_state = data["agents"]["planning"]
+        return planning_state.get("sessions") or data.get("sessions", [])
 
     def log_agent_action(
         self,
@@ -234,7 +404,7 @@ class MemoryManager:
             }
         )
 
-        self.client.blocks.update(block.id, value=json.dumps(data, indent=2))
+        self.client.blocks.update(block.id, value=self._serialize(data))
 
     def get_global_log(self) -> list:
         data, _ = self._read_global_block()

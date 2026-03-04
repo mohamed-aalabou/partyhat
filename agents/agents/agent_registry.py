@@ -1,21 +1,29 @@
 import os
 import sys
-import uuid
+from typing import Dict
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
-from langgraph.checkpoint.memory import MemorySaver
+
 from deepagents import create_deep_agent
+from langgraph.checkpoint.memory import MemorySaver
 
 from agents.planning_tools import PLANNING_TOOLS
+from agents.coding_tools import CODING_TOOLS
+from agents.testing_tools import TESTING_TOOLS
+from agents.deployment_tools import DEPLOYMENT_TOOLS
+from agents.audit_tools import AUDIT_TOOLS
 
 load_dotenv()
 
 
-SYSTEM_PROMPT = """You are PartyHat's smart contract planning assistant.
+CHECKPOINTER = MemorySaver()
+
+
+PLANNING_SYSTEM_PROMPT = """You are PartyHat's smart contract planning assistant.
 Your job is to help users design their smart contract by asking clear, simple
 questions ONE AT A TIME, like a friendly expert, not a form.
 
@@ -57,37 +65,77 @@ Rules:
   deployed on-chain
 """
 
+CODING_SYSTEM_PROMPT = """You are PartyHat's coding assistant.
+You generate and refine smart contract code based on the approved plan,
+using tools to persist artifacts and important coding notes.
+"""
 
-checkpointer = MemorySaver()
+TESTING_SYSTEM_PROMPT = """You are PartyHat's testing assistant.
+You design and interpret tests for smart contracts, using tools to manage
+test plans and test run results.
+"""
+
+DEPLOYMENT_SYSTEM_PROMPT = """You are PartyHat's deployment assistant.
+You help plan and track on-chain deployments of smart contracts, using tools
+to manage deployment targets and deployment records.
+"""
+
+AUDIT_SYSTEM_PROMPT = """You are PartyHat's audit assistant.
+You identify and track potential security and correctness issues in smart
+contracts, using tools to manage audit issues and reports.
+"""
+
+
+def _build_agent(tools, system_prompt: str):
+    llm = ChatOpenAI(model="gpt-5.2-2025-12-11", temperature=0.3)
+    return create_deep_agent(
+        model=llm,
+        tools=tools,
+        system_prompt=system_prompt,
+        checkpointer=CHECKPOINTER,
+    )
 
 
 def build_planning_agent():
-    llm = ChatOpenAI(model="gpt-5.2-2025-12-11", temperature=0.3)
-
-    agent = create_deep_agent(
-        model=llm,
-        tools=PLANNING_TOOLS,
-        system_prompt=SYSTEM_PROMPT,
-        checkpointer=checkpointer,
-    )
-
-    return agent
+    return _build_agent(PLANNING_TOOLS, PLANNING_SYSTEM_PROMPT)
 
 
-def chat(agent, session_id: str, user_message: str) -> dict:
+def build_coding_agent():
+    return _build_agent(CODING_TOOLS, CODING_SYSTEM_PROMPT)
+
+
+def build_testing_agent():
+    return _build_agent(TESTING_TOOLS, TESTING_SYSTEM_PROMPT)
+
+
+def build_deployment_agent():
+    return _build_agent(DEPLOYMENT_TOOLS, DEPLOYMENT_SYSTEM_PROMPT)
+
+
+def build_audit_agent():
+    return _build_agent(AUDIT_TOOLS, AUDIT_SYSTEM_PROMPT)
+
+
+AGENTS: Dict[str, object] = {
+    "planning": build_planning_agent(),
+    "coding": build_coding_agent(),
+    "testing": build_testing_agent(),
+    "deployment": build_deployment_agent(),
+    "audit": build_audit_agent(),
+}
+
+
+def get_agent_for_intent(intent: str):
+    if intent not in AGENTS:
+        raise ValueError(f"Unknown intent: {intent}")
+    return AGENTS[intent]
+
+
+def chat_with_intent(intent: str, session_id: str, user_message: str) -> dict:
     """
-    Args:
-        agent:        Compiled deep agent from build_planning_agent()
-        session_id:   Unique ID for this user's session
-        user_message: The user's latest message
-
-    Returns:
-        {
-            "session_id": str,
-            "response":   str,   agent's reply to show the user
-            "tool_calls": list,  which tools were called this turn
-        }
+    Route a message to the appropriate deep agent based on the intent.
     """
+    agent = get_agent_for_intent(intent)
     config = {"configurable": {"thread_id": session_id}}
 
     result = agent.invoke(
@@ -110,41 +158,3 @@ def chat(agent, session_id: str, user_message: str) -> dict:
         "tool_calls": tool_calls_made,
     }
 
-
-def run_cli():
-    print("\nPartyHat Planning Agent (Deep Agent)")
-    print("  Type 'quit' to exit")
-    print("  Type 'new' to start a fresh session\n")
-
-    agent = build_planning_agent()
-    session_id = str(uuid.uuid4())
-    print(f"Session ID: {session_id}\n")
-
-    result = chat(agent, session_id, "Hello, I want to plan a smart contract.")
-    print(f"Agent: {result['response']}")
-    if result["tool_calls"]:
-        print(f"  [tools called: {', '.join(result['tool_calls'])}]")
-    print()
-
-    while True:
-        user_input = input("You: ").strip()
-        if not user_input:
-            continue
-        if user_input.lower() == "quit":
-            print("Session ended.")
-            break
-        if user_input.lower() == "new":
-            session_id = str(uuid.uuid4())
-            print(f"\nNew session started: {session_id}\n")
-            result = chat(agent, session_id, "Hello, I want to plan a smart contract.")
-        else:
-            result = chat(agent, session_id, user_input)
-
-        print(f"\nAgent: {result['response']}")
-        if result["tool_calls"]:
-            print(f"  [tools called: {', '.join(result['tool_calls'])}]")
-        print()
-
-
-if __name__ == "__main__":
-    run_cli()

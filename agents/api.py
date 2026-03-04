@@ -11,8 +11,10 @@ from pydantic import BaseModel
 from typing import Optional
 
 from agents.planning_agent import build_planning_agent, chat
+from agents.agent_registry import chat_with_intent
 from agents.memory_manager import MemoryManager
 from schemas.plan_schema import PlanStatus
+from agents.planning_tools import load_planning_tools, set_planning_mcp_tools
 
 load_dotenv()
 
@@ -34,6 +36,16 @@ app.add_middleware(
 
 planning_agent = build_planning_agent()
 memory_manager = MemoryManager()
+
+
+@app.on_event("startup")
+async def load_mcp_tools_startup() -> None:
+    """
+    FastAPI startup hook to load OpenZeppelin MCP tools and inject them
+    into the global PLANNING_TOOLS used by the planning agent.
+    """
+    tools = await load_planning_tools()
+    set_planning_mcp_tools(tools)
 
 
 class StartSessionResponse(BaseModel):
@@ -65,6 +77,12 @@ class ApproveRequest(BaseModel):
 class ApproveResponse(BaseModel):
     session_id: str
     success: bool
+    message: str
+
+
+class RoutedMessageRequest(BaseModel):
+    session_id: str
+    intent: str
     message: str
 
 
@@ -163,3 +181,28 @@ async def approve_plan(request: ApproveRequest):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Could not approve plan: {str(e)}")
+
+
+@app.post("/agent/message", response_model=MessageResponse)
+async def routed_message(request: RoutedMessageRequest):
+    """
+    Generic entrypoint that routes the message to the appropriate agent based on intent.
+    """
+    if not request.message.strip():
+        raise HTTPException(status_code=400, detail="Message cannot be empty")
+
+    try:
+        result = chat_with_intent(
+            intent=request.intent,
+            session_id=request.session_id,
+            user_message=request.message,
+        )
+        return MessageResponse(
+            session_id=result["session_id"],
+            response=result["response"],
+            tool_calls=result["tool_calls"],
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Agent error: {str(e)}")
