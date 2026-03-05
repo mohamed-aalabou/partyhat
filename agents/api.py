@@ -8,13 +8,15 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List, Dict, Any
 
 from agents.planning_agent import build_planning_agent, chat
 from agents.agent_registry import chat_with_intent
 from agents.memory_manager import MemoryManager
 from schemas.plan_schema import PlanStatus
 from agents.planning_tools import load_planning_tools, set_planning_mcp_tools
+from schemas.coding_schema import CodeGenerationRequest
+from agents.coding_tools import generate_solidity_code_direct
 
 load_dotenv()
 
@@ -86,6 +88,15 @@ class RoutedMessageRequest(BaseModel):
     message: str
 
 
+class CodeGenerationResponse(BaseModel):
+    generated_code: str
+    goal: str
+
+
+class CodeArtifactsResponse(BaseModel):
+    artifacts: List[Dict[str, Any]]
+
+
 @app.get("/health")
 def health_check():
     return {"status": "ok", "service": "partyhat-agents"}
@@ -154,6 +165,23 @@ async def get_current_plan(session_id: str):
         )
 
 
+@app.get("/coding/current", response_model=CodeArtifactsResponse)
+async def get_current_code_artifacts(session_id: str):
+    """
+    Return the current list of code artifacts for this user.
+    Mirrors the behavior of get_current_artifacts() from coding_tools.
+    """
+    try:
+        state = memory_manager.get_agent_state("coding")
+        artifacts = state.get("artifacts", [])
+        return CodeArtifactsResponse(artifacts=artifacts)
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not retrieve code artifacts: {str(e)}",
+        )
+
+
 @app.post("/plan/approve", response_model=ApproveResponse)
 async def approve_plan(request: ApproveRequest):
 
@@ -206,3 +234,29 @@ async def routed_message(request: RoutedMessageRequest):
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Agent error: {str(e)}")
+
+
+@app.post("/coding/generate", response_model=CodeGenerationResponse)
+async def generate_solidity_endpoint(request: CodeGenerationRequest):
+    """
+    Lightweight endpoint to exercise the generate_solidity_code tool directly.
+
+    This bypasses the deep agent graph and allows quick testing of the
+    underlying Hugging Face-based Solidity generator.
+    """
+    if not request.goal.strip():
+        raise HTTPException(status_code=400, detail="Goal cannot be empty")
+
+    try:
+        # Call the direct helper, which encapsulates all generation logic.
+        result = generate_solidity_code_direct(request)
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Code generation failed: {str(e)}"
+        )
+
+    if isinstance(result, dict) and "error" in result:
+        raise HTTPException(status_code=500, detail=result["error"])
+
+    generated = result.get("generated_code", "")
+    return CodeGenerationResponse(generated_code=generated, goal=request.goal)

@@ -1,13 +1,15 @@
 import os
 import sys
-import json
-from typing import List
+from typing import List, Dict, Any
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from langchain_core.tools import tool
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage
 
 from schemas.coding_schema import CodeArtifact, CodeGenerationRequest
+from agents.code_storage import LocalCodeStorage
 
 
 def _get_memory_manager(user_id: str = "default"):
@@ -16,10 +18,85 @@ def _get_memory_manager(user_id: str = "default"):
     return MemoryManager(user_id=user_id)
 
 
+def generate_solidity_code_direct(request: CodeGenerationRequest) -> dict:
+    """
+    Direct helper for Solidity generation used outside the tool graph.
+
+    This function contains the core generation logic and is safe to call
+    directly from HTTP endpoints or other Python code. It calls an OpenAI
+    chat model to generate Solidity code, rather than going through the
+    /coding/generate HTTP endpoint or an external inference service.
+    """
+    constraints_section = ""
+    if request.constraints:
+        joined = "\n".join(f"- {c}" for c in request.constraints)
+        constraints_section = f"\n\nConstraints:\n{joined}"
+
+    prompt = (
+        "You are a Solidity expert. Generate production-grade Solidity code "
+        "that satisfies the following goal.\n\n"
+        f"Goal:\n{request.goal}{constraints_section}\n\n"
+        "Output only Solidity code, with SPDX license identifier, pragma, "
+        "imports, contract definitions, and any necessary comments. Do not "
+        "include explanations or markdown fences, return only raw Solidity."
+    )
+
+    model_name = os.getenv("SOLIDITY_MODEL", "gpt-5.2-2025-12-11")
+    llm = ChatOpenAI(model=model_name, temperature=0.1)
+
+    try:
+        response = llm.invoke([HumanMessage(content=prompt)])
+        generated_text = response.content or ""
+    except Exception as e:
+        return {"error": f"Failed to call Solidity generation model: {str(e)}"}
+
+    return {
+        "goal": request.goal,
+        "generated_code": generated_text,
+    }
+
+
+def get_current_plan() -> dict:
+    """
+    Retrieve the current smart contract plan draft from memory.
+
+    Call this tool:
+    - At the start of EVERY conversation to check if a plan already exists
+    - When the user asks to continue or modify an existing plan
+    - Before saving a new draft to understand the current state
+    - When resuming after a session gap
+
+    Returns the plan as a dict, or an empty dict if no plan exists yet.
+    """
+    try:
+        mm = _get_memory_manager()
+        plan = mm.get_plan()
+        if plan:
+            return plan
+        return {"message": "No plan exists yet. This is a fresh start."}
+    except Exception as e:
+        return {"error": f"Could not retrieve plan: {str(e)}"}
+
+
+@tool
+def generate_solidity_code(request: CodeGenerationRequest) -> dict:
+    """
+    Tool wrapper around the direct Solidity generation helper.
+
+    This allows the coding agent to call the generator while reusing the
+    same core implementation used by the HTTP endpoint.
+    """
+    return generate_solidity_code_direct(request)
+
+
 @tool
 def get_current_artifacts() -> dict:
     """
-    Retrieve the current list of code artifacts for this user.
+    Retrieve the current list of metadata-only code artifacts for this user.
+
+    The returned artifacts describe where code is stored (paths/keys),
+    along with lightweight metadata such as descriptions and contract names.
+    Full source blobs are not stored in memory.
     """
     try:
         mm = _get_memory_manager()
@@ -34,7 +111,12 @@ def get_current_artifacts() -> dict:
 @tool
 def save_code_artifact(artifact: CodeArtifact) -> dict:
     """
-    Save or update a code artifact in the coding agent's state.
+    Persist generated code via the storage backend and record metadata in memory.
+
+    Expected usage:
+    - Callers provide a CodeArtifact that may include a transient ``code`` field.
+    - This tool writes the code to disk using LocalCodeStorage.
+    - Only metadata (no code blobs) is appended to the coding agent's artifacts.
     """
     try:
         mm = _get_memory_manager()
@@ -42,8 +124,18 @@ def save_code_artifact(artifact: CodeArtifact) -> dict:
         mm._ensure_agents_structure(data)  # type: ignore[attr-defined]
         coding_state = data["agents"]["coding"]
 
-        artifacts: List[dict] = coding_state.get("artifacts", [])
-        artifacts.append(artifact.model_dump())
+        storage = LocalCodeStorage()
+
+        # Write code to storage if provided, then build a metadata-only record.
+        raw = artifact.model_dump()
+        code = raw.pop("code", None)
+
+        if code:
+            stored_path = storage.save_code(artifact, code)
+            raw["path"] = stored_path
+
+        artifacts: List[Dict[str, Any]] = coding_state.get("artifacts", [])
+        artifacts.append(raw)
         coding_state["artifacts"] = artifacts
 
         mm.client.blocks.update(  # type: ignore[attr-defined]
@@ -54,14 +146,31 @@ def save_code_artifact(artifact: CodeArtifact) -> dict:
         mm.log_agent_action(
             agent_name="coding",
             action="code_artifact_saved",
-            output_produced=artifact.model_dump(),
+            output_produced=raw,
             why="Coding agent saved or updated an artifact",
             how="save_code_artifact tool",
         )
 
-        return {"success": True, "artifact_path": artifact.path}
+        return {"success": True, "artifact_path": raw.get("path", artifact.path)}
     except Exception as e:
         return {"error": f"Could not save artifact: {str(e)}"}
+
+
+@tool
+def load_code_artifact(path: str) -> dict:
+    """
+    Load full source code for a previously saved artifact by its stored path.
+
+    This is an explicit, opt-in retrieval path; normal flows should rely on
+    metadata from get_current_artifacts and only call this when code content
+    is truly needed.
+    """
+    try:
+        storage = LocalCodeStorage()
+        code = storage.load_code(path)
+        return {"path": path, "code": code}
+    except Exception as e:
+        return {"error": f"Could not load artifact: {str(e)}"}
 
 
 @tool
@@ -98,8 +207,11 @@ def save_coding_note(note: str) -> dict:
 
 
 CODING_TOOLS = [
+    get_current_plan,
     get_current_artifacts,
+    generate_solidity_code,
     save_code_artifact,
     save_coding_note,
+    load_code_artifact,
 ]
 

@@ -1,3 +1,4 @@
+#Deprecated - Here for legacy support
 import os
 import sys
 import uuid
