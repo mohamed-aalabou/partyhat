@@ -26,6 +26,7 @@ def test_deployment_tools_include_fuji_workflow():
     assert "generate_foundry_deploy_script" in tool_names
     assert "save_deploy_artifact" in tool_names
     assert "run_foundry_deploy" in tool_names
+    assert "verify_contract_on_snowtrace" in tool_names
     assert "record_deployment" in tool_names
 
 

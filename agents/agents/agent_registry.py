@@ -1,6 +1,6 @@
 import os
 import sys
-from typing import Dict
+from typing import Dict, AsyncIterator
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -9,6 +9,7 @@ from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
 
 from deepagents import create_deep_agent
+from deepagents.backends import FilesystemBackend
 from langgraph.checkpoint.memory import MemorySaver
 
 from agents.planning_tools import PLANNING_TOOLS
@@ -16,6 +17,7 @@ from agents.coding_tools import CODING_TOOLS
 from agents.testing_tools import TESTING_TOOLS
 from agents.deployment_tools import DEPLOYMENT_TOOLS
 from agents.audit_tools import AUDIT_TOOLS
+from agents.modal_volume_backend import ModalVolumeBackend
 
 load_dotenv()
 
@@ -95,6 +97,7 @@ The following tools from agents.coding_tools are available:
 - save_code_artifact        → persist generated Solidity files and metadata
 - load_code_artifact        → load previously saved Solidity code by path
 - save_coding_note          → record important coding decisions and trade-offs
+- ensure_chainlink_contracts → install/repair Chainlink dependency in sandbox project
 
 If the plan is not marked as published or validated:
 STOP and notify that coding cannot begin.
@@ -157,6 +160,11 @@ Do NOT:
 If something in the plan is ambiguous:
 - record a reasoning note via save_coding_note()
 - make the safest minimal interpretation
+
+If compile/test feedback reports missing Chainlink imports
+(for example AggregatorV3Interface not found):
+- call ensure_chainlink_contracts() before handing off to testing
+- then proceed with artifact updates and notes
 
 --------------------------------------------------------------------
 
@@ -242,7 +250,8 @@ You are PartyHat's Smart Contract Testing Agent.
 
 Your role is to generate and run tests for Solidity contracts produced by the Coding Agent.
 
-You DO NOT modify contract code.
+You DO NOT modify production contract code (contracts in contracts/).
+You MAY modify or regenerate test files (test/*.t.sol) to fix test-only issues.
 You DO NOT redesign the architecture.
 
 You ONLY test the contracts against the validated plan.
@@ -263,6 +272,7 @@ Available tools:
 - get_current_plan        → load validated architecture
 - get_current_artifacts   → list generated contracts
 - load_code_artifact      → load Solidity files
+- ensure_chainlink_contracts → install/repair Chainlink dependency in sandbox project
 - generate_foundry_tests  → create Foundry tests
 - save_test_artifact      → save test files
 - run_foundry_tests       → run tests in sandbox
@@ -361,11 +371,23 @@ mark testing stage complete.
 
 If tests fail:
 
-→ record the issue with save_testing_note()
+If failure mentions missing Chainlink imports
+(for example AggregatorV3Interface not found):
+→ call ensure_chainlink_contracts()
+→ rerun run_foundry_tests()
 
-Do NOT modify contract code.
+If failure is at compile time and mentions incomplete mock, "should be marked abstract",
+or "Missing required implementations" (e.g. MockAggregatorV3 / AggregatorV3Interface):
+→ call generate_foundry_tests again with an extra constraint: "Any mock of
+  AggregatorV3Interface must implement all interface functions: description(),
+  version(), getRoundData(uint80), latestRoundData(), decimals(). Use stub values
+  where the test does not depend on them."
+→ save the new test artifact (overwriting the previous test file)
+→ call run_foundry_tests() again
 
-The Coding Agent will fix failures.
+Otherwise → record the issue with save_testing_note()
+
+Do NOT modify production contracts in contracts/. The Coding Agent fixes those.
 
 --------------------------------------------------------------------
 
@@ -386,9 +408,12 @@ IMPORTANT
 
 Do NOT:
 
-- modify Solidity contracts
+- modify production Solidity contracts (in contracts/)
 - deploy contracts
 - redesign the plan
+
+You MAY regenerate or fix test files (test/*.t.sol) when failures are due to
+incomplete mocks or test-only compile errors.
 
 You are responsible ONLY for generating and executing tests.
 """
@@ -423,7 +448,8 @@ Available tools:
 - generate_foundry_deploy_script -> create Foundry script Solidity
 - save_deploy_artifact          -> persist deployment script files
 - save_deployment_target        -> store target metadata
-- run_foundry_deploy            -> run forge script --broadcast in sandbox
+- run_foundry_deploy            -> run forge script --broadcast in sandbox (use quiet_output=True if you hit 50k response limit)
+- verify_contract_on_snowtrace  -> verify deployed contract on Snowtrace (Fuji/mainnet)
 - record_deployment             -> persist deployment outcome
 - get_deployment_history        -> retrieve prior deployment state
 
@@ -444,8 +470,9 @@ Typical steps:
 [ ] Generate Foundry deployment script
 [ ] Save script artifact
 [ ] Execute run_foundry_deploy
+[ ] Verify contract on Snowtrace (verify_contract_on_snowtrace with deployed address and contract path, e.g. contracts/MyToken.sol:MyToken)
 [ ] Record deployment result
-[ ] Share tx hash + contract address
+[ ] Share tx hash + contract address + Snowtrace verification link
 
 --------------------------------------------------------------------
 
@@ -468,11 +495,14 @@ Deployments must use Foundry script flow:
 
 forge script script/<Name>.s.sol --rpc-url $FUJI_RPC_URL --private-key $FUJI_PRIVATE_KEY --broadcast
 
+If run_foundry_deploy fails with INVALID_ARGUMENT or "response length exceeds block limit", retry with quiet_output=True (and do not pass -vvvv in extra_args). The tool will then keep the response under the platform limit; tx_hash and deployed_address are still returned.
+
 After execution:
 
 - inspect exit status
 - capture tx hash if available
 - capture deployed contract address if available
+- call verify_contract_on_snowtrace() with the deployed address and contract path (e.g. contracts/MyToken.sol:MyToken) so the contract is verified on Snowtrace
 - call record_deployment() with structured result
 
 If deployment fails:
@@ -502,12 +532,43 @@ contracts, using tools to manage audit issues and reports.
 
 
 def _build_agent(tools, system_prompt: str):
+    def _backend_factory(_runtime):
+        from agents.context import get_project_context
+
+        project_id, _ = get_project_context()
+        artifact_root = os.getenv("FOUNDRY_ARTIFACT_ROOT", "generated_contracts").strip("/")
+        use_modal = os.getenv("FOUNDRY_USE_MODAL_VOLUME", "").lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+
+        if use_modal:
+            base_name = os.getenv(
+                "FOUNDRY_ARTIFACT_VOLUME_NAME", "partyhat-foundry-artifacts"
+            )
+            volume_name = f"{base_name}-{project_id}" if project_id else base_name
+            base_dir = (
+                f"{artifact_root.rstrip('/')}/{project_id}"
+                if project_id
+                else artifact_root
+            )
+            return ModalVolumeBackend(volume_name=volume_name, base_dir=base_dir)
+
+        root_dir = (
+            f"{artifact_root.rstrip('/')}/{project_id}"
+            if project_id
+            else artifact_root
+        )
+        return FilesystemBackend(root_dir=root_dir, virtual_mode=True)
+
     llm = ChatOpenAI(model="gpt-5.2-2025-12-11", temperature=0.3)
     return create_deep_agent(
         model=llm,
         tools=tools,
         system_prompt=system_prompt,
         checkpointer=CHECKPOINTER,
+        backend=_backend_factory,
     )
 
 
@@ -546,12 +607,19 @@ def get_agent_for_intent(intent: str):
     return AGENTS[intent]
 
 
-def chat_with_intent(intent: str, session_id: str, user_message: str) -> dict:
+def chat_with_intent(
+    intent: str,
+    session_id: str,
+    user_message: str,
+    project_id: str | None = None,
+) -> dict:
     """
     Route a message to the appropriate deep agent based on the intent.
+    When project_id is set, it is used as thread_id for per-project conversation history.
     """
     agent = get_agent_for_intent(intent)
-    config = {"configurable": {"thread_id": session_id}}
+    thread_id = project_id if project_id else session_id
+    config = {"configurable": {"thread_id": thread_id}}
 
     result = agent.invoke(
         {"messages": [HumanMessage(content=user_message)]},
@@ -572,4 +640,75 @@ def chat_with_intent(intent: str, session_id: str, user_message: str) -> dict:
         "response": response_text,
         "tool_calls": tool_calls_made,
     }
+
+
+def _message_to_event_payload(msg) -> dict:
+    """Convert the last message in a state chunk to a JSON-serializable event payload."""
+    content = getattr(msg, "content", None) or ""
+    if isinstance(content, list):
+        content = "".join(
+            c.get("text", "") if isinstance(c, dict) else str(c) for c in content
+        )
+    payload = {"content": content}
+    if hasattr(msg, "tool_calls") and msg.tool_calls:
+        payload["tool_calls"] = [
+            {"name": tc.get("name", ""), "args": tc.get("args", "{}")}
+            for tc in msg.tool_calls
+        ]
+    return payload
+
+
+async def stream_chat_with_intent(
+    intent: str,
+    session_id: str,
+    user_message: str,
+    project_id: str | None = None,
+) -> AsyncIterator[dict]:
+    """
+    Stream agent responses and tool calls for the given intent.
+    Yields event dicts: {"type": "step", "content": ..., "tool_calls": ...} per step,
+    then {"type": "done", "session_id": ..., "response": ..., "tool_calls": [...]}.
+    """
+    agent = get_agent_for_intent(intent)
+    thread_id = project_id if project_id else session_id
+    config = {"configurable": {"thread_id": thread_id}}
+
+    last_chunk = None
+    async for chunk in agent.astream(
+        {"messages": [HumanMessage(content=user_message)]},
+        config=config,
+        stream_mode="values",
+    ):
+        last_chunk = chunk
+        messages = chunk.get("messages") or []
+        if not messages:
+            continue
+        last_message = messages[-1]
+        payload = _message_to_event_payload(last_message)
+        yield {"type": "step", **payload}
+
+    if last_chunk:
+        messages = last_chunk.get("messages") or []
+        final_message = messages[-1] if messages else None
+        response_text = (
+            getattr(final_message, "content", None) or ""
+            if final_message
+            else ""
+        )
+        if isinstance(response_text, list):
+            response_text = "".join(
+                c.get("text", "") if isinstance(c, dict) else str(c)
+                for c in response_text
+            )
+        tool_calls_made = []
+        for msg in messages:
+            if hasattr(msg, "tool_calls") and msg.tool_calls:
+                for tc in msg.tool_calls:
+                    tool_calls_made.append(tc.get("name", ""))
+        yield {
+            "type": "done",
+            "session_id": session_id,
+            "response": response_text,
+            "tool_calls": tool_calls_made,
+        }
 

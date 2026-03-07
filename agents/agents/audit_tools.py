@@ -10,10 +10,12 @@ from langchain_core.tools import tool
 from schemas.audit_schema import AuditIssue, AuditReport
 
 
-def _get_memory_manager(user_id: str = "default"):
+def _get_memory_manager():
     from agents.memory_manager import MemoryManager
+    from agents.context import get_project_context
 
-    return MemoryManager(user_id=user_id)
+    project_id, user_id = get_project_context()
+    return MemoryManager(user_id=user_id or "default", project_id=project_id)
 
 
 @tool

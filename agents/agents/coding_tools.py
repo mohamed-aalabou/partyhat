@@ -1,21 +1,26 @@
 import os
+import shlex
 import sys
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
+import modal
 
 from schemas.coding_schema import CodeArtifact, CodeGenerationRequest
-from agents.code_storage import LocalCodeStorage
+from agents.code_storage import get_code_storage
+from modal_foundry_app import foundry_image
 
 
-def _get_memory_manager(user_id: str = "default"):
+def _get_memory_manager():
     from agents.memory_manager import MemoryManager
+    from agents.context import get_project_context
 
-    return MemoryManager(user_id=user_id)
+    project_id, user_id = get_project_context()
+    return MemoryManager(user_id=user_id or "default", project_id=project_id)
 
 
 def generate_solidity_code_direct(request: CodeGenerationRequest) -> dict:
@@ -124,7 +129,7 @@ def save_code_artifact(artifact: CodeArtifact) -> dict:
         mm._ensure_agents_structure(data)  # type: ignore[attr-defined]
         coding_state = data["agents"]["coding"]
 
-        storage = LocalCodeStorage()
+        storage = get_code_storage()
 
         # Write code to storage if provided, then build a metadata-only record.
         raw = artifact.model_dump()
@@ -166,7 +171,7 @@ def load_code_artifact(path: str) -> dict:
     is truly needed.
     """
     try:
-        storage = LocalCodeStorage()
+        storage = get_code_storage()
         code = storage.load_code(path)
         return {"path": path, "code": code}
     except Exception as e:
@@ -206,6 +211,96 @@ def save_coding_note(note: str) -> dict:
         return {"error": f"Could not save coding note: {str(e)}"}
 
 
+@tool
+def ensure_chainlink_contracts(project_root: Optional[str] = None) -> dict:
+    """
+    Ensure Chainlink contracts are installed in the Foundry sandbox project.
+
+    This tool is intended for coding/test compile failures that mention missing
+    Chainlink imports (for example AggregatorV3Interface).
+    """
+    try:
+        from agents.context import get_project_context
+
+        project_id_ctx, _ = get_project_context()
+        default_root = os.getenv("FOUNDRY_ARTIFACT_ROOT", "generated_contracts")
+        if project_id_ctx:
+            default_root = f"{default_root.rstrip('/')}/{project_id_ctx}"
+        root = project_root or os.getenv("FOUNDRY_PROJECT_ROOT") or default_root
+
+        app_name = os.getenv("MODAL_APP_NAME", "partyhat-foundry-tests")
+        timeout = int(os.getenv("FOUNDRY_SANDBOX_TIMEOUT", "900"))
+
+        app = modal.App.lookup(app_name, create_if_missing=True)
+
+        base_volume_name = os.getenv(
+            "FOUNDRY_ARTIFACT_VOLUME_NAME", "partyhat-foundry-artifacts"
+        )
+        volume_name = (
+            f"{base_volume_name}-{project_id_ctx}"
+            if project_id_ctx
+            else base_volume_name
+        )
+        vol = modal.Volume.from_name(volume_name, create_if_missing=True)
+
+        sandbox_workdir = "/workspace/project"
+        quoted_root = shlex.quote(root)
+        bootstrap_cmd = (
+            "set -e; "
+            + f"cd {quoted_root}; "
+            + "mkdir -p lib; "
+            "if [ ! -d lib/chainlink-evm ]; then "
+            "  if [ -d /opt/foundry-deps/chainlink-evm ]; then cp -R /opt/foundry-deps/chainlink-evm lib/chainlink-evm; "
+            "  else git clone --depth 1 https://github.com/smartcontractkit/chainlink-evm lib/chainlink-evm; fi; "
+            "fi; "
+            "if [ ! -f lib/chainlink-evm/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol ]; then "
+            "  rm -rf lib/chainlink-evm; "
+            "  if [ -d /opt/foundry-deps/chainlink-evm ]; then cp -R /opt/foundry-deps/chainlink-evm lib/chainlink-evm; "
+            "  else git clone --depth 1 https://github.com/smartcontractkit/chainlink-evm lib/chainlink-evm; fi; "
+            "fi; "
+            "mkdir -p lib/chainlink-evm/contracts/src/v0.8/interfaces; "
+            "if [ ! -f lib/chainlink-evm/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol ] "
+            "&& [ -f lib/chainlink-evm/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol ]; then "
+            "  cp lib/chainlink-evm/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol "
+            "lib/chainlink-evm/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol; "
+            "fi; "
+            "touch remappings.txt; "
+            "grep -qxF '@chainlink/contracts/=lib/chainlink-evm/contracts/' remappings.txt "
+            "|| echo '@chainlink/contracts/=lib/chainlink-evm/contracts/' >> remappings.txt; "
+            "grep -qxF '@chainlink/contracts/src/v0.8/interfaces/=lib/chainlink-evm/contracts/src/v0.8/shared/interfaces/' remappings.txt "
+            "|| echo '@chainlink/contracts/src/v0.8/interfaces/=lib/chainlink-evm/contracts/src/v0.8/shared/interfaces/' >> remappings.txt; "
+            "ls -la lib/chainlink-evm/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol"
+        )
+
+        sandbox = modal.Sandbox.create(
+            "bash",
+            "-lc",
+            bootstrap_cmd,
+            image=foundry_image,
+            app=app,
+            workdir=sandbox_workdir,
+            timeout=timeout,
+            volumes={sandbox_workdir: vol},
+        )
+
+        stdout = sandbox.stdout.read()
+        stderr = sandbox.stderr.read()
+        sandbox.wait(raise_on_termination=False)
+        exit_code = sandbox.returncode
+
+        return {
+            "success": exit_code == 0,
+            "exit_code": exit_code,
+            "stdout": stdout,
+            "stderr": stderr,
+            "project_root": root,
+            "sandbox_workdir": sandbox_workdir,
+            "modal_app": app_name,
+        }
+    except Exception as e:
+        return {"error": f"Could not ensure Chainlink contracts in sandbox: {str(e)}"}
+
+
 CODING_TOOLS = [
     get_current_plan,
     get_current_artifacts,
@@ -213,5 +308,6 @@ CODING_TOOLS = [
     save_code_artifact,
     save_coding_note,
     load_code_artifact,
+    ensure_chainlink_contracts,
 ]
 

@@ -75,12 +75,18 @@ def build_planning_agent():
     return agent
 
 
-def chat(agent, session_id: str, user_message: str) -> dict:
+def chat(
+    agent,
+    session_id: str,
+    user_message: str,
+    project_id: str | None = None,
+) -> dict:
     """
     Args:
         agent:        Compiled deep agent from build_planning_agent()
         session_id:   Unique ID for this user's session
         user_message: The user's latest message
+        project_id:   When set, used as thread_id so conversation history is per project.
 
     Returns:
         {
@@ -89,7 +95,8 @@ def chat(agent, session_id: str, user_message: str) -> dict:
             "tool_calls": list,  which tools were called this turn
         }
     """
-    config = {"configurable": {"thread_id": session_id}}
+    thread_id = project_id if project_id else session_id
+    config = {"configurable": {"thread_id": thread_id}}
 
     result = agent.invoke(
         {"messages": [HumanMessage(content=user_message)]},

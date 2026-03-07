@@ -37,6 +37,10 @@ foundry_image = (
     .run_commands(
         "curl -L https://foundry.paradigm.xyz | bash",
         "/root/.foundry/bin/foundryup",
+        "mkdir -p /opt/foundry-deps",
+        "git clone --depth 1 https://github.com/foundry-rs/forge-std /opt/foundry-deps/forge-std",
+        "git clone --depth 1 https://github.com/OpenZeppelin/openzeppelin-contracts /opt/foundry-deps/openzeppelin-contracts",
+        "git clone --depth 1 https://github.com/smartcontractkit/chainlink-evm /opt/foundry-deps/chainlink-evm",
     )
     .env({
         "PATH": "/root/.foundry/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"

@@ -1,4 +1,5 @@
 import os
+import shlex
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,21 +15,22 @@ from langchain_core.messages import HumanMessage
 from pydantic import BaseModel, Field
 
 from schemas.coding_schema import CodeArtifact
-from agents.code_storage import LocalCodeStorage
+from agents.code_storage import get_code_storage
 from agents.planning_tools import get_current_plan as planning_get_current_plan
 from agents.coding_tools import (
     get_current_artifacts as coding_get_current_artifacts,
     load_code_artifact as coding_load_code_artifact,
+    ensure_chainlink_contracts as coding_ensure_chainlink_contracts,
 )
 
 
-def _get_memory_manager(user_id: str = "default"):
-    """
-    Lazy import helper to avoid circular dependencies.
-    """
+def _get_memory_manager():
+    """Lazy import helper. Uses project/user from context."""
     from agents.memory_manager import MemoryManager
+    from agents.context import get_project_context
 
-    return MemoryManager(user_id=user_id)
+    project_id, user_id = get_project_context()
+    return MemoryManager(user_id=user_id or "default", project_id=project_id)
 
 
 class FoundryTestGenerationRequest(BaseModel):
@@ -118,6 +120,12 @@ def generate_foundry_tests_direct(
         "- OpenZeppelin imports MUST use `@openzeppelin/contracts/...` remapping.\n"
         "- Cover constructor behaviour, state initialisation, happy-path flows,\n"
         "  revert conditions, access control, and relevant edge cases.\n"
+        "- When mocking a Solidity interface, the mock contract MUST implement every\n"
+        "  function of that interface (or the contract must be marked abstract and cannot\n"
+        "  be instantiated). For Chainlink AggregatorV3Interface, implement ALL of:\n"
+        "  decimals(), description(), version(), getRoundData(uint80), latestRoundData().\n"
+        "  Use stub return values (e.g. 0, \"\", or a struct of zeros) where the test\n"
+        "  does not depend on them.\n"
         "- Output ONLY raw Solidity test contracts (no markdown fences, no prose).\n\n"
         f"Testing goal:\n{request.goal.strip()}"
         f"{constraints_section}"
@@ -175,7 +183,7 @@ def save_test_artifact(artifact: CodeArtifact) -> Dict[str, Any]:
         mm._ensure_agents_structure(data)  # type: ignore[attr-defined]
         testing_state = data["agents"]["testing"]
 
-        storage = LocalCodeStorage()
+        storage = get_code_storage()
 
         raw = artifact.model_dump()
         code = raw.pop("code", None)
@@ -233,10 +241,13 @@ def run_foundry_tests(
     Returns a dict with stdout, stderr, exit_code, project_root, and success flag.
     """
     try:
-        default_root = Path.cwd() / "generated_contracts"
-        root = project_root or os.getenv("FOUNDRY_PROJECT_ROOT")
-        if not root:
-            root = str(default_root if default_root.exists() else Path.cwd())
+        from agents.context import get_project_context
+
+        project_id_ctx, _ = get_project_context()
+        default_root = os.getenv("FOUNDRY_ARTIFACT_ROOT", "generated_contracts")
+        if project_id_ctx:
+            default_root = f"{default_root.rstrip('/')}/{project_id_ctx}"
+        root = project_root or os.getenv("FOUNDRY_PROJECT_ROOT") or default_root
 
         # Build the underlying forge command. The Modal image ensures that
         # /root/.foundry/bin is added to PATH via /root/.bashrc, so running
@@ -265,56 +276,61 @@ def run_foundry_tests(
                     "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
                     "--remappings",
                     "forge-std/=lib/forge-std/src/",
+                    "--remappings",
+                    "@chainlink/contracts/=lib/chainlink-evm/contracts/",
+                    "--remappings",
+                    "@chainlink/contracts/src/v0.8/interfaces/=lib/chainlink-evm/contracts/src/v0.8/shared/interfaces/",
                 ]
             )
 
         app_name = os.getenv("MODAL_APP_NAME", "partyhat-foundry-tests")
         timeout = int(os.getenv("FOUNDRY_SANDBOX_TIMEOUT", "900"))
 
-        # Look up or create the Modal app context for sandboxes.
         app = modal.App.lookup(app_name, create_if_missing=True)
 
-        # Ensure the sandbox can actually see the Foundry project files by
-        # packaging the local project directory into the sandbox image.
-        local_root = Path(root)
-        sandbox_workdir = root
+        base_volume_name = os.getenv(
+            "FOUNDRY_ARTIFACT_VOLUME_NAME", "partyhat-foundry-artifacts"
+        )
+        volume_name = (
+            f"{base_volume_name}-{project_id_ctx}"
+            if project_id_ctx
+            else base_volume_name
+        )
+        vol = modal.Volume.from_name(volume_name, create_if_missing=True)
+
+        sandbox_workdir = "/workspace/project"
         sandbox_image = foundry_image
-        if local_root.exists():
-            # Ensure a basic Foundry config exists and uses the project's layout.
-            # This keeps compilation deterministic for generated_contracts/*
-            # where contracts are under contracts/ and tests under test/.
-            foundry_toml = local_root / "foundry.toml"
-            if not foundry_toml.exists():
-                foundry_toml.write_text(
-                    (
-                        "[profile.default]\n"
-                        "src = \"contracts\"\n"
-                        "test = \"test\"\n"
-                        "libs = [\"lib\"]\n"
-                        "remappings = [\n"
-                        "  \"@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/\",\n"
-                        "  \"forge-std/=lib/forge-std/src/\"\n"
-                        "]\n"
-                    ),
-                    encoding="utf-8",
-                )
 
-            sandbox_workdir = "/workspace/project"
-            sandbox_image = foundry_image.add_local_dir(
-                local_path=str(local_root),
-                remote_path=sandbox_workdir,
-            )
-
+        quoted_root = shlex.quote(root)
+        forge_cmd_str = " ".join(shlex.quote(part) for part in forge_cmd)
         bootstrap_cmd = (
             "set -e; "
-            "mkdir -p lib; "
+            + f"cd {quoted_root}; "
+            + "mkdir -p lib; "
             "if [ ! -d lib/forge-std ]; then "
-            "  git clone --depth 1 https://github.com/foundry-rs/forge-std lib/forge-std; "
+            "  if [ -d /opt/foundry-deps/forge-std ]; then cp -R /opt/foundry-deps/forge-std lib/forge-std; "
+            "  else git clone --depth 1 https://github.com/foundry-rs/forge-std lib/forge-std; fi; "
             "fi; "
             "if [ ! -d lib/openzeppelin-contracts ]; then "
-            "  git clone --depth 1 https://github.com/OpenZeppelin/openzeppelin-contracts lib/openzeppelin-contracts; "
+            "  if [ -d /opt/foundry-deps/openzeppelin-contracts ]; then cp -R /opt/foundry-deps/openzeppelin-contracts lib/openzeppelin-contracts; "
+            "  else git clone --depth 1 https://github.com/OpenZeppelin/openzeppelin-contracts lib/openzeppelin-contracts; fi; "
             "fi; "
-            + " ".join(forge_cmd)
+            "if [ ! -d lib/chainlink-evm ]; then "
+            "  if [ -d /opt/foundry-deps/chainlink-evm ]; then cp -R /opt/foundry-deps/chainlink-evm lib/chainlink-evm; "
+            "  else git clone --depth 1 https://github.com/smartcontractkit/chainlink-evm lib/chainlink-evm; fi; "
+            "fi; "
+            "if [ ! -f lib/chainlink-evm/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol ]; then "
+            "  rm -rf lib/chainlink-evm; "
+            "  if [ -d /opt/foundry-deps/chainlink-evm ]; then cp -R /opt/foundry-deps/chainlink-evm lib/chainlink-evm; "
+            "  else git clone --depth 1 https://github.com/smartcontractkit/chainlink-evm lib/chainlink-evm; fi; "
+            "fi; "
+            "mkdir -p lib/chainlink-evm/contracts/src/v0.8/interfaces; "
+            "if [ ! -f lib/chainlink-evm/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol ] "
+            "&& [ -f lib/chainlink-evm/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol ]; then "
+            "  cp lib/chainlink-evm/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol "
+            "lib/chainlink-evm/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol; "
+            "fi; "
+            + forge_cmd_str
         )
 
         sandbox = modal.Sandbox.create(
@@ -325,6 +341,7 @@ def run_foundry_tests(
             app=app,
             workdir=sandbox_workdir,
             timeout=timeout,
+            volumes={sandbox_workdir: vol},
         )
 
         # Read full stdout/stderr streams and wait for completion.
@@ -422,6 +439,7 @@ TESTING_TOOLS = [
     planning_get_current_plan,
     coding_get_current_artifacts,
     coding_load_code_artifact,
+    coding_ensure_chainlink_contracts,
     generate_foundry_tests,
     save_test_artifact,
     run_foundry_tests,

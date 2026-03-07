@@ -20,11 +20,13 @@ from langchain_core.tools import tool
 from schemas.plan_schema import SmartContractPlan, PlanStatus
 
 
-def _get_memory_manager(user_id: str = "default"):
-    """Lazy import to avoid circular dependencies."""
+def _get_memory_manager():
+    """Lazy import to avoid circular dependencies. Uses project/user from context."""
     from agents.memory_manager import MemoryManager
+    from agents.context import get_project_context
 
-    return MemoryManager(user_id=user_id)
+    project_id, user_id = get_project_context()
+    return MemoryManager(user_id=user_id or "default", project_id=project_id)
 
 
 @tool

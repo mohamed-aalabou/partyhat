@@ -10,10 +10,15 @@ from letta_client import Letta
 
 try:
     # Prefer TOON for token-efficient storage, but fall back to JSON if unavailable
-    from toon import encode as toon_encode, decode as toon_decode
+    from toon import (
+        encode as toon_encode,
+        decode as toon_decode,
+        DecodeOptions as ToonDecodeOptions,
+    )
 except Exception:  # pragma: no cover - extremely unlikely in production environment
     toon_encode = None  # type: ignore[assignment]
     toon_decode = None  # type: ignore[assignment]
+    ToonDecodeOptions = None  # type: ignore[assignment]
 
 load_dotenv(
     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
@@ -21,16 +26,32 @@ load_dotenv(
 
 
 class MemoryManager:
-    def __init__(self, user_id: str = "default"):
+    def __init__(self, user_id: str = "default", project_id: str | None = None):
         """
         Args:
             user_id: The authenticated user's ID from the backend auth layer.
                      Defaults to "default" for local testing only.
+            project_id: Optional project ID. When set, memory is scoped primarily
+                        to this project (user_block_label becomes project:{project_id}),
+                        so each project has its own isolated state regardless of user,
+                        and global logs are also project-specific.
         """
         self.client = Letta(api_key=os.getenv("LETTA_API_KEY"))
         self.user_id = user_id
-        self.user_block_label = f"user:{user_id}"
-        self.global_block_label = "global_agent_log"
+        self.project_id = project_id
+        if project_id:
+            # Project-scoped memory: one block per project, shared across users
+            # working on the same project. This prevents a single user from
+            # accumulating all project state into one block and hitting size limits.
+            self.user_block_label = f"project:{project_id}"
+        else:
+            self.user_block_label = f"user:{user_id}"
+        # Global log is project-scoped when a project_id is present,
+        # otherwise we fall back to the legacy shared global log.
+        if project_id:
+            self.global_block_label = f"project:{project_id}:agent_log"
+        else:
+            self.global_block_label = "global_agent_log"
 
     def _serialize(self, data: dict) -> str:
         """
@@ -58,15 +79,25 @@ class MemoryManager:
             return {}
 
         if toon_decode is not None:
+            strict_decode_error = None
             try:
                 return toon_decode(value)
-            except Exception:
-                # Backwards-compatibility path for existing JSON blocks
+            except Exception as exc:
+                strict_decode_error = exc
+                # Some existing blocks may only decode in lenient mode.
+                if ToonDecodeOptions is not None:
+                    try:
+                        return toon_decode(value, ToonDecodeOptions(strict=False))
+                    except Exception:
+                        pass
+
+                # Backwards-compatibility path for legacy JSON blocks.
                 try:
                     return json.loads(value)
                 except Exception:
-                    # If neither decoder works, propagate the original error
-                    raise
+                    # If neither decoder works, propagate the original TOON error
+                    # so callers get the root-cause decode failure.
+                    raise strict_decode_error
 
         return json.loads(value)
 
@@ -90,7 +121,7 @@ class MemoryManager:
             "preferences": {
                 "preferred_erc": None,
                 "preferred_license": None,
-                "preferred_chain": None,
+                "preferred_chain": "Avalanche C-Chain",
             },
             # Per-agent state slices
             "agents": {
@@ -247,8 +278,8 @@ class MemoryManager:
     def save_plan(self, plan: dict) -> None:
         """
         Save the current smart contract plan to user memory.
-        Archives the previous plan to plan_history before overwriting
-        so we never lose a version.
+        Archives only the previous plan to plan_history before overwriting,
+        keeping at most the most recent prior version to avoid unbounded growth.
         Args:
             plan: The SmartContractPlan as a dict (from model.model_dump())
         """
@@ -256,13 +287,14 @@ class MemoryManager:
         planning_state = self._get_agent_state(data, "planning")
 
         if planning_state.get("current_plan") is not None:
-            planning_state.setdefault("plan_history", [])
-            planning_state["plan_history"].append(
-                {
-                    "archived_at": datetime.utcnow().isoformat(),
-                    "plan": planning_state["current_plan"],
-                }
-            )
+            # Always truncate plan_history to a single most recent entry to
+            # prevent the user block from growing without bound. We only
+            # retain the immediately previous plan version.
+            previous_entry = {
+                "archived_at": datetime.utcnow().isoformat(),
+                "plan": planning_state["current_plan"],
+            }
+            planning_state["plan_history"] = [previous_entry]
 
         planning_state["current_plan"] = plan
         self.client.blocks.update(block.id, value=self._serialize(data))

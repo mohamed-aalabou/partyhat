@@ -1,9 +1,14 @@
+import json
 import os
 import re
+import shlex
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Dict, Any, Optional
+
+# Platform limit for tool response payload (e.g. Modal/OpenAI). Stay under to avoid INVALID_ARGUMENT.
+MAX_RESPONSE_CHARS = 48_000
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -19,6 +24,7 @@ from schemas.deployment_schema import (
     DeploymentRecord,
     FoundryDeployScriptGenerationRequest,
     FoundryDeployRequest,
+    SnowtraceVerifyRequest,
 )
 from agents.code_storage import LocalCodeStorage
 from agents.planning_tools import get_current_plan as planning_get_current_plan
@@ -26,12 +32,15 @@ from agents.coding_tools import (
     get_current_artifacts as coding_get_current_artifacts,
     load_code_artifact as coding_load_code_artifact,
 )
+from agents.code_storage import get_code_storage
 
 
-def _get_memory_manager(user_id: str = "default"):
+def _get_memory_manager():
     from agents.memory_manager import MemoryManager
+    from agents.context import get_project_context
 
-    return MemoryManager(user_id=user_id)
+    project_id, user_id = get_project_context()
+    return MemoryManager(user_id=user_id or "default", project_id=project_id)
 
 
 def _redact_text(value: Optional[str], secrets: List[str]) -> str:
@@ -47,6 +56,57 @@ def _redact_text(value: Optional[str], secrets: List[str]) -> str:
 def _extract_first(pattern: str, text: str) -> Optional[str]:
     match = re.search(pattern, text, flags=re.IGNORECASE)
     return match.group(1) if match else None
+
+
+def _truncate_for_display(text: str, max_chars: int, label: str = "output") -> str:
+    """Return text truncated to max_chars with head and tail kept and a middle notice."""
+    if not text or len(text) <= max_chars:
+        return text
+    notice = f"\n... [{label} truncated for platform limit] ...\n"
+    half = (max_chars - len(notice)) // 2
+    return text[:half] + notice + text[-half:]
+
+
+def _cap_response_with_stdout_stderr(
+    response: Dict[str, Any], truncation_note: str
+) -> Dict[str, Any]:
+    """If response JSON would exceed MAX_RESPONSE_CHARS, truncate stdout/stderr."""
+    payload = json.dumps(response)
+    if len(payload) <= MAX_RESPONSE_CHARS:
+        return response
+    response = dict(response)
+    overhead = len(
+        json.dumps(
+            {
+                **response,
+                "stdout": "",
+                "stderr": "",
+                "output_truncated": True,
+                "truncation_note": truncation_note,
+            }
+        )
+    )
+    allowance = max(0, MAX_RESPONSE_CHARS - overhead - 200)
+    max_stdout = allowance // 2
+    max_stderr = allowance - max_stdout
+    if response.get("stdout") and len(response["stdout"]) > max_stdout:
+        response["stdout"] = _truncate_for_display(
+            response["stdout"], max_stdout, "stdout"
+        )
+    if response.get("stderr") and len(response["stderr"]) > max_stderr:
+        response["stderr"] = _truncate_for_display(
+            response["stderr"], max_stderr, "stderr"
+        )
+    response["output_truncated"] = True
+    response["truncation_note"] = truncation_note
+    return response
+
+
+def _cap_deploy_response(response: Dict[str, Any]) -> Dict[str, Any]:
+    """If response JSON would exceed MAX_RESPONSE_CHARS, truncate stdout/stderr in place."""
+    return _cap_response_with_stdout_stderr(
+        response, "stdout/stderr truncated to stay under 50k platform limit."
+    )
 
 
 def _parse_deploy_output(stdout: str, stderr: str) -> Dict[str, Optional[str]]:
@@ -156,7 +216,7 @@ def save_deploy_artifact(artifact: CodeArtifact) -> Dict[str, Any]:
         mm._ensure_agents_structure(data)  # type: ignore[attr-defined]
         deployment_state = data["agents"]["deployment"]
 
-        storage = LocalCodeStorage()
+        storage = get_code_storage()
 
         raw = artifact.model_dump()
         code = raw.pop("code", None)
@@ -228,8 +288,14 @@ def run_foundry_deploy(
     """
     Execute `forge script ... --broadcast` for Avalanche Fuji in a Modal Sandbox.
     Requires FUJI_RPC_URL and FUJI_PRIVATE_KEY to be set in the environment.
+    Set quiet_output=True to avoid high verbosity and to truncate stdout/stderr so the
+    response stays under the platform 50k character limit (use if you get INVALID_ARGUMENT
+    response length errors). tx_hash and deployed_address are always included.
     """
     try:
+        from agents.context import get_project_context
+
+        project_id_ctx, _ = get_project_context()
         if request.network != "avalanche_fuji":
             return {
                 "error": (
@@ -245,10 +311,10 @@ def run_foundry_deploy(
         if not private_key:
             return {"error": f"Missing required env var: {request.private_key_env_var}"}
 
-        default_root = Path.cwd() / "generated_contracts"
-        root = project_root or os.getenv("FOUNDRY_PROJECT_ROOT")
-        if not root:
-            root = str(default_root if default_root.exists() else Path.cwd())
+        default_root = os.getenv("FOUNDRY_ARTIFACT_ROOT", "generated_contracts")
+        if project_id_ctx:
+            default_root = f"{default_root.rstrip('/')}/{project_id_ctx}"
+        root = project_root or os.getenv("FOUNDRY_PROJECT_ROOT") or default_root
 
         forge_cmd = [
             "forge",
@@ -263,49 +329,84 @@ def run_foundry_deploy(
             forge_cmd.append("--broadcast")
         if request.contract_name:
             forge_cmd.extend(["--tc", request.contract_name])
-        forge_cmd.extend(request.extra_args or [])
+        user_args = list(request.extra_args or [])
+        if request.quiet_output:
+            # Strip high verbosity so forge output stays smaller and under platform limit
+            user_args = [
+                a
+                for a in user_args
+                if a not in ("-v", "-vv", "-vvv", "-vvvv")
+            ]
+        forge_cmd.extend(user_args)
+
+        has_remappings = any(
+            a == "--remappings" or a.startswith("--remappings=") for a in user_args
+        )
+        if not has_remappings:
+            forge_cmd.extend(
+                [
+                    "--remappings",
+                    "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
+                    "--remappings",
+                    "forge-std/=lib/forge-std/src/",
+                    "--remappings",
+                    "@chainlink/contracts/=lib/chainlink-evm/contracts/",
+                    "--remappings",
+                    "@chainlink/contracts/src/v0.8/interfaces/=lib/chainlink-evm/contracts/src/v0.8/shared/interfaces/",
+                ]
+            )
 
         app_name = os.getenv("MODAL_APP_NAME", "partyhat-foundry-tests")
         timeout = int(os.getenv("FOUNDRY_SANDBOX_TIMEOUT", "900"))
         app = modal.App.lookup(app_name, create_if_missing=True)
+        base_volume_name = os.getenv(
+            "FOUNDRY_ARTIFACT_VOLUME_NAME", "partyhat-foundry-artifacts"
+        )
+        volume_name = (
+            f"{base_volume_name}-{project_id_ctx}"
+            if project_id_ctx
+            else base_volume_name
+        )
+        vol = modal.Volume.from_name(volume_name, create_if_missing=True)
 
-        local_root = Path(root)
-        sandbox_workdir = root
+        sandbox_workdir = "/workspace/project"
         sandbox_image = foundry_image
-        if local_root.exists():
-            foundry_toml = local_root / "foundry.toml"
-            if not foundry_toml.exists():
-                foundry_toml.write_text(
-                    (
-                        "[profile.default]\n"
-                        "src = \"contracts\"\n"
-                        "test = \"test\"\n"
-                        "script = \"script\"\n"
-                        "libs = [\"lib\"]\n"
-                        "remappings = [\n"
-                        "  \"@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/\",\n"
-                        "  \"forge-std/=lib/forge-std/src/\"\n"
-                        "]\n"
-                    ),
-                    encoding="utf-8",
-                )
 
-            sandbox_workdir = "/workspace/project"
-            sandbox_image = foundry_image.add_local_dir(
-                local_path=str(local_root),
-                remote_path=sandbox_workdir,
-            )
-
+        quoted_root = shlex.quote(root)
+        forge_cmd_str = " ".join(
+            part
+            if isinstance(part, str) and part.startswith("$")
+            else shlex.quote(str(part))
+            for part in forge_cmd
+        )
         bootstrap_cmd = (
             "set -e; "
-            "mkdir -p lib; "
+            + f"cd {quoted_root}; "
+            + "mkdir -p lib; "
             "if [ ! -d lib/forge-std ]; then "
-            "  git clone --depth 1 https://github.com/foundry-rs/forge-std lib/forge-std; "
+            "  if [ -d /opt/foundry-deps/forge-std ]; then cp -R /opt/foundry-deps/forge-std lib/forge-std; "
+            "  else git clone --depth 1 https://github.com/foundry-rs/forge-std lib/forge-std; fi; "
             "fi; "
             "if [ ! -d lib/openzeppelin-contracts ]; then "
-            "  git clone --depth 1 https://github.com/OpenZeppelin/openzeppelin-contracts lib/openzeppelin-contracts; "
+            "  if [ -d /opt/foundry-deps/openzeppelin-contracts ]; then cp -R /opt/foundry-deps/openzeppelin-contracts lib/openzeppelin-contracts; "
+            "  else git clone --depth 1 https://github.com/OpenZeppelin/openzeppelin-contracts lib/openzeppelin-contracts; fi; "
             "fi; "
-            + " ".join(forge_cmd)
+            "if [ ! -d lib/chainlink-evm ]; then "
+            "  if [ -d /opt/foundry-deps/chainlink-evm ]; then cp -R /opt/foundry-deps/chainlink-evm lib/chainlink-evm; "
+            "  else git clone --depth 1 https://github.com/smartcontractkit/chainlink-evm lib/chainlink-evm; fi; "
+            "fi; "
+            "if [ ! -f lib/chainlink-evm/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol ]; then "
+            "  rm -rf lib/chainlink-evm; "
+            "  if [ -d /opt/foundry-deps/chainlink-evm ]; then cp -R /opt/foundry-deps/chainlink-evm lib/chainlink-evm; "
+            "  else git clone --depth 1 https://github.com/smartcontractkit/chainlink-evm lib/chainlink-evm; fi; "
+            "fi; "
+            "mkdir -p lib/chainlink-evm/contracts/src/v0.8/interfaces; "
+            "if [ ! -f lib/chainlink-evm/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol ] "
+            "&& [ -f lib/chainlink-evm/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol ]; then "
+            "  cp lib/chainlink-evm/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol "
+            "lib/chainlink-evm/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol; "
+            "fi; "
+            + forge_cmd_str
         )
 
         sandbox = modal.Sandbox.create(
@@ -316,6 +417,7 @@ def run_foundry_deploy(
             app=app,
             workdir=sandbox_workdir,
             timeout=timeout,
+            volumes={sandbox_workdir: vol},
             env={
                 request.rpc_url_env_var: rpc_url,
                 request.private_key_env_var: private_key,
@@ -371,7 +473,7 @@ def run_foundry_deploy(
             error=None if exit_code == 0 else "forge script returned non-zero exit code",
         )
 
-        return {
+        response = {
             "success": exit_code == 0,
             "exit_code": exit_code,
             "stdout": stdout,
@@ -386,6 +488,7 @@ def run_foundry_deploy(
             "tx_hash": parsed.get("tx_hash"),
             "deployed_address": parsed.get("deployed_address"),
         }
+        return _cap_deploy_response(response)
     except Exception as e:
         return {"error": f"Could not run forge deployment in Modal Sandbox: {str(e)}"}
 
@@ -441,6 +544,178 @@ def get_deployment_history() -> dict:
         return {"error": f"Could not retrieve deployment history: {str(e)}"}
 
 
+# Snowtrace (Etherscan-compatible) API base URLs per chain
+SNOWTRACE_VERIFIER_URLS = {
+    43113: "https://api-testnet.snowtrace.io/api",   # Fuji testnet
+    43114: "https://api.snowtrace.io/api",           # Avalanche C-Chain mainnet
+}
+
+
+@tool
+def verify_contract_on_snowtrace(
+    request: SnowtraceVerifyRequest,
+    project_root: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Verify a deployed contract on Snowtrace (Avalanche C-Chain block explorer) using
+    forge verify-contract. Run this after a successful deployment to publish source
+    code on Snowtrace. Supports Fuji (43113) and mainnet (43114).
+    """
+    try:
+        from agents.context import get_project_context
+
+        project_id_ctx, _ = get_project_context()
+        verifier_url = SNOWTRACE_VERIFIER_URLS.get(request.chain_id)
+        if not verifier_url:
+            return {
+                "error": (
+                    f"Unsupported chain_id {request.chain_id}. "
+                    "Use 43113 (Fuji) or 43114 (C-Chain mainnet)."
+                )
+            }
+
+        api_key = os.getenv(request.api_key_env_var) or "placeholder"
+        default_root = os.getenv("FOUNDRY_ARTIFACT_ROOT", "generated_contracts")
+        if project_id_ctx:
+            default_root = f"{default_root.rstrip('/')}/{project_id_ctx}"
+        root = project_root or request.project_root or os.getenv("FOUNDRY_PROJECT_ROOT") or default_root
+
+        forge_cmd = [
+            "forge",
+            "verify-contract",
+            request.contract_address,
+            request.contract_path,
+            "--verifier",
+            "etherscan",
+            "--verifier-url",
+            verifier_url,
+            "--etherscan-api-key",
+            api_key,
+            "--chain-id",
+            str(request.chain_id),
+            "--watch",
+        ]
+        if request.constructor_args:
+            forge_cmd.extend(["--constructor-args", request.constructor_args])
+        if request.compiler_version:
+            forge_cmd.extend(["--compiler-version", request.compiler_version])
+        if request.optimizer_runs is not None:
+            forge_cmd.extend(["--optimizer-runs", str(request.optimizer_runs)])
+
+        remappings = [
+            "--remappings",
+            "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
+            "--remappings",
+            "forge-std/=lib/forge-std/src/",
+            "--remappings",
+            "@chainlink/contracts/=lib/chainlink-evm/contracts/",
+            "--remappings",
+            "@chainlink/contracts/src/v0.8/interfaces/=lib/chainlink-evm/contracts/src/v0.8/shared/interfaces/",
+        ]
+        forge_cmd.extend(remappings)
+
+        app_name = os.getenv("MODAL_APP_NAME", "partyhat-foundry-tests")
+        timeout = int(os.getenv("FOUNDRY_SANDBOX_TIMEOUT", "900"))
+        app = modal.App.lookup(app_name, create_if_missing=True)
+        base_volume_name = os.getenv(
+            "FOUNDRY_ARTIFACT_VOLUME_NAME", "partyhat-foundry-artifacts"
+        )
+        volume_name = (
+            f"{base_volume_name}-{project_id_ctx}"
+            if project_id_ctx
+            else base_volume_name
+        )
+        vol = modal.Volume.from_name(volume_name, create_if_missing=True)
+        sandbox_workdir = "/workspace/project"
+        sandbox_image = foundry_image
+
+        quoted_root = shlex.quote(root)
+        forge_cmd_str = " ".join(shlex.quote(str(part)) for part in forge_cmd)
+        bootstrap_cmd = (
+            "set -e; "
+            + f"cd {quoted_root}; "
+            + "mkdir -p lib; "
+            "if [ ! -d lib/forge-std ]; then "
+            "  if [ -d /opt/foundry-deps/forge-std ]; then cp -R /opt/foundry-deps/forge-std lib/forge-std; "
+            "  else git clone --depth 1 https://github.com/foundry-rs/forge-std lib/forge-std; fi; "
+            "fi; "
+            "if [ ! -d lib/openzeppelin-contracts ]; then "
+            "  if [ -d /opt/foundry-deps/openzeppelin-contracts ]; then cp -R /opt/foundry-deps/openzeppelin-contracts lib/openzeppelin-contracts; "
+            "  else git clone --depth 1 https://github.com/OpenZeppelin/openzeppelin-contracts lib/openzeppelin-contracts; fi; "
+            "fi; "
+            "if [ ! -d lib/chainlink-evm ]; then "
+            "  if [ -d /opt/foundry-deps/chainlink-evm ]; then cp -R /opt/foundry-deps/chainlink-evm lib/chainlink-evm; "
+            "  else git clone --depth 1 https://github.com/smartcontractkit/chainlink-evm lib/chainlink-evm; fi; "
+            "fi; "
+            "if [ ! -f lib/chainlink-evm/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol ]; then "
+            "  rm -rf lib/chainlink-evm; "
+            "  if [ -d /opt/foundry-deps/chainlink-evm ]; then cp -R /opt/foundry-deps/chainlink-evm lib/chainlink-evm; "
+            "  else git clone --depth 1 https://github.com/smartcontractkit/chainlink-evm lib/chainlink-evm; fi; "
+            "fi; "
+            "mkdir -p lib/chainlink-evm/contracts/src/v0.8/interfaces; "
+            "if [ ! -f lib/chainlink-evm/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol ] "
+            "&& [ -f lib/chainlink-evm/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol ]; then "
+            "  cp lib/chainlink-evm/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol "
+            "lib/chainlink-evm/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol; "
+            "fi; "
+            + forge_cmd_str
+        )
+
+        sandbox = modal.Sandbox.create(
+            "bash",
+            "-lc",
+            bootstrap_cmd,
+            image=sandbox_image,
+            app=app,
+            workdir=sandbox_workdir,
+            timeout=timeout,
+            volumes={sandbox_workdir: vol},
+            env={request.api_key_env_var: api_key},
+        )
+
+        stdout_raw = sandbox.stdout.read()
+        stderr_raw = sandbox.stderr.read()
+        sandbox.wait(raise_on_termination=False)
+        exit_code = sandbox.returncode
+
+        stdout = _redact_text(stdout_raw, [api_key] if api_key != "placeholder" else [])
+        stderr = _redact_text(stderr_raw, [api_key] if api_key != "placeholder" else [])
+
+        mm = _get_memory_manager()
+        mm.log_agent_action(
+            agent_name="deployment",
+            action="snowtrace_verify",
+            output_produced={
+                "contract_address": request.contract_address,
+                "contract_path": request.contract_path,
+                "chain_id": request.chain_id,
+                "exit_code": exit_code,
+                "success": exit_code == 0,
+            },
+            why="Deployment agent ran Snowtrace contract verification",
+            how="verify_contract_on_snowtrace tool",
+            error=None if exit_code == 0 else "forge verify-contract returned non-zero exit code",
+        )
+
+        explorer_base = "https://testnet.snowtrace.io" if request.chain_id == 43113 else "https://snowtrace.io"
+        response = {
+            "success": exit_code == 0,
+            "exit_code": exit_code,
+            "stdout": stdout,
+            "stderr": stderr,
+            "contract_address": request.contract_address,
+            "contract_path": request.contract_path,
+            "chain_id": request.chain_id,
+            "verifier_url": verifier_url,
+            "explorer_link": f"{explorer_base}/address/{request.contract_address}#code",
+        }
+        return _cap_response_with_stdout_stderr(
+            response, "stdout/stderr truncated to stay under 50k platform limit."
+        )
+    except Exception as e:
+        return {"error": f"Snowtrace verification failed: {str(e)}"}
+
+
 DEPLOYMENT_TOOLS = [
     planning_get_current_plan,
     coding_get_current_artifacts,
@@ -449,6 +724,7 @@ DEPLOYMENT_TOOLS = [
     save_deploy_artifact,
     save_deployment_target,
     run_foundry_deploy,
+    verify_contract_on_snowtrace,
     record_deployment,
     get_deployment_history,
 ]

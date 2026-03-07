@@ -108,6 +108,14 @@ class FoundryDeployRequest(BaseModel):
         default=True,
         description="Whether to include --broadcast when running forge script.",
     )
+    quiet_output: bool = Field(
+        default=False,
+        description=(
+            "If True, forge is run without high verbosity (-v/-vv/-vvv/-vvvv) and "
+            "stdout/stderr in the response are truncated to stay under the platform 50k limit. "
+            "Use when the agent hits INVALID_ARGUMENT response length errors."
+        ),
+    )
 
 
 class FoundryDeployResult(BaseModel):
@@ -121,4 +129,47 @@ class FoundryDeployResult(BaseModel):
     deployed_address: Optional[str] = None
     stdout: Optional[str] = None
     stderr: Optional[str] = None
+
+
+class SnowtraceVerifyRequest(BaseModel):
+    """Request to verify a deployed contract on Snowtrace (Avalanche C-Chain explorer)."""
+
+    contract_address: str = Field(
+        ...,
+        description="Deployed contract address (0x...) to verify on Snowtrace.",
+    )
+    contract_path: str = Field(
+        ...,
+        description=(
+            "Contract path in format path/to/Contract.sol:ContractName, "
+            "e.g. contracts/MyToken.sol:MyToken. Must be relative to project root."
+        ),
+    )
+    chain_id: int = Field(
+        default=43113,
+        description="Chain ID. Use 43113 for Fuji testnet, 43114 for C-Chain mainnet.",
+    )
+    constructor_args: Optional[str] = Field(
+        default=None,
+        description=(
+            "ABI-encoded constructor arguments as hex (e.g. from cast abi-encode). "
+            "Omit if contract has no constructor args."
+        ),
+    )
+    compiler_version: Optional[str] = Field(
+        default=None,
+        description="Solidity compiler version (e.g. v0.8.20). If omitted, Foundry uses build cache.",
+    )
+    optimizer_runs: Optional[int] = Field(
+        default=None,
+        description="Number of optimizer runs used during compilation. Omit to use build cache.",
+    )
+    api_key_env_var: str = Field(
+        default="SNOWTRACE_API_KEY",
+        description="Environment variable name for Snowtrace API key (optional for public use).",
+    )
+    project_root: Optional[str] = Field(
+        default=None,
+        description="Foundry project root path. If omitted, uses FOUNDRY_ARTIFACT_ROOT/project_id.",
+    )
 
