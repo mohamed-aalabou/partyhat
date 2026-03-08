@@ -11,7 +11,6 @@ Tools defined here:
 
 import sys
 import os
-import asyncio
 from typing import List
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -58,8 +57,8 @@ def save_plan_draft(plan: SmartContractPlan) -> dict:
     Save an intermediate draft of the smart contract plan to memory.
 
     Call this tool:
-    - After collecting each major piece of information (project name, each
-      function, constructor details)
+    - ONCE per conversation turn after collecting a meaningful new piece of
+      information (project name, a new function, constructor details).
     - Mid-conversation, NOT just at the end, to prevent data loss if the
       session ends unexpectedly
     - After the user confirms a section is correct
@@ -84,9 +83,8 @@ def save_plan_draft(plan: SmartContractPlan) -> dict:
         mm.log_agent_action(
             agent_name="planning_agent",
             action="plan_draft_saved",
-            output_produced=plan.model_dump(),
-            why="Mid-conversation draft save to prevent data loss",
-            how="save_plan_draft tool called by planning agent",
+            why=f"Draft saved with {len(plan.contracts)} contract(s) — status: draft",
+            how="save_plan_draft tool",
         )
 
         return {
@@ -182,16 +180,17 @@ def publish_final_plan(plan: SmartContractPlan) -> dict:
         mm = _get_memory_manager()
         mm.save_plan(plan.model_dump())
 
+        decisions = [
+            f"Selected {c.erc_template or 'custom'} for contract {c.name}"
+            for c in plan.contracts
+        ]
+
         mm.log_agent_action(
             agent_name="planning_agent",
             action="plan_published",
-            output_produced=plan.model_dump(),
-            decisions_made=[
-                f"Selected {c.erc_template or 'custom'} for contract {c.name}"
-                for c in plan.contracts
-            ],
-            why="User confirmed the plan is complete and ready for code generation",
-            how="publish_final_plan tool called after user explicit approval",
+            decisions_made=decisions,
+            why="User confirmed plan complete and ready for code generation",
+            how="publish_final_plan tool",
         )
 
         return {
