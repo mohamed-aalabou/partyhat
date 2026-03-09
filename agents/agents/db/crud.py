@@ -20,13 +20,13 @@ from agents.db.models import (
 
 async def create_user(
     session: AsyncSession,
-    email: str | None = None,
+    wallet: str | None = None,
     user_id: uuid.UUID | None = None,
 ) -> User:
     """Create a user. If user_id is provided, use it; otherwise generate."""
     user = User(
         id=user_id or uuid.uuid4(),
-        email=email,
+        wallet=wallet,
     )
     session.add(user)
     await session.commit()
@@ -37,6 +37,12 @@ async def create_user(
 async def get_user_by_id(session: AsyncSession, user_id: uuid.UUID) -> User | None:
     """Fetch user by id."""
     result = await session.execute(select(User).where(User.id == user_id))
+    return result.scalar_one_or_none()
+
+
+async def get_user_by_wallet(session: AsyncSession, wallet: str) -> User | None:
+    """Fetch user by wallet address."""
+    result = await session.execute(select(User).where(User.wallet == wallet))
     return result.scalar_one_or_none()
 
 
