@@ -207,7 +207,5 @@ def get_code_storage(project_id: str | None = None) -> CodeStorage:
         "true",
         "yes",
     }
-    if use_modal:
-        return ModalVolumeCodeStorage(project_id=pid)
-    return LocalCodeStorage(project_id=pid)
+    return ModalVolumeCodeStorage(project_id=pid)
 

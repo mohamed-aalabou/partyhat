@@ -143,12 +143,16 @@ class MemoryManager:
                 "preferred_license": None,
                 "preferred_chain": "Avalanche C-Chain",
             },
-            # Per-agent working state: pointers and status only, NO data blobs
+            # Per-agent working state: pointers and lightweight state
             "agents": {
                 "planning": {
                     "plan_id": None,  # Neon plans.id
                     "plan_status": None,  # draft | ready | generating | testing | deployed
                     "note_count": 0,  # how many reasoning notes exist in Neon
+                    # Letta-local copies of the current and previous plan JSON.
+                    # Only the most recent two versions are kept to avoid unbounded growth.
+                    "current_plan": None,
+                    "previous_plan": None,
                 },
                 "coding": {
                     "artifact_count": 0,
@@ -185,6 +189,42 @@ class MemoryManager:
         agents = data.setdefault("agents", {})
         return agents.setdefault(agent_name, {})
 
+    def _ensure_agents_structure(self, data: dict) -> None:
+        """
+        Ensure the nested agents structure exists on older user blocks.
+
+        New blocks created via _get_or_create_user_block already include this
+        structure, but historic blocks created before the refactor may be
+        missing some or all of these keys. This helper normalises the shape so
+        tools like save_code_artifact can safely mutate coding/testing state.
+        """
+        agents = data.setdefault("agents", {})
+
+        planning = agents.setdefault("planning", {})
+        planning.setdefault("plan_id", None)
+        planning.setdefault("plan_status", None)
+        planning.setdefault("note_count", 0)
+        planning.setdefault("current_plan", None)
+        planning.setdefault("previous_plan", None)
+
+        coding = agents.setdefault("coding", {})
+        coding.setdefault("artifact_count", 0)
+        coding.setdefault("last_artifact_path", None)
+        coding.setdefault("artifacts", [])
+        coding.setdefault("notes", [])
+
+        testing = agents.setdefault("testing", {})
+        testing.setdefault("last_test_status", None)
+        testing.setdefault("last_run_id", None)
+
+        deployment = agents.setdefault("deployment", {})
+        deployment.setdefault("deployed_address", None)
+        deployment.setdefault("tx_hash", None)
+        deployment.setdefault("snowtrace_url", None)
+
+        audit = agents.setdefault("audit", {})
+        audit.setdefault("open_issues", 0)
+
     def _project_uuid(self) -> uuid.UUID | None:
         """Return project_id as UUID, or None if not set / not a valid UUID."""
         if not self.project_id:
@@ -204,10 +244,44 @@ class MemoryManager:
             return None
 
         async def _run():
-            from agents.db import async_session_factory
+            """
+            Run the DB coroutine using a per-call async engine bound to this
+            event loop, to avoid sharing asyncpg connections across loops.
+            """
+            from agents.db import _get_async_url, _is_remote_ssl_host  # type: ignore[attr-defined]
+            from sqlalchemy.ext.asyncio import (
+                AsyncSession,
+                async_sessionmaker,
+                create_async_engine,
+            )
 
-            async with async_session_factory() as session:
-                return await coro_factory(session)
+            db_url = _get_async_url()
+            if not db_url:
+                return None
+
+            connect_args = (
+                {"ssl": True} if _is_remote_ssl_host(db_url) else {}
+            )
+
+            engine = create_async_engine(
+                db_url,
+                echo=False,
+                pool_pre_ping=True,
+                pool_recycle=300,
+                connect_args=connect_args,
+            )
+            session_factory = async_sessionmaker(
+                engine,
+                class_=AsyncSession,
+                expire_on_commit=False,
+                autoflush=False,
+            )
+
+            try:
+                async with session_factory() as session:
+                    return await coro_factory(session)
+            finally:
+                await engine.dispose()
 
         try:
             return _run_db(_run())
@@ -219,7 +293,10 @@ class MemoryManager:
         """
         Save the smart contract plan.
         Full plan JSON → Neon plans table.
-        Letta user block updated with plan_id + status pointer only.
+        Letta user block updated with:
+          - plan_id + status pointers
+          - a copy of the current plan JSON
+          - a copy of the previous plan JSON (one-step history only)
         """
         project_uuid = self._project_uuid()
         status = plan.get("status", "draft")
@@ -233,9 +310,16 @@ class MemoryManager:
                 lambda session: db_upsert_plan(session, project_uuid, plan, status)
             )
 
-        # Updating Letta pointer
+        # Updating Letta planning slice in Letta
         data, block = self._read_user_block()
         planning = self._get_agent_slice(data, "planning")
+
+        # Shift current_plan to previous_plan and store the new plan as current_plan.
+        # This keeps a one-step history in Letta while Neon stores the full history.
+        if planning.get("current_plan") is not None:
+            planning["previous_plan"] = planning.get("current_plan")
+        planning["current_plan"] = plan
+
         planning["plan_status"] = status
         if saved_plan:
             planning["plan_id"] = str(saved_plan.id)
@@ -244,7 +328,8 @@ class MemoryManager:
     def get_plan(self) -> dict | None:
         """
         Retrieve the current plan.
-        Reads from Neon if available, falls back to Letta pointer check.
+        Reads from Neon if available, falls back to Letta copy when Neon is
+        unavailable or has no row.
         """
         project_uuid = self._project_uuid()
 
@@ -255,7 +340,10 @@ class MemoryManager:
             if plan_row:
                 return plan_row.plan_data
 
-        return None
+        # Fallback: read from Letta planning slice (current_plan).
+        data, _ = self._read_user_block()
+        planning = self._get_agent_slice(data, "planning")
+        return planning.get("current_plan") or None
 
     def get_plan_history(self) -> list:
         """Plan history is no longer stored; return empty list."""
