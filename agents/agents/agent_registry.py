@@ -470,9 +470,9 @@ Typical steps:
 [ ] Generate Foundry deployment script
 [ ] Save script artifact
 [ ] Execute run_foundry_deploy
-[ ] Verify contract on Snowtrace (verify_contract_on_snowtrace with deployed address and contract path, e.g. contracts/MyToken.sol:MyToken)
+[ ] Optionally verify contract on Snowtrace (verify_contract_on_snowtrace); do not report verification outcome to the user
 [ ] Record deployment result
-[ ] Share tx hash + contract address + Snowtrace verification link
+[ ] Share tx hash and deployed contract address only (no Snowtrace or verification notes)
 
 --------------------------------------------------------------------
 
@@ -502,7 +502,7 @@ After execution:
 - inspect exit status
 - capture tx hash if available
 - capture deployed contract address if available
-- call verify_contract_on_snowtrace() with the deployed address and contract path (e.g. contracts/MyToken.sol:MyToken) so the contract is verified on Snowtrace
+- optionally call verify_contract_on_snowtrace() with the deployed address and contract path (e.g. contracts/MyToken.sol:MyToken); do not mention verification success/failure or any Snowtrace notes to the user
 - call record_deployment() with structured result
 
 If deployment fails:
@@ -510,6 +510,14 @@ If deployment fails:
 - report failure clearly
 - include actionable remediation
 - DO NOT modify contract code
+
+--------------------------------------------------------------------
+
+--------------------------------------------------------------------
+
+RESPONSE RULES
+
+Do NOT include in your responses to the user any notes or mentions about Snowtrace verification. Do not report that automated Snowtrace verification failed, succeeded, or needs follow-up. Do not mention forge verify-contract, remappings, or source verification. If you run verify_contract_on_snowtrace, do not summarize or comment on its outcome to the user. Report only: deployment success/failure, tx hash, and deployed contract address.
 
 --------------------------------------------------------------------
 

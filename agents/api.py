@@ -22,6 +22,7 @@ from agents.db.crud import (
     create_user as db_create_user,
     create_project as db_create_project,
     get_project as db_get_project,
+    get_user_by_wallet as db_get_user_by_wallet,
     list_projects_by_user,
 )
 from agents.db.models import User, Project
@@ -204,6 +205,18 @@ class CodeArtifactsResponse(BaseModel):
     artifacts: List[Dict[str, Any]]
 
 
+class DeploymentCurrentResponse(BaseModel):
+    """Current deployment state: last deploy results for this user/project."""
+
+    last_deploy_results: List[Dict[str, Any]]
+
+
+class TestingCurrentResponse(BaseModel):
+    """Current testing state: last test results for this user/project."""
+
+    last_test_results: List[Dict[str, Any]]
+
+
 class ArtifactTreeNode(BaseModel):
     name: str
     path: str
@@ -238,13 +251,16 @@ def health_check():
 
 @app.post("/users", response_model=CreateUserResponse)
 async def create_user_endpoint(
-    email: Optional[str] = None,
+    wallet: str,
     session: AsyncSession | None = Depends(get_session),
 ):
-    """Create a new user. Returns user_id."""
+    """Create or get user by wallet. Requires wallet. If wallet is already linked, returns that user_id; otherwise creates a new user and links the wallet."""
     if session is None:
         raise HTTPException(status_code=503, detail="DATABASE_URL required")
-    user = await db_create_user(session, email=email)
+    existing = await db_get_user_by_wallet(session, wallet)
+    if existing is not None:
+        return CreateUserResponse(user_id=str(existing.id))
+    user = await db_create_user(session, wallet=wallet)
     return CreateUserResponse(user_id=str(user.id))
 
 
@@ -434,6 +450,64 @@ async def get_current_code_artifacts(
         raise HTTPException(
             status_code=500,
             detail=f"Could not retrieve code artifacts: {str(e)}",
+        )
+
+
+@app.get("/deployment/current", response_model=DeploymentCurrentResponse)
+async def get_current_deployment(
+    project_id: str = "default",
+    user_id: str = "default",
+    ctx: RequestContext = Depends(get_request_context),
+    session: AsyncSession = Depends(get_session),
+):
+    """
+    Return the last deploy results for this user/project.
+    Mirrors the behavior of get_deployment_history() from deployment_tools (last_deploy_results slice).
+    """
+    effective_project_id = project_id if project_id != "default" else ctx.project_id
+    effective_user_id = user_id if user_id != "default" else ctx.user_id
+    await ensure_project_context(effective_project_id, effective_user_id, session)
+    try:
+        mm = MemoryManager(
+            user_id=effective_user_id,
+            project_id=effective_project_id if effective_project_id != "default" else None,
+        )
+        state = mm.get_agent_state("deployment")
+        last_deploy_results = state.get("last_deploy_results", [])
+        return DeploymentCurrentResponse(last_deploy_results=last_deploy_results)
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not retrieve deployment state: {str(e)}",
+        )
+
+
+@app.get("/testing/current", response_model=TestingCurrentResponse)
+async def get_current_test_results(
+    project_id: str = "default",
+    user_id: str = "default",
+    ctx: RequestContext = Depends(get_request_context),
+    session: AsyncSession = Depends(get_session),
+):
+    """
+    Return the last test results for this user/project.
+    Mirrors the testing agent state (last_test_results from run_foundry_tests).
+    """
+    effective_project_id = project_id if project_id != "default" else ctx.project_id
+    effective_user_id = user_id if user_id != "default" else ctx.user_id
+    await ensure_project_context(effective_project_id, effective_user_id, session)
+    try:
+        mm = MemoryManager(
+            user_id=effective_user_id,
+            project_id=effective_project_id if effective_project_id != "default" else None,
+        )
+        state = mm.get_agent_state("testing")
+        last_test_results = state.get("last_test_results", [])
+        return TestingCurrentResponse(last_test_results=last_test_results)
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not retrieve test results: {str(e)}",
         )
 
 

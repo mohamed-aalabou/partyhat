@@ -22,7 +22,7 @@ class User(Base):
         primary_key=True,
         default=uuid.uuid4,
     )
-    email: Mapped[str | None] = mapped_column(Text, unique=True, nullable=True)
+    wallet: Mapped[str | None] = mapped_column(Text, unique=True, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),
