@@ -14,7 +14,9 @@ class PlanStatus(str, Enum):
     READY = "ready"  # Plan complete, Create agent can start
     GENERATING = "generating"  # Code being generated
     TESTING = "testing"  # Tests running
-    DEPLOYED = "deployed"  # On-chain, so locked forever?!
+    DEPLOYING = "deploying"  # Deployment in progress
+    DEPLOYED = "deployed"  # On-chain, immutable
+    FAILED = "failed"  # Pipeline hit an unrecoverable error
 
 
 # Functions inside a contract
