@@ -12,6 +12,7 @@ import modal
 
 from schemas.coding_schema import CodeArtifact, CodeGenerationRequest
 from agents.code_storage import get_code_storage
+from agents.task_tools import TASK_TOOLS
 from modal_foundry_app import foundry_image
 
 
@@ -246,9 +247,7 @@ def ensure_chainlink_contracts(project_root: Optional[str] = None) -> dict:
         sandbox_workdir = "/workspace/project"
         quoted_root = shlex.quote(root)
         bootstrap_cmd = (
-            "set -e; "
-            + f"cd {quoted_root}; "
-            + "mkdir -p lib; "
+            "set -e; " + f"cd {quoted_root}; " + "mkdir -p lib; "
             "if [ ! -d lib/chainlink-evm ]; then "
             "  if [ -d /opt/foundry-deps/chainlink-evm ]; then cp -R /opt/foundry-deps/chainlink-evm lib/chainlink-evm; "
             "  else git clone --depth 1 https://github.com/smartcontractkit/chainlink-evm lib/chainlink-evm; fi; "
@@ -309,5 +308,4 @@ CODING_TOOLS = [
     save_coding_note,
     load_code_artifact,
     ensure_chainlink_contracts,
-]
-
+] + TASK_TOOLS

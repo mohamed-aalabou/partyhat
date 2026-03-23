@@ -8,6 +8,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from langchain_core.tools import tool
 
 from schemas.audit_schema import AuditIssue, AuditReport
+from agents.task_tools import TASK_TOOLS
 
 
 def _get_memory_manager():
@@ -104,5 +105,4 @@ AUDIT_TOOLS = [
     save_audit_issue,
     finalize_audit_report,
     get_audit_history,
-]
-
+] + TASK_TOOLS

@@ -22,6 +22,7 @@ from agents.coding_tools import (
     load_code_artifact as coding_load_code_artifact,
     ensure_chainlink_contracts as coding_ensure_chainlink_contracts,
 )
+from agents.task_tools import TASK_TOOLS
 
 
 def _get_memory_manager():
@@ -116,7 +117,7 @@ def generate_foundry_tests_direct(
         "  - tests are in `test/`\n"
         "- Contract imports in tests MUST use `../contracts/<ContractName>.sol`.\n"
         "- NEVER import from `../src/...`.\n"
-        "- Keep `forge-std` import as `import {Test} from \"forge-std/Test.sol\";`.\n"
+        '- Keep `forge-std` import as `import {Test} from "forge-std/Test.sol";`.\n'
         "- OpenZeppelin imports MUST use `@openzeppelin/contracts/...` remapping.\n"
         "- Cover constructor behaviour, state initialisation, happy-path flows,\n"
         "  revert conditions, access control, and relevant edge cases.\n"
@@ -124,7 +125,7 @@ def generate_foundry_tests_direct(
         "  function of that interface (or the contract must be marked abstract and cannot\n"
         "  be instantiated). For Chainlink AggregatorV3Interface, implement ALL of:\n"
         "  decimals(), description(), version(), getRoundData(uint80), latestRoundData().\n"
-        "  Use stub return values (e.g. 0, \"\", or a struct of zeros) where the test\n"
+        '  Use stub return values (e.g. 0, "", or a struct of zeros) where the test\n'
         "  does not depend on them.\n"
         "- Output ONLY raw Solidity test contracts (no markdown fences, no prose).\n\n"
         f"Testing goal:\n{request.goal.strip()}"
@@ -145,7 +146,9 @@ def generate_foundry_tests_direct(
     # Guardrail normalization to keep generated tests aligned with this repo's
     # Foundry layout, even if the model drifts to common src/ conventions.
     generated_text = generated_text.replace("../src/", "../contracts/")
-    generated_text = generated_text.replace('import "forge-std/Test.sol";', 'import {Test} from "forge-std/Test.sol";')
+    generated_text = generated_text.replace(
+        'import "forge-std/Test.sol";', 'import {Test} from "forge-std/Test.sol";'
+    )
 
     return {
         "goal": request.goal,
@@ -259,8 +262,7 @@ def run_foundry_tests(
         # Always keep discovery scoped to canonical Foundry test files unless
         # the caller already provided an explicit match filter.
         has_match_filter = any(
-            a in ("--match-path", "--match-test", "--match-contract")
-            for a in user_args
+            a in ("--match-path", "--match-test", "--match-contract") for a in user_args
         )
         if not has_match_filter:
             forge_cmd.extend(["--match-path", "test/*Test.t.sol"])
@@ -304,9 +306,7 @@ def run_foundry_tests(
         quoted_root = shlex.quote(root)
         forge_cmd_str = " ".join(shlex.quote(part) for part in forge_cmd)
         bootstrap_cmd = (
-            "set -e; "
-            + f"cd {quoted_root}; "
-            + "mkdir -p lib; "
+            "set -e; " + f"cd {quoted_root}; " + "mkdir -p lib; "
             "if [ ! -d lib/forge-std ]; then "
             "  if [ -d /opt/foundry-deps/forge-std ]; then cp -R /opt/foundry-deps/forge-std lib/forge-std; "
             "  else git clone --depth 1 https://github.com/foundry-rs/forge-std lib/forge-std; fi; "
@@ -329,8 +329,7 @@ def run_foundry_tests(
             "&& [ -f lib/chainlink-evm/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol ]; then "
             "  cp lib/chainlink-evm/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol "
             "lib/chainlink-evm/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol; "
-            "fi; "
-            + forge_cmd_str
+            "fi; " + forge_cmd_str
         )
 
         sandbox = modal.Sandbox.create(
@@ -444,4 +443,4 @@ TESTING_TOOLS = [
     save_test_artifact,
     run_foundry_tests,
     save_testing_note,
-]
+] + TASK_TOOLS

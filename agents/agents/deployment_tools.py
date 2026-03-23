@@ -32,6 +32,7 @@ from agents.coding_tools import (
     get_current_artifacts as coding_get_current_artifacts,
     load_code_artifact as coding_load_code_artifact,
 )
+from agents.task_tools import TASK_TOOLS
 from agents.code_storage import get_code_storage
 
 
@@ -145,7 +146,9 @@ def generate_foundry_deploy_script_direct(
             "----------------- SOURCE END -----------------\n"
         )
 
-    args_comment = ", ".join(request.constructor_args) if request.constructor_args else "none"
+    args_comment = (
+        ", ".join(request.constructor_args) if request.constructor_args else "none"
+    )
     prompt = (
         "You are a Solidity deployment expert.\n"
         "Generate a Foundry deployment script for Avalanche Fuji.\n\n"
@@ -333,9 +336,7 @@ def run_foundry_deploy(
         if request.quiet_output:
             # Strip high verbosity so forge output stays smaller and under platform limit
             user_args = [
-                a
-                for a in user_args
-                if a not in ("-v", "-vv", "-vvv", "-vvvv")
+                a for a in user_args if a not in ("-v", "-vv", "-vvv", "-vvvv")
             ]
         forge_cmd.extend(user_args)
 
@@ -374,15 +375,15 @@ def run_foundry_deploy(
 
         quoted_root = shlex.quote(root)
         forge_cmd_str = " ".join(
-            part
-            if isinstance(part, str) and part.startswith("$")
-            else shlex.quote(str(part))
+            (
+                part
+                if isinstance(part, str) and part.startswith("$")
+                else shlex.quote(str(part))
+            )
             for part in forge_cmd
         )
         bootstrap_cmd = (
-            "set -e; "
-            + f"cd {quoted_root}; "
-            + "mkdir -p lib; "
+            "set -e; " + f"cd {quoted_root}; " + "mkdir -p lib; "
             "if [ ! -d lib/forge-std ]; then "
             "  if [ -d /opt/foundry-deps/forge-std ]; then cp -R /opt/foundry-deps/forge-std lib/forge-std; "
             "  else git clone --depth 1 https://github.com/foundry-rs/forge-std lib/forge-std; fi; "
@@ -405,8 +406,7 @@ def run_foundry_deploy(
             "&& [ -f lib/chainlink-evm/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol ]; then "
             "  cp lib/chainlink-evm/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol "
             "lib/chainlink-evm/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol; "
-            "fi; "
-            + forge_cmd_str
+            "fi; " + forge_cmd_str
         )
 
         sandbox = modal.Sandbox.create(
@@ -470,7 +470,9 @@ def run_foundry_deploy(
             output_produced=entry,
             why="Deployment agent executed forge script broadcast in Modal Sandbox",
             how="run_foundry_deploy tool (Modal Sandbox)",
-            error=None if exit_code == 0 else "forge script returned non-zero exit code",
+            error=(
+                None if exit_code == 0 else "forge script returned non-zero exit code"
+            ),
         )
 
         response = {
@@ -546,8 +548,8 @@ def get_deployment_history() -> dict:
 
 # Snowtrace (Etherscan-compatible) API base URLs per chain
 SNOWTRACE_VERIFIER_URLS = {
-    43113: "https://api-testnet.snowtrace.io/api",   # Fuji testnet
-    43114: "https://api.snowtrace.io/api",           # Avalanche C-Chain mainnet
+    43113: "https://api-testnet.snowtrace.io/api",  # Fuji testnet
+    43114: "https://api.snowtrace.io/api",  # Avalanche C-Chain mainnet
 }
 
 
@@ -578,7 +580,12 @@ def verify_contract_on_snowtrace(
         default_root = os.getenv("FOUNDRY_ARTIFACT_ROOT", "generated_contracts")
         if project_id_ctx:
             default_root = f"{default_root.rstrip('/')}/{project_id_ctx}"
-        root = project_root or request.project_root or os.getenv("FOUNDRY_PROJECT_ROOT") or default_root
+        root = (
+            project_root
+            or request.project_root
+            or os.getenv("FOUNDRY_PROJECT_ROOT")
+            or default_root
+        )
 
         forge_cmd = [
             "forge",
@@ -632,9 +639,7 @@ def verify_contract_on_snowtrace(
         quoted_root = shlex.quote(root)
         forge_cmd_str = " ".join(shlex.quote(str(part)) for part in forge_cmd)
         bootstrap_cmd = (
-            "set -e; "
-            + f"cd {quoted_root}; "
-            + "mkdir -p lib; "
+            "set -e; " + f"cd {quoted_root}; " + "mkdir -p lib; "
             "if [ ! -d lib/forge-std ]; then "
             "  if [ -d /opt/foundry-deps/forge-std ]; then cp -R /opt/foundry-deps/forge-std lib/forge-std; "
             "  else git clone --depth 1 https://github.com/foundry-rs/forge-std lib/forge-std; fi; "
@@ -657,8 +662,7 @@ def verify_contract_on_snowtrace(
             "&& [ -f lib/chainlink-evm/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol ]; then "
             "  cp lib/chainlink-evm/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol "
             "lib/chainlink-evm/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol; "
-            "fi; "
-            + forge_cmd_str
+            "fi; " + forge_cmd_str
         )
 
         sandbox = modal.Sandbox.create(
@@ -694,10 +698,18 @@ def verify_contract_on_snowtrace(
             },
             why="Deployment agent ran Snowtrace contract verification",
             how="verify_contract_on_snowtrace tool",
-            error=None if exit_code == 0 else "forge verify-contract returned non-zero exit code",
+            error=(
+                None
+                if exit_code == 0
+                else "forge verify-contract returned non-zero exit code"
+            ),
         )
 
-        explorer_base = "https://testnet.snowtrace.io" if request.chain_id == 43113 else "https://snowtrace.io"
+        explorer_base = (
+            "https://testnet.snowtrace.io"
+            if request.chain_id == 43113
+            else "https://snowtrace.io"
+        )
         response = {
             "success": exit_code == 0,
             "exit_code": exit_code,
@@ -727,4 +739,4 @@ DEPLOYMENT_TOOLS = [
     verify_contract_on_snowtrace,
     record_deployment,
     get_deployment_history,
-]
+] + TASK_TOOLS
