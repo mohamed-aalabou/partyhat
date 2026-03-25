@@ -16,6 +16,17 @@ from agents.db.crud import (
     get_pipeline_run_tasks,
 )
 from agents.memory_manager import MemoryManager
+from agents.agent_registry import stream_chat_with_intent
+from agents.pipeline_cancel import is_pipeline_cancelled, clear_cancellation
+from agents.db import async_session_factory
+from agents.db.crud import (
+    create_pipeline_task,
+    get_next_pending_task,
+    set_task_in_progress,
+    get_pipeline_task_count,
+    get_pipeline_run_tasks,
+)
+from agents.memory_manager import MemoryManager
 
 MAX_ITERATIONS = 10  # Just a hard cap to prevent infinite agent loops
 
@@ -48,6 +59,20 @@ async def run_autonomous_pipeline(
     user_id: str,
     max_iterations: int = MAX_ITERATIONS,
 ) -> AsyncIterator[dict]:
+    """
+    Run the autonomous post-approval pipeline.
+
+    Yields structured event dicts for SSE streaming to the frontend:
+        {"type": "pipeline_start",   "pipeline_run_id": "..."}
+        {"type": "stage_start",      "stage": "coding", "task_id": "...", "description": "..."}
+        {"type": "agent_message",    "stage": "coding", "content": "..."}
+        {"type": "tool_call",        "stage": "coding", "tool": "save_code_artifact", "args": "..."}
+        {"type": "stage_complete",   "stage": "coding", "task_id": "..."}
+        {"type": "pipeline_complete","pipeline_run_id": "...", "tasks_completed": 3}
+        {"type": "pipeline_cancelled","pipeline_run_id": "...", "stage": "..."}
+        {"type": "pipeline_error",   "stage": "testing", "error": "..."}
+    """
+
     pipeline_run_id = str(uuid.uuid4())
 
     yield {
@@ -82,6 +107,16 @@ async def run_autonomous_pipeline(
 
     while iteration < max_iterations:
         iteration += 1
+
+        if is_pipeline_cancelled(pipeline_run_id):
+            yield {
+                "type": "pipeline_cancelled",
+                "pipeline_run_id": pipeline_run_id,
+                "iteration": iteration,
+            }
+            _update_plan_status(project_id, user_id, "ready")
+            clear_cancellation(pipeline_run_id)
+            break
 
         set_project_context(project_id, user_id)
         set_pipeline_run_id(pipeline_run_id)
@@ -146,6 +181,18 @@ async def run_autonomous_pipeline(
                 user_message=task.description,
                 project_id=project_id,
             ):
+                if is_pipeline_cancelled(pipeline_run_id):
+                    yield {
+                        "type": "pipeline_cancelled",
+                        "pipeline_run_id": pipeline_run_id,
+                        "stage": stage,
+                        "iteration": iteration,
+                    }
+                    _update_plan_status(project_id, user_id, "ready")
+                    clear_cancellation(pipeline_run_id)
+                    clear_project_context()
+                    return
+
                 if event.get("type") == "step":
                     step_event = {"type": "agent_message", "stage": stage}
                     if event.get("content"):

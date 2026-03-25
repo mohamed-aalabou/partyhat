@@ -33,6 +33,7 @@ from agents.code_storage import get_code_storage
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agents.pipeline_orchestrator import run_autonomous_pipeline, get_pipeline_status
+from agents.pipeline_cancel import cancel_pipeline_run
 from agents.db import async_session_factory
 
 load_dotenv()
@@ -947,3 +948,23 @@ async def pipeline_status(
     if "error" in result:
         raise HTTPException(status_code=500, detail=result["error"])
     return result
+
+
+@app.post("/pipeline/cancel")
+async def cancel_pipeline(
+    request: PipelineCancelRequest,
+    ctx: RequestContext = Depends(get_request_context),
+    session: AsyncSession = Depends(get_session),
+):
+    """
+    Cancel a running pipeline. The orchestrator will stop at the next
+    safe point (between agent tasks or mid-stream) and reset the plan
+    status back to 'ready' so the user can modify and re-run.
+    """
+    await ensure_project_context(request.project_id, ctx.user_id, session)
+    cancel_pipeline_run(request.pipeline_run_id)
+    return {
+        "success": True,
+        "message": "Cancellation requested. The pipeline will stop at the next safe point.",
+        "pipeline_run_id": request.pipeline_run_id,
+    }
