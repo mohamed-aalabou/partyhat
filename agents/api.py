@@ -13,7 +13,6 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 
-from agents.planning_agent import build_planning_agent, chat
 from agents.agent_registry import chat_with_intent, stream_chat_with_intent
 from agents.memory_manager import MemoryManager
 from agents.context import set_project_context, get_project_context
@@ -52,9 +51,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-planning_agent = build_planning_agent()
 
 
 @app.on_event("startup")
@@ -365,8 +361,8 @@ async def start_session(
     await ensure_project_context(project_id, user_id, session)
 
     try:
-        result = chat(
-            agent=planning_agent,
+        result = chat_with_intent(
+            intent="planning",
             session_id=session_id,
             user_message="Hello, I want to plan a new smart contract.",
             project_id=project_id if project_id != "default" else None,
@@ -395,8 +391,8 @@ async def send_message(
     await ensure_project_context(project_id, user_id, session)
 
     try:
-        result = chat(
-            agent=planning_agent,
+        result = chat_with_intent(
+            intent="planning",
             session_id=request.session_id,
             user_message=request.message,
             project_id=project_id if project_id != "default" else None,
