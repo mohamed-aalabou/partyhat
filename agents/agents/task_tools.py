@@ -4,34 +4,66 @@ Two tools added to every agent (except planning) for the autonomous pipeline:
     1. get_my_current_task:read what work has been assigned to this agent
     2. complete_task_and_create_next: mark current task done, push next task(s)
 
-These tools read/write to the Neon pipeline_tasks table via async CRUD,
-bridged into sync context for LangChain @tool compatibility.
+These tools use SYNCHRONOUS SQLAlchemy sessions to avoid event loop
+conflicts. LangChain tools are sync functions called from within an
+async context (FastAPI → agent.astream → tool). Using asyncio.run()
+in a thread creates a new event loop that conflicts with asyncpg's
+connection pool on the original loop. Sync psycopg2 sessions sidestep
+this entirely.
 """
 
-import asyncio
 import os
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from typing import List, Optional
 
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
+from sqlalchemy import create_engine, select, desc
+from sqlalchemy.orm import Session, sessionmaker
 
 
-# LangChain tools are sync and our DB CRUD is async. We use a dedicated thread
-# pool so asyncio.run() always gets a fresh event loop, avoiding conflicts with FastAPI's running loop.
+def _get_sync_url() -> str:
+    """Convert DATABASE_URL to a sync-compatible URL for psycopg2."""
+    url = os.getenv("DATABASE_URL", "")
+    # Removing async driver prefixes
+    if url.startswith("postgresql+asyncpg://"):
+        url = url.replace("postgresql+asyncpg://", "postgresql://", 1)
+    # Ensuring it starts with postgresql://
+    if not url.startswith("postgresql://"):
+        url = "postgresql://localhost/partyhat"
+    return url
 
-_db_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="pipeline-task")
+
+def _is_remote_ssl_host(url: str) -> bool:
+    if not url or "localhost" in url or "127.0.0.1" in url:
+        return False
+    return "neon.tech" in url or ".aws.neon.tech" in url
 
 
-def _run_async(coro):
-    """Run an async coroutine from sync tool context safely."""
-    future = _db_executor.submit(asyncio.run, coro)
-    return future.result()
+_sync_url = _get_sync_url()
+_sync_engine = (
+    create_engine(
+        _sync_url,
+        pool_pre_ping=True,
+        pool_recycle=300,
+        connect_args={"sslmode": "require"} if _is_remote_ssl_host(_sync_url) else {},
+    )
+    if os.getenv("DATABASE_URL")
+    else None
+)
+
+_SyncSession = sessionmaker(bind=_sync_engine) if _sync_engine else None
+
+
+def _get_sync_session() -> Session | None:
+    if _SyncSession is None:
+        return None
+    return _SyncSession()
 
 
 def _db_available() -> bool:
-    return bool(os.getenv("DATABASE_URL"))
+    return _sync_engine is not None
 
 
 def _get_context():
@@ -43,16 +75,28 @@ def _get_context():
     return project_id, user_id, pipeline_run_id
 
 
-async def _get_current_task_async(pipeline_run_id: str):
-    """Fetch the in-progress task for this pipeline run."""
-    from agents.db import async_session_factory
-    from agents.db.crud import get_current_in_progress_task
+def _get_current_task_sync(pipeline_run_id: str):
+    """Fetch the in-progress task for this pipeline run (sync)."""
+    from agents.db.models import PipelineTask
 
-    async with async_session_factory() as session:
-        return await get_current_in_progress_task(session, uuid.UUID(pipeline_run_id))
+    session = _get_sync_session()
+    if session is None:
+        return None
+    try:
+        result = session.execute(
+            select(PipelineTask)
+            .where(
+                PipelineTask.pipeline_run_id == uuid.UUID(pipeline_run_id),
+                PipelineTask.status == "in_progress",
+            )
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
+    finally:
+        session.close()
 
 
-async def _complete_and_create_async(
+def _complete_and_create_sync(
     pipeline_run_id: str,
     project_id: str,
     task_id: str,
@@ -60,24 +104,35 @@ async def _complete_and_create_async(
     next_tasks: list[dict],
     created_by: str,
 ):
-    """Complete current task and create next tasks in a single session."""
-    from agents.db import async_session_factory
-    from agents.db.crud import complete_task, create_pipeline_task
+    """Complete current task and create next tasks in a single session (sync)."""
+    from agents.db.models import PipelineTask
 
-    async with async_session_factory() as session:
-        await complete_task(session, uuid.UUID(task_id), result_summary)
+    session = _get_sync_session()
+    if session is None:
+        return []
+    try:
+        task = session.execute(
+            select(PipelineTask).where(PipelineTask.id == uuid.UUID(task_id))
+        ).scalar_one_or_none()
+
+        if task:
+            task.status = "completed"
+            task.result_summary = result_summary
+            task.completed_at = datetime.now(timezone.utc)
 
         created = []
         for t in next_tasks:
-            new_task = await create_pipeline_task(
-                session,
+            new_task = PipelineTask(
                 pipeline_run_id=uuid.UUID(pipeline_run_id),
                 project_id=uuid.UUID(project_id),
                 assigned_to=t["assigned_to"],
                 created_by=created_by,
                 description=t["description"],
+                status="pending",
                 context=t.get("context"),
             )
+            session.add(new_task)
+            session.flush()  # getting the ID
             created.append(
                 {
                     "id": str(new_task.id),
@@ -85,7 +140,14 @@ async def _complete_and_create_async(
                     "description": new_task.description,
                 }
             )
+
+        session.commit()
         return created
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
 
 
 class NextTask(BaseModel):
@@ -149,7 +211,7 @@ def get_my_current_task() -> dict:
     Returns the task details or an error if no task is found.
     """
     if not _db_available():
-        return {"error": "DATABASE_URL not configured — pipeline tasks require Neon"}
+        return {"error": "DATABASE_URL not configured; pipeline tasks require Neon"}
 
     project_id, user_id, pipeline_run_id = _get_context()
 
@@ -162,7 +224,7 @@ def get_my_current_task() -> dict:
         }
 
     try:
-        task = _run_async(_get_current_task_async(pipeline_run_id))
+        task = _get_current_task_sync(pipeline_run_id)
         if task is None:
             return {"error": "No in-progress task found for this pipeline run."}
 
@@ -234,7 +296,7 @@ def complete_task_and_create_next(input: CompleteTaskInput) -> dict:
         return {"error": "No project_id in context."}
 
     try:
-        task = _run_async(_get_current_task_async(pipeline_run_id))
+        task = _get_current_task_sync(pipeline_run_id)
         if task is None:
             return {"error": "No in-progress task found to complete."}
 
@@ -248,15 +310,13 @@ def complete_task_and_create_next(input: CompleteTaskInput) -> dict:
                     )
                 }
 
-        created = _run_async(
-            _complete_and_create_async(
-                pipeline_run_id=pipeline_run_id,
-                project_id=project_id,
-                task_id=str(task.id),
-                result_summary=input.result_summary,
-                next_tasks=[nt.model_dump() for nt in input.next_tasks],
-                created_by=task.assigned_to,  # the current agent is the creator
-            )
+        created = _complete_and_create_sync(
+            pipeline_run_id=pipeline_run_id,
+            project_id=project_id,
+            task_id=str(task.id),
+            result_summary=input.result_summary,
+            next_tasks=[nt.model_dump() for nt in input.next_tasks],
+            created_by=task.assigned_to,  # current agent is the creator
         )
 
         result = {
