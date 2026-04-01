@@ -879,7 +879,7 @@ async def run_pipeline(
                 status_code=404, detail="No plan found. Complete planning first."
             )
         plan_status = plan.get("status", "draft")
-        if plan_status not in ("ready",):
+        if "ready" not in plan_status.lower():
             raise HTTPException(
                 status_code=400,
                 detail=f"Plan is not ready for pipeline execution (current status: '{plan_status}'). Approve the plan first.",
