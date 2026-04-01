@@ -17,13 +17,14 @@ from agents.planning_agent import build_planning_agent, chat
 from agents.agent_registry import chat_with_intent, stream_chat_with_intent
 from agents.memory_manager import MemoryManager
 from agents.context import set_project_context, get_project_context
-from agents.db import get_session, create_tables
+from agents.db import get_session, create_tables, async_session_factory
 from agents.db.crud import (
     create_user as db_create_user,
     create_project as db_create_project,
     get_project as db_get_project,
     get_user_by_wallet as db_get_user_by_wallet,
     list_projects_by_user,
+    update_project as db_update_project,
 )
 from agents.db.models import User, Project
 from schemas.plan_schema import PlanStatus
@@ -104,6 +105,76 @@ async def ensure_project_context(
     set_project_context(project_id, user_id)
 
 
+def _parse_project_uuid(project_id: str) -> uuid.UUID | None:
+    if not project_id or project_id == "default":
+        return None
+    try:
+        return uuid.UUID(project_id)
+    except ValueError:
+        return None
+
+
+async def _append_chat_message(
+    session: AsyncSession | None,
+    project_id: str,
+    session_id: str,
+    sender: str,
+    content: str,
+) -> None:
+    if session is None:
+        return
+    project_uuid = _parse_project_uuid(project_id)
+    if project_uuid is None:
+        return
+    if sender not in ("user", "agent"):
+        return
+    if not content or not content.strip():
+        return
+    from agents.db.crud import append_message as db_append_message
+
+    await db_append_message(
+        session,
+        project_id=project_uuid,
+        session_id=session_id,
+        sender=sender,
+        content=content,
+    )
+
+
+async def _append_chat_message_new_session(
+    project_uuid: uuid.UUID | None,
+    session_id: str,
+    sender: str,
+    content: str,
+) -> None:
+    """
+    Streaming responses outlive the request lifecycle; use a fresh DB session.
+    """
+    if project_uuid is None:
+        return
+    if sender not in ("user", "agent"):
+        return
+    if not content or not content.strip():
+        return
+    if not os.getenv("DATABASE_URL"):
+        return
+    from agents.db.crud import append_message as db_append_message
+
+    async with async_session_factory() as db_session:
+        await db_append_message(
+            db_session,
+            project_id=project_uuid,
+            session_id=session_id,
+            sender=sender,
+            content=content,
+        )
+
+
+class AnswerRecommendationResponse(BaseModel):
+    text: str
+    recommended: Optional[bool] = None
+
+
 class StartSessionRequest(BaseModel):
     project_id: Optional[str] = None
     user_id: Optional[str] = None
@@ -112,6 +183,7 @@ class StartSessionRequest(BaseModel):
 class StartSessionResponse(BaseModel):
     session_id: str
     message: str  # agent's opening message
+    answer_recommendations: List[AnswerRecommendationResponse] = []
 
 
 class CreateUserResponse(BaseModel):
@@ -121,6 +193,7 @@ class CreateUserResponse(BaseModel):
 class CreateProjectRequest(BaseModel):
     user_id: str
     name: Optional[str] = None
+    screenshot_base64: Optional[str] = None
 
 
 class CreateProjectResponse(BaseModel):
@@ -131,7 +204,13 @@ class ProjectResponse(BaseModel):
     id: str
     user_id: str
     name: Optional[str]
+    screenshot_base64: Optional[str]
     created_at: str
+
+
+class UpdateProjectRequest(BaseModel):
+    name: Optional[str] = None
+    screenshot_base64: Optional[str] = None
 
 
 class RequestContext(BaseModel):
@@ -174,10 +253,10 @@ class MessageResponse(BaseModel):
     session_id: str
     response: str
     tool_calls: list[str]  # which tools were called
+    answer_recommendations: List[AnswerRecommendationResponse] = []
 
 
 class PlanResponse(BaseModel):
-    session_id: str
     plan: Optional[dict]
     status: Optional[str]
 
@@ -250,9 +329,65 @@ class MemorySnapshotResponse(BaseModel):
     global_memory: Dict[str, Any]
 
 
+class ChatMessageResponse(BaseModel):
+    id: str
+    project_id: str
+    session_id: str
+    sender: str
+    content: str
+    created_at: str
+
+
+class ListMessagesResponse(BaseModel):
+    messages: List[ChatMessageResponse]
+
+
 @app.get("/health")
 def health_check():
     return {"status": "ok", "service": "partyhat-agents"}
+
+
+@app.get("/messages", response_model=ListMessagesResponse)
+async def list_messages_endpoint(
+    session_id: Optional[str] = None,
+    limit: int = 200,
+    project_id: str = "default",
+    user_id: str = "default",
+    ctx: RequestContext = Depends(get_request_context),
+    session: AsyncSession | None = Depends(get_session),
+):
+    effective_project_id = project_id if project_id != "default" else ctx.project_id
+    effective_user_id = user_id if user_id != "default" else ctx.user_id
+    await ensure_project_context(effective_project_id, effective_user_id, session)
+
+    if session is None:
+        raise HTTPException(status_code=503, detail="DATABASE_URL required")
+
+    project_uuid = _parse_project_uuid(effective_project_id)
+    if project_uuid is None:
+        raise HTTPException(status_code=400, detail="project_id is required")
+
+    from agents.db.crud import list_messages as db_list_messages
+
+    rows = await db_list_messages(
+        session,
+        project_id=project_uuid,
+        session_id=session_id,
+        limit=limit,
+    )
+    return ListMessagesResponse(
+        messages=[
+            ChatMessageResponse(
+                id=str(r.id),
+                project_id=str(r.project_id),
+                session_id=r.session_id,
+                sender=r.sender,
+                content=r.content,
+                created_at=r.created_at.isoformat(),
+            )
+            for r in rows
+        ]
+    )
 
 
 @app.post("/users", response_model=CreateUserResponse)
@@ -282,7 +417,12 @@ async def create_project_endpoint(
         user_uuid = uuid.UUID(request.user_id)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid user_id format")
-    project = await db_create_project(session, user_id=user_uuid, name=request.name)
+    project = await db_create_project(
+        session,
+        user_id=user_uuid,
+        name=request.name,
+        screenshot_base64=request.screenshot_base64,
+    )
     return CreateProjectResponse(project_id=str(project.id))
 
 
@@ -304,6 +444,32 @@ async def list_projects_endpoint(
             id=str(p.id),
             user_id=str(p.user_id),
             name=p.name,
+            screenshot_base64=p.screenshot_base64,
+            created_at=p.created_at.isoformat(),
+        )
+        for p in projects
+    ]
+
+
+@app.get("/users/{user_id}/projects", response_model=List[ProjectResponse])
+async def list_projects_by_user_endpoint(
+    user_id: str,
+    session: AsyncSession | None = Depends(get_session),
+):
+    """List all projects for a user (alias endpoint)."""
+    if session is None:
+        raise HTTPException(status_code=503, detail="DATABASE_URL required")
+    try:
+        user_uuid = uuid.UUID(user_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid user_id format")
+    projects = await list_projects_by_user(session, user_uuid)
+    return [
+        ProjectResponse(
+            id=str(p.id),
+            user_id=str(p.user_id),
+            name=p.name,
+            screenshot_base64=p.screenshot_base64,
             created_at=p.created_at.isoformat(),
         )
         for p in projects
@@ -331,6 +497,41 @@ async def get_project_endpoint(
         id=str(project.id),
         user_id=str(project.user_id),
         name=project.name,
+        screenshot_base64=project.screenshot_base64,
+        created_at=project.created_at.isoformat(),
+    )
+
+
+@app.patch("/projects/{project_id}", response_model=ProjectResponse)
+async def update_project_endpoint(
+    project_id: str,
+    request: UpdateProjectRequest,
+    session: AsyncSession | None = Depends(get_session),
+):
+    """Update project name by project id."""
+    if session is None:
+        raise HTTPException(status_code=503, detail="DATABASE_URL required")
+    try:
+        proj_uuid = uuid.UUID(project_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid project_id format")
+
+    update_data = request.model_dump(exclude_unset=True)
+    project = await db_update_project(
+        session,
+        proj_uuid,
+        name=update_data.get("name"),
+        screenshot_base64=update_data.get("screenshot_base64"),
+        set_name="name" in update_data,
+        set_screenshot_base64="screenshot_base64" in update_data,
+    )
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return ProjectResponse(
+        id=str(project.id),
+        user_id=str(project.user_id),
+        name=project.name,
+        screenshot_base64=project.screenshot_base64,
         created_at=project.created_at.isoformat(),
     )
 
@@ -363,6 +564,7 @@ async def start_session(
         return StartSessionResponse(
             session_id=session_id,
             message=result["response"],
+            answer_recommendations=result.get("answer_recommendations", []),
         )
     except Exception as e:
         raise HTTPException(
@@ -374,7 +576,7 @@ async def start_session(
 async def send_message(
     request: MessageRequest,
     ctx: RequestContext = Depends(get_request_context),
-    session: AsyncSession = Depends(get_session),
+    session: AsyncSession | None = Depends(get_session),
 ):
     if not request.message.strip():
         raise HTTPException(status_code=400, detail="Message cannot be empty")
@@ -384,16 +586,31 @@ async def send_message(
     await ensure_project_context(project_id, user_id, session)
 
     try:
+        await _append_chat_message(
+            session=session,
+            project_id=project_id,
+            session_id=request.session_id,
+            sender="user",
+            content=request.message,
+        )
         result = chat(
             agent=planning_agent,
             session_id=request.session_id,
             user_message=request.message,
             project_id=project_id if project_id != "default" else None,
         )
+        await _append_chat_message(
+            session=session,
+            project_id=project_id,
+            session_id=request.session_id,
+            sender="agent",
+            content=result.get("response", ""),
+        )
         return MessageResponse(
             session_id=result["session_id"],
             response=result["response"],
             tool_calls=result["tool_calls"],
+            answer_recommendations=result.get("answer_recommendations", []),
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Agent error: {str(e)}")
@@ -401,7 +618,6 @@ async def send_message(
 
 @app.get("/plan/current", response_model=PlanResponse)
 async def get_current_plan(
-    session_id: str,
     project_id: str = "default",
     user_id: str = "default",
     ctx: RequestContext = Depends(get_request_context),
@@ -418,11 +634,10 @@ async def get_current_plan(
         plan = mm.get_plan()
         if plan:
             return PlanResponse(
-                session_id=session_id,
                 plan=plan,
                 status=plan.get("status", PlanStatus.DRAFT.value),
             )
-        return PlanResponse(session_id=session_id, plan=None, status=None)
+        return PlanResponse(plan=None, status=None)
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"Could not retrieve plan: {str(e)}"
@@ -431,7 +646,6 @@ async def get_current_plan(
 
 @app.get("/coding/current", response_model=CodeArtifactsResponse)
 async def get_current_code_artifacts(
-    session_id: str,
     project_id: str = "default",
     user_id: str = "default",
     ctx: RequestContext = Depends(get_request_context),
@@ -706,7 +920,7 @@ async def get_full_memory_snapshot(
 async def routed_message(
     request: RoutedMessageRequest,
     ctx: RequestContext = Depends(get_request_context),
-    session: AsyncSession = Depends(get_session),
+    session: AsyncSession | None = Depends(get_session),
 ):
     """
     Generic entrypoint that routes the message to the appropriate agent based on intent.
@@ -720,16 +934,31 @@ async def routed_message(
     await ensure_project_context(project_id, user_id, session)
 
     try:
+        await _append_chat_message(
+            session=session,
+            project_id=project_id,
+            session_id=request.session_id,
+            sender="user",
+            content=request.message,
+        )
         result = chat_with_intent(
             intent=request.intent,
             session_id=request.session_id,
             user_message=request.message,
             project_id=project_id if project_id != "default" else None,
         )
+        await _append_chat_message(
+            session=session,
+            project_id=project_id,
+            session_id=request.session_id,
+            sender="agent",
+            content=result.get("response", ""),
+        )
         return MessageResponse(
             session_id=result["session_id"],
             response=result["response"],
             tool_calls=result["tool_calls"],
+            answer_recommendations=result.get("answer_recommendations", []),
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -741,7 +970,7 @@ async def routed_message(
 async def routed_message_stream(
     request: RoutedMessageRequest,
     ctx: RequestContext = Depends(get_request_context),
-    session: AsyncSession = Depends(get_session),
+    session: AsyncSession | None = Depends(get_session),
 ):
     """
     Stream agent responses and tool calls via Server-Sent Events.
@@ -755,6 +984,15 @@ async def routed_message_stream(
     user_id = request.user_id or ctx.user_id
     await ensure_project_context(project_id, user_id, session)
 
+    project_uuid = _parse_project_uuid(project_id)
+    await _append_chat_message(
+        session=session,
+        project_id=project_id,
+        session_id=request.session_id,
+        sender="user",
+        content=request.message,
+    )
+
     async def event_stream():
         try:
             async for event in stream_chat_with_intent(
@@ -763,6 +1001,13 @@ async def routed_message_stream(
                 user_message=request.message,
                 project_id=project_id if project_id != "default" else None,
             ):
+                if event.get("type") == "done":
+                    await _append_chat_message_new_session(
+                        project_uuid=project_uuid,
+                        session_id=request.session_id,
+                        sender="agent",
+                        content=event.get("response", "") or "",
+                    )
                 yield f"data: {json.dumps(event)}\n\n"
         except ValueError as e:
             yield f"data: {json.dumps({'type': 'error', 'detail': str(e)})}\n\n"

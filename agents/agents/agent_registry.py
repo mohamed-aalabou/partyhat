@@ -12,7 +12,11 @@ from deepagents import create_deep_agent
 from deepagents.backends import FilesystemBackend
 from langgraph.checkpoint.memory import MemorySaver
 
-from agents.planning_tools import PLANNING_TOOLS
+from agents.planning_tools import (
+    PLANNING_TOOLS,
+    get_answer_recommendations,
+    clear_answer_recommendations,
+)
 from agents.coding_tools import CODING_TOOLS
 from agents.testing_tools import TESTING_TOOLS
 from agents.deployment_tools import DEPLOYMENT_TOOLS
@@ -36,6 +40,9 @@ You have access to tools. Use them actively and consciously:
   Do NOT wait until the end, save frequently to prevent data loss
 - Call save_reasoning_note() whenever a significant decision is made or
   clarified (why ERC-721 over ERC-20, why a function was added, etc.)
+- Call send_answer_recommendations() whenever you ask a question, to provide
+  2-5 suggested answer options. Each option must include text, and may include
+  recommended=true for preferred choices.
 - Call validate_plan() when you believe you have a complete plan
 - Call publish_final_plan() ONLY after the user explicitly confirms they
   are happy with everything
@@ -628,6 +635,8 @@ def chat_with_intent(
     agent = get_agent_for_intent(intent)
     thread_id = project_id if project_id else session_id
     config = {"configurable": {"thread_id": thread_id}}
+    if intent == "planning":
+        clear_answer_recommendations()
 
     result = agent.invoke(
         {"messages": [HumanMessage(content=user_message)]},
@@ -647,6 +656,9 @@ def chat_with_intent(
         "session_id": session_id,
         "response": response_text,
         "tool_calls": tool_calls_made,
+        "answer_recommendations": (
+            get_answer_recommendations() if intent == "planning" else []
+        ),
     }
 
 
@@ -680,6 +692,8 @@ async def stream_chat_with_intent(
     agent = get_agent_for_intent(intent)
     thread_id = project_id if project_id else session_id
     config = {"configurable": {"thread_id": thread_id}}
+    if intent == "planning":
+        clear_answer_recommendations()
 
     last_chunk = None
     async for chunk in agent.astream(
@@ -718,5 +732,8 @@ async def stream_chat_with_intent(
             "session_id": session_id,
             "response": response_text,
             "tool_calls": tool_calls_made,
+            "answer_recommendations": (
+                get_answer_recommendations() if intent == "planning" else []
+            ),
         }
 

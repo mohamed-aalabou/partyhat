@@ -15,6 +15,7 @@ from agents.db.models import (
     AgentLogEntry,
     TestRun,
     Deployment,
+    Message,
 )
 
 
@@ -50,6 +51,7 @@ async def create_project(
     session: AsyncSession,
     user_id: uuid.UUID,
     name: str | None = None,
+    screenshot_base64: str | None = None,
     project_id: uuid.UUID | None = None,
 ) -> Project:
     """Create a project for the given user."""
@@ -57,6 +59,7 @@ async def create_project(
         id=project_id or uuid.uuid4(),
         user_id=user_id,
         name=name,
+        screenshot_base64=screenshot_base64,
     )
     session.add(project)
     await session.commit()
@@ -90,6 +93,27 @@ async def list_projects_by_user(
         .order_by(Project.created_at.desc())
     )
     return list(result.scalars().all())
+
+
+async def update_project(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    name: str | None = None,
+    screenshot_base64: str | None = None,
+    set_name: bool = False,
+    set_screenshot_base64: bool = False,
+) -> Project | None:
+    """Update project fields by id; only provided fields are modified."""
+    project = await get_project(session, project_id)
+    if project is None:
+        return None
+    if set_name:
+        project.name = name
+    if set_screenshot_base64:
+        project.screenshot_base64 = screenshot_base64
+    await session.commit()
+    await session.refresh(project)
+    return project
 
 
 # Plans
@@ -330,4 +354,47 @@ async def list_deployments(
         .where(Deployment.project_id == project_id)
         .order_by(Deployment.created_at.desc())
     )
+    return list(result.scalars().all())
+
+
+# Messages
+async def append_message(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    session_id: str,
+    sender: str,
+    content: str,
+) -> Message:
+    """
+    Persist one chat message for a project + session.
+    Sender is expected to be: "user" | "agent" (enforced by callers).
+    """
+    row = Message(
+        project_id=project_id,
+        session_id=session_id,
+        sender=sender,
+        content=content,
+    )
+    session.add(row)
+    await session.commit()
+    await session.refresh(row)
+    return row
+
+
+async def list_messages(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    session_id: str | None = None,
+    limit: int = 200,
+) -> list[Message]:
+    """List messages for a project, chronological; optionally filter by session."""
+    query = (
+        select(Message)
+        .where(Message.project_id == project_id)
+        .order_by(Message.created_at.asc())
+        .limit(limit)
+    )
+    if session_id:
+        query = query.where(Message.session_id == session_id)
+    result = await session.execute(query)
     return list(result.scalars().all())

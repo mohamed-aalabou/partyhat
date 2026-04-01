@@ -374,6 +374,27 @@ def run_foundry_tests(
             value=mm._serialize(data),  # type: ignore[attr-defined]
         )
 
+        # Keep existing Letta behavior, and additionally persist this run in Neon
+        # when DB/project context is available.
+        try:
+            project_uuid = mm._project_uuid()  # type: ignore[attr-defined]
+            if project_uuid and getattr(mm, "_db_available", False):
+                from agents.db.crud import save_test_run as db_save_test_run
+
+                mm._db_call(  # type: ignore[attr-defined]
+                    lambda session: db_save_test_run(
+                        session,
+                        project_id=project_uuid,
+                        status="passed" if exit_code == 0 else "failed",
+                        tests_run=None,
+                        tests_passed=None,
+                        output=f"stdout:\n{stdout}\n\nstderr:\n{stderr}",
+                    )
+                )
+        except Exception:
+            # DB persistence must not change current tool behavior.
+            pass
+
         mm.log_agent_action(
             agent_name="testing",
             action="foundry_tests_run",

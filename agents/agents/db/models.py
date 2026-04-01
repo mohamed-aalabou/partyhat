@@ -49,6 +49,7 @@ class Project(Base):
         nullable=False,
     )
     name: Mapped[str | None] = mapped_column(Text, nullable=True)
+    screenshot_base64: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),
@@ -82,6 +83,12 @@ class Project(Base):
         "Deployment",
         back_populates="project",
         cascade="all, delete-orphan",
+    )
+    messages: Mapped[list["Message"]] = relationship(
+        "Message",
+        back_populates="project",
+        cascade="all, delete-orphan",
+        order_by="Message.created_at.asc()",
     )
 
 
@@ -261,3 +268,34 @@ class Deployment(Base):
     )
 
     project: Mapped["Project"] = relationship("Project", back_populates="deployments")
+
+
+class Message(Base):
+    """
+    Persistent chat messages per project + session.
+    Sender is constrained in code to: "user" | "agent".
+    """
+
+    __tablename__ = "messages"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    session_id: Mapped[str] = mapped_column(Text, nullable=False, index=True)
+    sender: Mapped[str] = mapped_column(Text, nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        index=True,
+    )
+
+    project: Mapped["Project"] = relationship("Project", back_populates="messages")
