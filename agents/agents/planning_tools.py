@@ -3,20 +3,21 @@ Planning Agent Tool Registry
 -----------------------------
 Tools defined here:
     1. get_current_plan: to read current draft from memory
-    2. save_plan_draft: to persist intermediate draft mid-conversation
-    3. validate_plan: to run Pydantic schema check explicitly
-    4. publish_final_plan: to finalise and save to user + global memory
-    5. save_reasoning_note: to log WHY a decision was made (episodic memory)
+    2. send_answer_recommendations: to expose suggested quick replies to UI
+    3. save_plan_draft: to persist intermediate draft mid-conversation
+    4. validate_plan: to run Pydantic schema check explicitly
+    5. publish_final_plan: to finalise and save to user + global memory
+    6. save_reasoning_note: to log WHY a decision was made (episodic memory)
 """
 
 import sys
 import os
-import asyncio
-from typing import List
+from typing import List, Optional
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from langchain_core.tools import tool
+from pydantic import BaseModel, Field
 from schemas.plan_schema import SmartContractPlan, PlanStatus
 
 
@@ -27,6 +28,20 @@ def _get_memory_manager():
 
     project_id, user_id = get_project_context()
     return MemoryManager(user_id=user_id or "default", project_id=project_id)
+
+
+class AnswerRecommendation(BaseModel):
+    text: str = Field(
+        ...,
+        description="Suggested answer text the frontend can render as a quick reply.",
+    )
+    recommended: Optional[bool] = Field(
+        default=None,
+        description=(
+            "Optional hint whether this answer is the primary recommendation. "
+            "Omit when no specific recommendation is intended."
+        ),
+    )
 
 
 @tool
@@ -52,14 +67,45 @@ def get_current_plan() -> dict:
         return {"error": f"Could not retrieve plan: {str(e)}"}
 
 
+def get_answer_recommendations() -> List[dict]:
+    """
+    Read the latest answer recommendations from planning agent state.
+    Returns an empty list when no recommendations are available.
+    """
+    try:
+        mm = _get_memory_manager()
+        state = mm.get_agent_state("planning")
+        recommendations = state.get("answer_recommendations", [])
+        if isinstance(recommendations, list):
+            return recommendations
+        return []
+    except Exception:
+        return []
+
+
+def clear_answer_recommendations() -> None:
+    """
+    Clear transient answer recommendations before each planning turn.
+    """
+    try:
+        mm = _get_memory_manager()
+        state = mm.get_agent_state("planning")
+        if state.get("answer_recommendations"):
+            state["answer_recommendations"] = []
+            mm.set_agent_state("planning", state)
+    except Exception:
+        # Best-effort cleanup; failures should never block planning flow.
+        pass
+
+
 @tool
 def save_plan_draft(plan: SmartContractPlan) -> dict:
     """
     Save an intermediate draft of the smart contract plan to memory.
 
     Call this tool:
-    - After collecting each major piece of information (project name, each
-      function, constructor details)
+    - ONCE per conversation turn after collecting a meaningful new piece of
+      information (project name, a new function, constructor details).
     - Mid-conversation, NOT just at the end, to prevent data loss if the
       session ends unexpectedly
     - After the user confirms a section is correct
@@ -84,9 +130,8 @@ def save_plan_draft(plan: SmartContractPlan) -> dict:
         mm.log_agent_action(
             agent_name="planning_agent",
             action="plan_draft_saved",
-            output_produced=plan.model_dump(),
-            why="Mid-conversation draft save to prevent data loss",
-            how="save_plan_draft tool called by planning agent",
+            why=f"Draft saved with {len(plan.contracts)} contract(s) — status: draft",
+            how="save_plan_draft tool",
         )
 
         return {
@@ -97,6 +142,33 @@ def save_plan_draft(plan: SmartContractPlan) -> dict:
         }
     except Exception as e:
         return {"error": f"Could not save draft: {str(e)}"}
+
+
+@tool
+def send_answer_recommendations(recommendations: List[AnswerRecommendation]) -> dict:
+    """
+    Save answer recommendations for the latest planning question.
+
+    Use this when asking the user a question and you want the UI to show
+    suggested quick-reply options. Each item must include:
+    - text: the answer option text
+    - recommended (optional): set true for the best option(s)
+    """
+    try:
+        mm = _get_memory_manager()
+        state = mm.get_agent_state("planning")
+        state["answer_recommendations"] = [
+            rec.model_dump(exclude_none=True) for rec in recommendations
+        ]
+        mm.set_agent_state("planning", state)
+
+        return {
+            "success": True,
+            "count": len(recommendations),
+            "answer_recommendations": state["answer_recommendations"],
+        }
+    except Exception as e:
+        return {"error": f"Could not save answer recommendations: {str(e)}"}
 
 
 @tool
@@ -182,16 +254,17 @@ def publish_final_plan(plan: SmartContractPlan) -> dict:
         mm = _get_memory_manager()
         mm.save_plan(plan.model_dump())
 
+        decisions = [
+            f"Selected {c.erc_template or 'custom'} for contract {c.name}"
+            for c in plan.contracts
+        ]
+
         mm.log_agent_action(
             agent_name="planning_agent",
             action="plan_published",
-            output_produced=plan.model_dump(),
-            decisions_made=[
-                f"Selected {c.erc_template or 'custom'} for contract {c.name}"
-                for c in plan.contracts
-            ],
-            why="User confirmed the plan is complete and ready for code generation",
-            how="publish_final_plan tool called after user explicit approval",
+            decisions_made=decisions,
+            why="User confirmed plan complete and ready for code generation",
+            how="publish_final_plan tool",
         )
 
         return {
@@ -247,6 +320,7 @@ _mcp_tools: List = []
 
 PLANNING_TOOLS = [
     get_current_plan,
+    send_answer_recommendations,
     save_plan_draft,
     validate_plan,
     publish_final_plan,
@@ -293,6 +367,7 @@ def set_planning_mcp_tools(tools: List) -> None:
     _mcp_tools = tools or []
     PLANNING_TOOLS = _mcp_tools + [
         get_current_plan,
+        send_answer_recommendations,
         save_plan_draft,
         validate_plan,
         publish_final_plan,

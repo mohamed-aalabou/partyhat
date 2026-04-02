@@ -72,6 +72,27 @@ async def _migrate_users_email_to_wallet(conn) -> None:
     )
 
 
+async def _migrate_projects_add_screenshot_base64(conn) -> None:
+    """Add projects.screenshot_base64 column if missing (one-off migration)."""
+    await conn.execute(
+        text(
+            """
+            DO $$
+            BEGIN
+              IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = 'projects'
+                  AND column_name = 'screenshot_base64'
+              ) THEN
+                ALTER TABLE projects ADD COLUMN screenshot_base64 TEXT;
+              END IF;
+            END $$;
+            """
+        )
+    )
+
+
 async def create_tables() -> None:
     """Create all tables. Call on app startup or migrations."""
     if not os.getenv("DATABASE_URL"):
@@ -79,6 +100,7 @@ async def create_tables() -> None:
     async with _engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         await _migrate_users_email_to_wallet(conn)
+        await _migrate_projects_add_screenshot_base64(conn)
 
 
 async def drop_tables() -> None:

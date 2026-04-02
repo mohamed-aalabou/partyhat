@@ -59,7 +59,10 @@ If you omit both, `project_id` and `user_id` default to `"default"`. For project
 | POST   | `/users`                 | Create or resolve user by wallet (wallet required) |
 | POST   | `/projects`              | Create project                                     |
 | GET    | `/projects`              | List projects for a user                           |
+| GET    | `/users/{user_id}/projects` | List projects for a user (alias route)          |
 | GET    | `/projects/{project_id}` | Get one project                                    |
+| PATCH  | `/projects/{project_id}` | Partially update project fields                    |
+| GET    | `/messages`              | List persisted chat messages for a project         |
 | POST   | `/plan/start`            | Start planning session                             |
 | POST   | `/plan/message`          | Send message to planning agent                     |
 | GET    | `/plan/current`          | Get current plan                                   |
@@ -164,6 +167,29 @@ List all projects for a user.
 
 ---
 
+### `GET /users/{user_id}/projects`
+
+Alias route for `GET /projects` that accepts `user_id` in the path instead of query.
+
+**Path:** `user_id` (string, required) - user UUID.
+
+**Response:** `200 OK` (same shape as `GET /projects`)
+
+```json
+[
+	{
+		"id": "660e8400-e29b-41d4-a716-446655440001",
+		"user_id": "550e8400-e29b-41d4-a716-446655440000",
+		"name": "My Token Project",
+		"created_at": "2025-03-07T12:00:00"
+	}
+]
+```
+
+**Errors:** `400` invalid `user_id`, `503` no database.
+
+---
+
 ### `GET /projects/{project_id}`
 
 Get a single project. Ownership is validated when `user_id` is provided.
@@ -183,6 +209,81 @@ Get a single project. Ownership is validated when `user_id` is provided.
 ```
 
 **Errors:** `400` invalid IDs, `404` not found, `503` no database.
+
+---
+
+### `PATCH /projects/{project_id}`
+
+Partially update a project by id. Only fields that are explicitly included in the JSON body are updated.
+
+**Path:** `project_id` (UUID).
+
+**Body (all optional):**
+
+```json
+{
+	"name": "My Updated Project Name",
+	"screenshot_base64": "data:image/png;base64,iVBORw0KGgoAAA..."
+}
+```
+
+- `name` (string or `null`, optional): Project name.
+- `screenshot_base64` (string or `null`, optional): Base64 PNG screenshot string.
+
+Behavior notes:
+
+- Uses partial update semantics (`exclude_unset=True`), so omitted fields are left unchanged.
+- Sending `screenshot_base64: null` clears the stored screenshot.
+
+**Response:** `200 OK`
+
+```json
+{
+	"id": "660e8400-e29b-41d4-a716-446655440001",
+	"user_id": "550e8400-e29b-41d4-a716-446655440000",
+	"name": "My Updated Project Name",
+	"screenshot_base64": "data:image/png;base64,iVBORw0KGgoAAA...",
+	"created_at": "2025-03-07T12:00:00"
+}
+```
+
+**Errors:** `400` invalid `project_id`, `404` project not found, `503` no database.
+
+---
+
+## Messages
+
+### `GET /messages`
+
+List persisted chat messages for a project. Supports optional filtering by `session_id`.
+
+**Query:**
+
+- `session_id` (string, optional): Restrict to one chat session.
+- `limit` (int, optional, default `200`): Max messages returned.
+- `project_id` (optional, default `"default"`): Use explicit query value or `X-Project-Id` header.
+- `user_id` (optional, default `"default"`): Use explicit query value or `X-User-Id` header.
+
+**Response:** `200 OK`
+
+```json
+{
+	"messages": [
+		{
+			"id": "6f2c3e7c-6fa1-4cb5-9e52-9ad1132c67d4",
+			"project_id": "660e8400-e29b-41d4-a716-446655440001",
+			"session_id": "770e8400-e29b-41d4-a716-446655440002",
+			"sender": "user",
+			"content": "I want an ERC-20 token with mint and burn.",
+			"created_at": "2025-03-07T12:00:00.000000"
+		}
+	]
+}
+```
+
+**Errors:** `400` missing/invalid `project_id`, `503` no database.
+
+**Frontend:** Load chat history on page refresh or when reopening a project/session.
 
 ---
 
@@ -210,7 +311,12 @@ Or rely on `X-Project-Id` / `X-User-Id` headers.
 ```json
 {
 	"session_id": "770e8400-e29b-41d4-a716-446655440002",
-	"message": "Hello! I'm here to help you plan your smart contract..."
+	"message": "Hello! I'm here to help you plan your smart contract...",
+	"answer_recommendations": [
+		{ "text": "Create an ERC-20 token", "recommended": true },
+		{ "text": "Create an ERC-721 NFT collection" },
+		{ "text": "Create an ERC-1155 multi-token contract" }
+	]
 }
 ```
 
@@ -243,23 +349,27 @@ Send a user message to the planning agent.
 {
 	"session_id": "770e8400-e29b-41d4-a716-446655440002",
 	"response": "I'll help you design an ERC-20 with mint and burn...",
-	"tool_calls": ["update_plan", "save_plan"]
+	"tool_calls": ["send_answer_recommendations", "save_plan_draft"],
+	"answer_recommendations": [
+		{ "text": "Fixed initial supply (e.g. 1,000,000)", "recommended": true },
+		{ "text": "Mintable supply controlled by owner" },
+		{ "text": "No cap for now; decide later" }
+	]
 }
 ```
 
 **Errors:** `400` empty message, `500` agent error.
 
-**Frontend:** Append user message to UI, send request, then append `response` as the assistant message. Optionally show `tool_calls` for transparency.
+**Frontend:** Append user message to UI, send request, then append `response` as the assistant message. Use `answer_recommendations` as optional quick-reply chips/buttons (each item has `text` and optional `recommended`).
 
 ---
 
 ### `GET /plan/current`
 
-Get the current plan for the session (project/user from headers or query).
+Get the current plan for the user/project context.
 
 **Query:**
 
-- `session_id` (string, required)
 - `project_id` (optional, default `"default"`)
 - `user_id` (optional, default `"default"`)
 
@@ -267,7 +377,6 @@ Get the current plan for the session (project/user from headers or query).
 
 ```json
 {
-  "session_id": "770e8400-e29b-41d4-a716-446655440002",
   "plan": {
     "project_name": "PartyToken",
     "description": "ERC-20 with mint and burn",
@@ -554,7 +663,8 @@ Single request/response.
 {
 	"session_id": "770e8400-e29b-41d4-a716-446655440002",
 	"response": "I've added a pause function...",
-	"tool_calls": ["update_plan"]
+	"tool_calls": ["save_coding_note"],
+	"answer_recommendations": []
 }
 ```
 
@@ -581,7 +691,16 @@ Each event is a JSON line after `data: `:
 - **Done:**
 
   ```json
-  { "type": "done", "session_id": "...", "response": "...", "tool_calls": [...] }
+  {
+    "type": "done",
+    "session_id": "...",
+    "response": "...",
+    "tool_calls": [...],
+    "answer_recommendations": [
+      { "text": "Option A", "recommended": true },
+      { "text": "Option B" }
+    ]
+  }
   ```
 
 - **Error:**
@@ -665,13 +784,15 @@ Returns the full project-scoped user memory and global agent log (Letta blocks).
 
 2. **Projects**
    - `POST /projects` to create, `GET /projects?user_id=...` to list.
+   - Optional alias: `GET /users/{user_id}/projects`.
    - Store current `project_id` and send it (and `user_id`) on every request via headers:  
      `X-Project-Id`, `X-User-Id`.
 
 3. **Planning**
    - `POST /plan/start` → store `session_id`, show first message.
    - Chat: `POST /plan/message` with `session_id` + `message`.
-   - Plan view: `GET /plan/current?session_id=...`.
+   - Optional history restore: `GET /messages?session_id=...`.
+   - Plan view: `GET /plan/current` (uses `project_id`/`user_id` via query or headers).
    - When user is happy: `POST /plan/approve`.
 
 4. **Coding**

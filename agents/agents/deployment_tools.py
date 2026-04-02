@@ -59,6 +59,15 @@ def _extract_first(pattern: str, text: str) -> Optional[str]:
     return match.group(1) if match else None
 
 
+def _normalize_private_key_hex(value: str) -> str:
+    normalized = (value or "").strip()
+    if normalized.startswith(("0x", "0X")):
+        return f"0x{normalized[2:]}"
+    if re.fullmatch(r"[0-9a-fA-F]{64}", normalized):
+        return f"0x{normalized}"
+    return normalized
+
+
 def _truncate_for_display(text: str, max_chars: int, label: str = "output") -> str:
     """Return text truncated to max_chars with head and tail kept and a middle notice."""
     if not text or len(text) <= max_chars:
@@ -159,6 +168,8 @@ def generate_foundry_deploy_script_direct(
         "- Import target contract from ../contracts/<ContractName>.sol.\n"
         "- Define contract name exactly as requested.\n"
         "- Implement run() with vm.startBroadcast() and vm.stopBroadcast().\n"
+        "- Load PRIVATE_KEY in a robust way: accept both `0x`-prefixed and non-prefixed hex env values.\n"
+        "- Prefer `vm.envString(\"FUJI_PRIVATE_KEY\")` + normalization + `vm.parseUint(...)` over plain `vm.envUint(...)`.\n"
         "- Deploy exactly one requested contract instance.\n"
         "- Keep constructor arguments hardcoded literals in script for v1.\n"
         "- Add brief inline comments where non-obvious.\n\n"
@@ -313,6 +324,7 @@ def run_foundry_deploy(
             return {"error": f"Missing required env var: {request.rpc_url_env_var}"}
         if not private_key:
             return {"error": f"Missing required env var: {request.private_key_env_var}"}
+        private_key = _normalize_private_key_hex(private_key)
 
         default_root = os.getenv("FOUNDRY_ARTIFACT_ROOT", "generated_contracts")
         if project_id_ctx:
@@ -463,6 +475,29 @@ def run_foundry_deploy(
             block.id,
             value=mm._serialize(data),  # type: ignore[attr-defined]
         )
+
+        # Keep existing Letta behavior, and additionally persist this run in Neon
+        # when DB/project context is available.
+        try:
+            project_uuid = mm._project_uuid()  # type: ignore[attr-defined]
+            if project_uuid and getattr(mm, "_db_available", False):
+                from agents.db.crud import save_deployment as db_save_deployment
+
+                mm._db_call(  # type: ignore[attr-defined]
+                    lambda session: db_save_deployment(
+                        session,
+                        project_id=project_uuid,
+                        status="success" if exit_code == 0 else "failed",
+                        contract_name=request.contract_name,
+                        deployed_address=parsed.get("deployed_address"),
+                        tx_hash=parsed.get("tx_hash"),
+                        snowtrace_url=None,
+                        network=request.network,
+                    )
+                )
+        except Exception:
+            # DB persistence must not change current tool behavior.
+            pass
 
         mm.log_agent_action(
             agent_name="deployment",
