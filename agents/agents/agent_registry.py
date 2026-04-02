@@ -12,21 +12,77 @@ from deepagents import create_deep_agent
 from deepagents.backends import FilesystemBackend
 from langgraph.checkpoint.memory import MemorySaver
 
-from agents.planning_tools import (
-    PLANNING_TOOLS,
-    get_answer_recommendations,
-    clear_answer_recommendations,
-)
-from agents.coding_tools import CODING_TOOLS
-from agents.testing_tools import TESTING_TOOLS
-from agents.deployment_tools import DEPLOYMENT_TOOLS
-from agents.audit_tools import AUDIT_TOOLS
 from agents.modal_volume_backend import ModalVolumeBackend
 
 load_dotenv()
 
 
 CHECKPOINTER = MemorySaver()
+
+
+TASK_WORKFLOW_PROMPT = """
+
+--------------------------------------------------------------------
+
+AUTONOMOUS PIPELINE — TASK WORKFLOW
+
+You may be called as part of an autonomous pipeline. When this happens,
+you will have access to two additional tools:
+
+- get_my_current_task()  → call FIRST to read your assignment
+- complete_task_and_create_next() → call LAST when your work is done
+
+PIPELINE WORKFLOW:
+
+1. Call get_my_current_task() at the START of your work.
+   - If it returns a task: read the description and context carefully,
+     then do exactly what is asked.
+   - If it returns an error about no active pipeline: you are in manual
+     mode. Ignore these pipeline tools and work normally.
+
+2. Do your work using your existing tools as usual.
+
+3. When FINISHED, call complete_task_and_create_next() with:
+   - result_summary: brief description of what you accomplished
+   - next_tasks: list of tasks for other agents (or empty if pipeline is done)
+
+You MUST call complete_task_and_create_next() before your turn ends
+when in pipeline mode, or the pipeline will stall.
+
+"""
+
+CODING_TASK_GUIDANCE = """
+TASK ROUTING (for complete_task_and_create_next):
+- Code generated successfully → create task for "testing" agent
+- Cannot generate due to plan issues → create task for "testing" with
+  error context explaining what is wrong
+"""
+
+TESTING_TASK_GUIDANCE = """
+TASK ROUTING (for complete_task_and_create_next):
+- All tests pass → create task for "deployment" agent
+- Tests fail due to CONTRACT bugs → create task for "coding" agent with
+  the full error output and affected file paths in the context field
+- Tests fail due to test-only issues (bad mocks, import errors) → fix
+  the tests yourself, re-run, then create the appropriate next task
+"""
+
+DEPLOYMENT_TASK_GUIDANCE = """
+TASK ROUTING (for complete_task_and_create_next):
+- Deployment succeeds → create NO next tasks (pass empty list). This
+  signals the pipeline is complete.
+- Deployment fails due to contract issues → create task for "coding"
+  agent with the error in context
+- Deployment fails due to config/RPC issues → create task for
+  "deployment" agent (yourself) to retry with adjusted parameters
+"""
+
+AUDIT_TASK_GUIDANCE = """
+TASK ROUTING (for complete_task_and_create_next):
+- Audit clean, no critical issues → create no tasks (empty list)
+- Found issues requiring code changes → create task for "coding" agent
+  with the findings in context
+"""
 
 
 PLANNING_SYSTEM_PROMPT = """You are PartyHat's smart contract planning assistant.
@@ -74,7 +130,8 @@ Rules:
   deployed on-chain
 """
 
-CODING_SYSTEM_PROMPT = """You are PartyHat's Smart Contract Coding Agent.
+CODING_SYSTEM_PROMPT = (
+    """You are PartyHat's Smart Contract Coding Agent.
 
 Your role is to transform a validated smart contract plan into
 production-grade Solidity code.
@@ -251,8 +308,12 @@ Those responsibilities belong to other PartyHat agents.
 
 You are responsible ONLY for generating the smart contract code.
 """
+    + TASK_WORKFLOW_PROMPT
+    + CODING_TASK_GUIDANCE
+)
 
-TESTING_SYSTEM_PROMPT = """
+TESTING_SYSTEM_PROMPT = (
+    """
 You are PartyHat's Smart Contract Testing Agent.
 
 Your role is to generate and run tests for Solidity contracts produced by the Coding Agent.
@@ -353,7 +414,7 @@ Forge runs them using:
 
 forge test
 
-Foundry executes each test and marks failure if the test reverts. :contentReference[oaicite:0]{index=0}
+Foundry executes each test and marks failure if the test reverts.
 
 --------------------------------------------------------------------
 
@@ -424,8 +485,12 @@ incomplete mocks or test-only compile errors.
 
 You are responsible ONLY for generating and executing tests.
 """
+    + TASK_WORKFLOW_PROMPT
+    + TESTING_TASK_GUIDANCE
+)
 
-DEPLOYMENT_SYSTEM_PROMPT = """
+DEPLOYMENT_SYSTEM_PROMPT = (
+    """
 You are PartyHat's Smart Contract Deployment Agent.
 
 Your role is to deploy tested Solidity contracts to Avalanche Fuji using Foundry.
@@ -520,8 +585,6 @@ If deployment fails:
 
 --------------------------------------------------------------------
 
---------------------------------------------------------------------
-
 RESPONSE RULES
 
 Do NOT include in your responses to the user any notes or mentions about Snowtrace verification. Do not report that automated Snowtrace verification failed, succeeded, or needs follow-up. Do not mention forge verify-contract, remappings, or source verification. If you run verify_contract_on_snowtrace, do not summarize or comment on its outcome to the user. Report only: deployment success/failure, tx hash, and deployed contract address.
@@ -539,11 +602,18 @@ Do NOT:
 
 You are responsible ONLY for deployment preparation, execution, and recording.
 """
+    + TASK_WORKFLOW_PROMPT
+    + DEPLOYMENT_TASK_GUIDANCE
+)
 
-AUDIT_SYSTEM_PROMPT = """You are PartyHat's audit assistant.
+AUDIT_SYSTEM_PROMPT = (
+    """You are PartyHat's audit assistant.
 You identify and track potential security and correctness issues in smart
 contracts, using tools to manage audit issues and reports.
 """
+    + TASK_WORKFLOW_PROMPT
+    + AUDIT_TASK_GUIDANCE
+)
 
 
 def _build_agent(tools, system_prompt: str):
@@ -551,7 +621,9 @@ def _build_agent(tools, system_prompt: str):
         from agents.context import get_project_context
 
         project_id, _ = get_project_context()
-        artifact_root = os.getenv("FOUNDRY_ARTIFACT_ROOT", "generated_contracts").strip("/")
+        artifact_root = os.getenv("FOUNDRY_ARTIFACT_ROOT", "generated_contracts").strip(
+            "/"
+        )
         use_modal = os.getenv("FOUNDRY_USE_MODAL_VOLUME", "").lower() in {
             "1",
             "true",
@@ -571,9 +643,7 @@ def _build_agent(tools, system_prompt: str):
             return ModalVolumeBackend(volume_name=volume_name, base_dir=base_dir)
 
         root_dir = (
-            f"{artifact_root.rstrip('/')}/{project_id}"
-            if project_id
-            else artifact_root
+            f"{artifact_root.rstrip('/')}/{project_id}" if project_id else artifact_root
         )
         return FilesystemBackend(root_dir=root_dir, virtual_mode=True)
 
@@ -587,39 +657,51 @@ def _build_agent(tools, system_prompt: str):
     )
 
 
-def build_planning_agent():
-    return _build_agent(PLANNING_TOOLS, PLANNING_SYSTEM_PROMPT)
+# Lazy Agent Registry:
+# Agents are built on first use, NOT at import time. This ensures that:
+# 1. MCP tools loaded during FastAPI startup are bound to the planning agent
+# 2. Tool list mutations (like adding TASK_TOOLS) are captured
+# 3. Import-time side effects are minimised
 
+_AGENTS: Dict[str, object] = {}
 
-def build_coding_agent():
-    return _build_agent(CODING_TOOLS, CODING_SYSTEM_PROMPT)
-
-
-def build_testing_agent():
-    return _build_agent(TESTING_TOOLS, TESTING_SYSTEM_PROMPT)
-
-
-def build_deployment_agent():
-    return _build_agent(DEPLOYMENT_TOOLS, DEPLOYMENT_SYSTEM_PROMPT)
-
-
-def build_audit_agent():
-    return _build_agent(AUDIT_TOOLS, AUDIT_SYSTEM_PROMPT)
-
-
-AGENTS: Dict[str, object] = {
-    "planning": build_planning_agent(),
-    "coding": build_coding_agent(),
-    "testing": build_testing_agent(),
-    "deployment": build_deployment_agent(),
-    "audit": build_audit_agent(),
+_BUILDERS = {
+    "planning": lambda: _build_agent(
+        __import__("agents.planning_tools", fromlist=["PLANNING_TOOLS"]).PLANNING_TOOLS,
+        PLANNING_SYSTEM_PROMPT,
+    ),
+    "coding": lambda: _build_agent(
+        __import__("agents.coding_tools", fromlist=["CODING_TOOLS"]).CODING_TOOLS,
+        CODING_SYSTEM_PROMPT,
+    ),
+    "testing": lambda: _build_agent(
+        __import__("agents.testing_tools", fromlist=["TESTING_TOOLS"]).TESTING_TOOLS,
+        TESTING_SYSTEM_PROMPT,
+    ),
+    "deployment": lambda: _build_agent(
+        __import__(
+            "agents.deployment_tools", fromlist=["DEPLOYMENT_TOOLS"]
+        ).DEPLOYMENT_TOOLS,
+        DEPLOYMENT_SYSTEM_PROMPT,
+    ),
+    "audit": lambda: _build_agent(
+        __import__("agents.audit_tools", fromlist=["AUDIT_TOOLS"]).AUDIT_TOOLS,
+        AUDIT_SYSTEM_PROMPT,
+    ),
 }
 
 
 def get_agent_for_intent(intent: str):
-    if intent not in AGENTS:
+    """
+    Get or build the agent for the given intent.
+    Agents are constructed lazily on first request, ensuring all tool
+    mutations (MCP injection, TASK_TOOLS append) have been applied.
+    """
+    if intent not in _BUILDERS:
         raise ValueError(f"Unknown intent: {intent}")
-    return AGENTS[intent]
+    if intent not in _AGENTS:
+        _AGENTS[intent] = _BUILDERS[intent]()
+    return _AGENTS[intent]
 
 
 def chat_with_intent(
@@ -632,6 +714,11 @@ def chat_with_intent(
     Route a message to the appropriate deep agent based on the intent.
     When project_id is set, it is used as thread_id for per-project conversation history.
     """
+    from agents.planning_tools import (
+        get_answer_recommendations,
+        clear_answer_recommendations,
+    )
+
     agent = get_agent_for_intent(intent)
     thread_id = project_id if project_id else session_id
     config = {"configurable": {"thread_id": thread_id}}
@@ -689,6 +776,11 @@ async def stream_chat_with_intent(
     Yields event dicts: {"type": "step", "content": ..., "tool_calls": ...} per step,
     then {"type": "done", "session_id": ..., "response": ..., "tool_calls": [...]}.
     """
+    from agents.planning_tools import (
+        get_answer_recommendations,
+        clear_answer_recommendations,
+    )
+
     agent = get_agent_for_intent(intent)
     thread_id = project_id if project_id else session_id
     config = {"configurable": {"thread_id": thread_id}}
@@ -713,9 +805,7 @@ async def stream_chat_with_intent(
         messages = last_chunk.get("messages") or []
         final_message = messages[-1] if messages else None
         response_text = (
-            getattr(final_message, "content", None) or ""
-            if final_message
-            else ""
+            getattr(final_message, "content", None) or "" if final_message else ""
         )
         if isinstance(response_text, list):
             response_text = "".join(
@@ -736,4 +826,3 @@ async def stream_chat_with_intent(
                 get_answer_recommendations() if intent == "planning" else []
             ),
         }
-

@@ -12,20 +12,12 @@ from agents.db.crud import (
     create_pipeline_task,
     get_next_pending_task,
     set_task_in_progress,
-    get_pipeline_task_count,
     get_pipeline_run_tasks,
 )
 from agents.memory_manager import MemoryManager
 from agents.agent_registry import stream_chat_with_intent
 from agents.pipeline_cancel import is_pipeline_cancelled, clear_cancellation
 from agents.db import async_session_factory
-from agents.db.crud import (
-    create_pipeline_task,
-    get_next_pending_task,
-    set_task_in_progress,
-    get_pipeline_task_count,
-    get_pipeline_run_tasks,
-)
 from agents.memory_manager import MemoryManager
 
 MAX_ITERATIONS = 10  # Just a hard cap to prevent infinite agent loops

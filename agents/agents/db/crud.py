@@ -398,3 +398,99 @@ async def list_messages(
         query = query.where(Message.session_id == session_id)
     result = await session.execute(query)
     return list(result.scalars().all())
+
+
+async def create_pipeline_task(
+    session: AsyncSession,
+    pipeline_run_id: uuid.UUID,
+    project_id: uuid.UUID,
+    assigned_to: str,
+    created_by: str,
+    description: str,
+    context: dict | None = None,
+) -> "PipelineTask":
+    """Push a new task onto the pipeline task stack."""
+    from agents.db.models import PipelineTask
+
+    task = PipelineTask(
+        pipeline_run_id=pipeline_run_id,
+        project_id=project_id,
+        assigned_to=assigned_to,
+        created_by=created_by,
+        description=description,
+        status="pending",
+        context=context,
+    )
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+    return task
+
+
+async def get_next_pending_task(
+    session: AsyncSession,
+    pipeline_run_id: uuid.UUID,
+) -> "PipelineTask | None":
+    """Get the most recently created pending task (LIFO stack behavior)."""
+    from agents.db.models import PipelineTask
+
+    result = await session.execute(
+        select(PipelineTask)
+        .where(
+            PipelineTask.pipeline_run_id == pipeline_run_id,
+            PipelineTask.status == "pending",
+        )
+        .order_by(desc(PipelineTask.created_at))
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+async def set_task_in_progress(
+    session: AsyncSession,
+    task_id: uuid.UUID,
+) -> "PipelineTask | None":
+    """Mark a task as in_progress."""
+    from agents.db.models import PipelineTask
+
+    result = await session.execute(
+        select(PipelineTask).where(PipelineTask.id == task_id)
+    )
+    task = result.scalar_one_or_none()
+    if task is None:
+        return None
+    task.status = "in_progress"
+    await session.commit()
+    await session.refresh(task)
+    return task
+
+
+async def get_pipeline_run_tasks(
+    session: AsyncSession,
+    pipeline_run_id: uuid.UUID,
+) -> "list[PipelineTask]":
+    """Get all tasks for a pipeline run, ordered by creation time."""
+    from agents.db.models import PipelineTask
+
+    result = await session.execute(
+        select(PipelineTask)
+        .where(PipelineTask.pipeline_run_id == pipeline_run_id)
+        .order_by(PipelineTask.created_at.asc())
+    )
+    return list(result.scalars().all())
+
+
+async def get_latest_pipeline_run_id(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> uuid.UUID | None:
+    """Get the most recent pipeline_run_id for a project."""
+    from agents.db.models import PipelineTask
+
+    result = await session.execute(
+        select(PipelineTask.pipeline_run_id)
+        .where(PipelineTask.project_id == project_id)
+        .order_by(desc(PipelineTask.created_at))
+        .limit(1)
+    )
+    return result.scalar_one_or_none()

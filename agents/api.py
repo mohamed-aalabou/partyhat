@@ -34,6 +34,10 @@ from agents.coding_tools import generate_solidity_code_direct
 from agents.code_storage import get_code_storage
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from agents.pipeline_orchestrator import run_autonomous_pipeline, get_pipeline_status
+from agents.pipeline_cancel import cancel_pipeline_run
+from agents.db import async_session_factory
+
 load_dotenv()
 
 app = FastAPI(
@@ -101,7 +105,9 @@ async def ensure_project_context(
                     detail="Project not found or does not belong to this user",
                 )
         except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid project_id or user_id format")
+            raise HTTPException(
+                status_code=400, detail="Invalid project_id or user_id format"
+            )
     set_project_context(project_id, user_id)
 
 
@@ -489,7 +495,9 @@ async def get_project_endpoint(
         proj_uuid = uuid.UUID(project_id)
         user_uuid = uuid.UUID(user_id)
     except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid project_id or user_id format")
+        raise HTTPException(
+            status_code=400, detail="Invalid project_id or user_id format"
+        )
     project = await db_get_project(session, proj_uuid, user_id=user_uuid)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
@@ -629,7 +637,9 @@ async def get_current_plan(
     try:
         mm = MemoryManager(
             user_id=effective_user_id,
-            project_id=effective_project_id if effective_project_id != "default" else None,
+            project_id=(
+                effective_project_id if effective_project_id != "default" else None
+            ),
         )
         plan = mm.get_plan()
         if plan:
@@ -661,7 +671,9 @@ async def get_current_code_artifacts(
     try:
         mm = MemoryManager(
             user_id=effective_user_id,
-            project_id=effective_project_id if effective_project_id != "default" else None,
+            project_id=(
+                effective_project_id if effective_project_id != "default" else None
+            ),
         )
         state = mm.get_agent_state("coding")
         artifacts = state.get("artifacts", [])
@@ -690,7 +702,9 @@ async def get_current_deployment(
     try:
         mm = MemoryManager(
             user_id=effective_user_id,
-            project_id=effective_project_id if effective_project_id != "default" else None,
+            project_id=(
+                effective_project_id if effective_project_id != "default" else None
+            ),
         )
         state = mm.get_agent_state("deployment")
         last_deploy_results = state.get("last_deploy_results", [])
@@ -719,7 +733,9 @@ async def get_current_test_results(
     try:
         mm = MemoryManager(
             user_id=effective_user_id,
-            project_id=effective_project_id if effective_project_id != "default" else None,
+            project_id=(
+                effective_project_id if effective_project_id != "default" else None
+            ),
         )
         state = mm.get_agent_state("testing")
         last_test_results = state.get("last_test_results", [])
@@ -742,7 +758,9 @@ async def approve_plan(
     await ensure_project_context(project_id, user_id, session)
 
     try:
-        mm = MemoryManager(user_id=user_id, project_id=project_id if project_id != "default" else None)
+        mm = MemoryManager(
+            user_id=user_id, project_id=project_id if project_id != "default" else None
+        )
         plan = mm.get_plan()
 
         if not plan:
@@ -770,14 +788,21 @@ async def approve_plan(
 
 def _build_artifact_tree(project_id: str | None = None) -> ArtifactTreeNode:
     storage = get_code_storage(project_id=project_id)
-    base_root = os.getenv("FOUNDRY_ARTIFACT_ROOT", "generated_contracts").strip("/") or "generated_contracts"
+    base_root = (
+        os.getenv("FOUNDRY_ARTIFACT_ROOT", "generated_contracts").strip("/")
+        or "generated_contracts"
+    )
     if project_id:
         base_root = f"{base_root}/{project_id}"
 
     try:
         file_paths = storage.list_paths()
 
-        root = {"name": Path(base_root).name or "artifacts", "children": {}, "type": "directory"}
+        root = {
+            "name": Path(base_root).name or "artifacts",
+            "children": {},
+            "type": "directory",
+        }
 
         for rel_path in sorted(file_paths):
             parts = [p for p in Path(rel_path).parts if p]
@@ -896,7 +921,9 @@ async def get_full_memory_snapshot(
     try:
         mm = MemoryManager(
             user_id=effective_user_id,
-            project_id=effective_project_id if effective_project_id != "default" else None,
+            project_id=(
+                effective_project_id if effective_project_id != "default" else None
+            ),
         )
         # Use the MemoryManager's helpers to read the raw Letta blocks.
         user_data, _ = mm._read_user_block()  # type: ignore[attr-defined]
@@ -1048,12 +1075,130 @@ async def generate_solidity_endpoint(
         # Call the direct helper, which encapsulates all generation logic.
         result = generate_solidity_code_direct(request)
     except Exception as e:
-        raise HTTPException(
-            status_code=500, detail=f"Code generation failed: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Code generation failed: {str(e)}")
 
     if isinstance(result, dict) and "error" in result:
         raise HTTPException(status_code=500, detail=result["error"])
 
     generated = result.get("generated_code", "")
     return CodeGenerationResponse(generated_code=generated, goal=request.goal)
+
+
+class PipelineRunRequest(BaseModel):
+    project_id: str
+    user_id: str
+
+
+class PipelineCancelRequest(BaseModel):
+    project_id: str
+    pipeline_run_id: str
+
+
+@app.post("/pipeline/run")
+async def run_pipeline(
+    request: PipelineRunRequest,
+    ctx: RequestContext = Depends(get_request_context),
+    session: AsyncSession = Depends(get_session),
+):
+    """
+    Launch the autonomous pipeline after plan approval.
+    Streams SSE events as the pipeline progresses through agents.
+    """
+    project_id = request.project_id or ctx.project_id
+    user_id = request.user_id or ctx.user_id
+
+    if project_id == "default" or user_id == "default":
+        raise HTTPException(
+            status_code=400,
+            detail="project_id and user_id are required for pipeline execution",
+        )
+
+    await ensure_project_context(project_id, user_id, session)
+
+    try:
+        mm = MemoryManager(user_id=user_id, project_id=project_id)
+        plan = mm.get_plan()
+        if not plan:
+            raise HTTPException(
+                status_code=404, detail="No plan found. Complete planning first."
+            )
+        plan_status = plan.get("status", "draft")
+        if "ready" not in str(plan_status).lower():
+            raise HTTPException(
+                status_code=400,
+                detail=f"Plan is not ready for pipeline execution (current status: '{plan_status}'). Approve the plan first.",
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not validate plan: {e}")
+
+    async def event_stream():
+        try:
+            async for event in run_autonomous_pipeline(
+                project_id=project_id,
+                user_id=user_id,
+            ):
+                yield f"data: {json.dumps(event)}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'pipeline_error', 'error': str(e)})}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.get("/pipeline/status")
+async def pipeline_status(
+    project_id: str,
+    pipeline_run_id: str | None = None,
+    ctx: RequestContext = Depends(get_request_context),
+    session: AsyncSession = Depends(get_session),
+):
+    """Return the task history for a pipeline run."""
+    effective_project_id = project_id if project_id != "default" else ctx.project_id
+    await ensure_project_context(effective_project_id, ctx.user_id, session)
+
+    if not pipeline_run_id:
+        try:
+            async with async_session_factory() as db_session:
+                from agents.db.crud import get_latest_pipeline_run_id
+                import uuid as _uuid
+
+                run_id = await get_latest_pipeline_run_id(
+                    db_session, _uuid.UUID(effective_project_id)
+                )
+                if not run_id:
+                    return {"error": "No pipeline runs found for this project"}
+                pipeline_run_id = str(run_id)
+        except Exception as e:
+            raise HTTPException(
+                status_code=500, detail=f"Could not find pipeline run: {e}"
+            )
+
+    result = await get_pipeline_status(effective_project_id, pipeline_run_id)
+    if "error" in result:
+        raise HTTPException(status_code=500, detail=result["error"])
+    return result
+
+
+@app.post("/pipeline/cancel")
+async def cancel_pipeline(
+    request: PipelineCancelRequest,
+    ctx: RequestContext = Depends(get_request_context),
+    session: AsyncSession = Depends(get_session),
+):
+    """Cancel a running pipeline."""
+    await ensure_project_context(request.project_id, ctx.user_id, session)
+    cancel_pipeline_run(request.pipeline_run_id)
+    return {
+        "success": True,
+        "message": "Cancellation requested. The pipeline will stop at the next safe point.",
+        "pipeline_run_id": request.pipeline_run_id,
+    }
