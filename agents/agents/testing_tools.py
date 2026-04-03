@@ -244,9 +244,15 @@ def run_foundry_tests(
     Returns a dict with stdout, stderr, exit_code, project_root, and success flag.
     """
     try:
-        from agents.context import get_project_context
+        from agents.context import (
+            get_pipeline_run_id,
+            get_pipeline_task_id,
+            get_project_context,
+        )
 
         project_id_ctx, _ = get_project_context()
+        pipeline_run_id = get_pipeline_run_id()
+        pipeline_task_id = get_pipeline_task_id()
         default_root = os.getenv("FOUNDRY_ARTIFACT_ROOT", "generated_contracts")
         if project_id_ctx:
             default_root = f"{default_root.rstrip('/')}/{project_id_ctx}"
@@ -357,6 +363,8 @@ def run_foundry_tests(
         history: List[Dict[str, Any]] = testing_state.get("last_test_results", [])
         entry = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
+            "pipeline_run_id": pipeline_run_id,
+            "pipeline_task_id": pipeline_task_id,
             "project_root": root,
             "sandbox_workdir": sandbox_workdir,
             "command": " ".join(forge_cmd),
@@ -406,6 +414,8 @@ def run_foundry_tests(
         return {
             "success": exit_code == 0,
             "exit_code": exit_code,
+            "pipeline_run_id": pipeline_run_id,
+            "pipeline_task_id": pipeline_task_id,
             "stdout": stdout,
             "stderr": stderr,
             "project_root": root,

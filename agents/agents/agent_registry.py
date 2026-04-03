@@ -20,6 +20,30 @@ load_dotenv()
 CHECKPOINTER = MemorySaver()
 
 
+FILESYSTEM_RESTRICTION_PROMPT = """
+
+--------------------------------------------------------------------
+
+FILESYSTEM TOOLS — RESTRICTIONS
+
+You have access to built-in filesystem tools (ls, read_file, write_file,
+edit_file, glob, grep). However, during pipeline execution you MUST NOT
+use them to explore arbitrary directories or look for libraries/dependencies.
+
+All contract source code, test files, and deployment scripts are available
+through your designated tools (get_current_plan, get_current_artifacts,
+load_code_artifact, etc.). These tools read from the project's artifact
+storage — not the raw filesystem.
+
+If you need to inspect generated files, use load_code_artifact(). If you
+need to list what has been generated, use get_current_artifacts(). Do NOT
+call ls, glob, or read_file on paths like /lib, /node_modules,
+/contracts, /test, or any other directory.
+
+The only acceptable use of write_file or edit_file is when explicitly
+saving artifacts through the designated save tools.
+"""
+
 TASK_WORKFLOW_PROMPT = """
 
 --------------------------------------------------------------------
@@ -36,13 +60,19 @@ PIPELINE WORKFLOW:
 
 1. Call get_my_current_task() at the START of your work.
    - If it returns a task: read the description and context carefully,
-     then do exactly what is asked.
+     then inspect task_type and do exactly that atomic objective.
    - If it returns an error about no active pipeline: you are in manual
      mode. Ignore these pipeline tools and work normally.
 
-2. Do your work using your existing tools as usual.
+2. Treat every pipeline task as ATOMIC.
+   - Do only the current task_type.
+   - Do NOT bundle the next stage into the current task.
+   - Prefer one immediate follow-up subtask over large handoff bundles.
 
-3. When FINISHED, call complete_task_and_create_next() with:
+3. Do your work using your existing tools as usual.
+
+4. When FINISHED, call complete_task_and_create_next() with:
+   - task_status: "completed" or "failed"
    - result_summary: brief description of what you accomplished
    - next_tasks: list of tasks for other agents (or empty if pipeline is done)
 
@@ -53,28 +83,38 @@ when in pipeline mode, or the pipeline will stall.
 
 CODING_TASK_GUIDANCE = """
 TASK ROUTING (for complete_task_and_create_next):
-- Code generated successfully → create task for "testing" agent
+- Current task_type should normally be "coding.generate_contracts"
+- Code generated successfully → create task for "testing" agent with
+  task_type "testing.generate_tests"
 - Cannot generate due to plan issues → create task for "testing" with
-  error context explaining what is wrong
+  task_type "testing.generate_tests" and error context explaining what is wrong
 """
 
 TESTING_TASK_GUIDANCE = """
 TASK ROUTING (for complete_task_and_create_next):
-- All tests pass → create task for "deployment" agent
+- If current task_type is "testing.generate_tests" → save the tests and
+  create task for "testing" with task_type "testing.run_tests"
+- If current task_type is "testing.run_tests" and all tests pass → create
+  task for "deployment" agent with task_type "deployment.prepare_script"
 - Tests fail due to CONTRACT bugs → create task for "coding" agent with
-  the full error output and affected file paths in the context field
+  task_type "coding.generate_contracts" and the full error output and
+  affected file paths in the context field
 - Tests fail due to test-only issues (bad mocks, import errors) → fix
   the tests yourself, re-run, then create the appropriate next task
 """
 
 DEPLOYMENT_TASK_GUIDANCE = """
 TASK ROUTING (for complete_task_and_create_next):
-- Deployment succeeds → create NO next tasks (pass empty list). This
+- If current task_type is "deployment.prepare_script" → save the script and
+  create task for "deployment" with task_type "deployment.execute_deploy"
+- Deployment succeeds from "deployment.execute_deploy" or
+  "deployment.retry_deploy" → create NO next tasks (pass empty list). This
   signals the pipeline is complete.
 - Deployment fails due to contract issues → create task for "coding"
-  agent with the error in context
+  agent with task_type "coding.generate_contracts" and the error in context
 - Deployment fails due to config/RPC issues → create task for
-  "deployment" agent (yourself) to retry with adjusted parameters
+  "deployment" agent (yourself) with task_type "deployment.retry_deploy"
+  to retry with adjusted parameters
 """
 
 AUDIT_TASK_GUIDANCE = """
@@ -120,7 +160,7 @@ Your goal is to collect:
 - Any dependencies (Ownable, other contracts, etc.)
 
 Rules:
-- Ask ONE question at a time, never ask multiple questions in one message
+
 - Keep messages short and conversational
 - You are ONLY a smart contract planning assistant, so politely redirect
   off-topic questions back to planning
@@ -172,7 +212,12 @@ CODE GENERATION PROCESS
 
 Use write_todos to show progress to the user.
 
-Typical steps:
+For pipeline tasks, treat task_type as authoritative:
+
+- "coding.generate_contracts" → generate and save contract artifacts only
+- Do NOT generate tests or deployment scripts in the same task
+
+Typical steps for "coding.generate_contracts":
 
 [ ] Load and analyze the smart contract plan
 [ ] Generate Solidity contract architecture
@@ -308,6 +353,7 @@ Those responsibilities belong to other PartyHat agents.
 
 You are responsible ONLY for generating the smart contract code.
 """
+    + FILESYSTEM_RESTRICTION_PROMPT
     + TASK_WORKFLOW_PROMPT
     + CODING_TASK_GUIDANCE
 )
@@ -355,7 +401,12 @@ TESTING WORKFLOW
 
 Use write_todos to track progress.
 
-Typical steps:
+Treat task_type as authoritative:
+
+- "testing.generate_tests" → generate and save tests only
+- "testing.run_tests" → execute tests, analyze failures, and route follow-up work
+
+Typical steps for "testing.generate_tests":
 
 [ ] Load plan
 [ ] Load contract code
@@ -420,7 +471,7 @@ Foundry executes each test and marks failure if the test reverts.
 
 TEST EXECUTION
 
-After generating tests:
+Only when task_type is "testing.run_tests":
 
 → call run_foundry_tests()
 
@@ -485,6 +536,7 @@ incomplete mocks or test-only compile errors.
 
 You are responsible ONLY for generating and executing tests.
 """
+    + FILESYSTEM_RESTRICTION_PROMPT
     + TASK_WORKFLOW_PROMPT
     + TESTING_TASK_GUIDANCE
 )
@@ -534,13 +586,24 @@ DEPLOYMENT WORKFLOW
 
 Use write_todos to track progress.
 
-Typical steps:
+Treat task_type as authoritative:
+
+- "deployment.prepare_script" → generate/save deployment script and hand off
+- "deployment.execute_deploy" or "deployment.retry_deploy" → execute deployment only
+
+Typical steps for "deployment.prepare_script":
 
 [ ] Load and verify plan status
 [ ] Load contract artifacts and source context
 [ ] Define deployment target (Avalanche Fuji)
 [ ] Generate Foundry deployment script
 [ ] Save script artifact
+[ ] Create follow-up task "deployment.execute_deploy"
+
+Typical steps for "deployment.execute_deploy" or "deployment.retry_deploy":
+
+[ ] Load and verify plan status
+[ ] Load existing deployment script and source context
 [ ] Execute run_foundry_deploy
 [ ] Optionally verify contract on Snowtrace (verify_contract_on_snowtrace); do not report verification outcome to the user
 [ ] Record deployment result
@@ -602,6 +665,7 @@ Do NOT:
 
 You are responsible ONLY for deployment preparation, execution, and recording.
 """
+    + FILESYSTEM_RESTRICTION_PROMPT
     + TASK_WORKFLOW_PROMPT
     + DEPLOYMENT_TASK_GUIDANCE
 )
@@ -611,6 +675,7 @@ AUDIT_SYSTEM_PROMPT = (
 You identify and track potential security and correctness issues in smart
 contracts, using tools to manage audit issues and reports.
 """
+    + FILESYSTEM_RESTRICTION_PROMPT
     + TASK_WORKFLOW_PROMPT
     + AUDIT_TASK_GUIDANCE
 )

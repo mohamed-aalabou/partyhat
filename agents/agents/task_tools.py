@@ -15,11 +15,11 @@ this entirely.
 import os
 import uuid
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import List, Optional, Literal
 
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
-from sqlalchemy import create_engine, select, desc
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 
 
@@ -56,6 +56,12 @@ _sync_engine = (
 _SyncSession = sessionmaker(bind=_sync_engine) if _sync_engine else None
 
 
+TERMINAL_SUCCESS_TASK_TYPES = {
+    "deployment.execute_deploy",
+    "deployment.retry_deploy",
+}
+
+
 def _get_sync_session() -> Session | None:
     if _SyncSession is None:
         return None
@@ -67,30 +73,38 @@ def _db_available() -> bool:
 
 
 def _get_context():
-    """Read pipeline_run_id and project_id from contextvars."""
-    from agents.context import get_project_context, get_pipeline_run_id
+    """Read pipeline identifiers from contextvars."""
+    from agents.context import (
+        get_pipeline_run_id,
+        get_pipeline_task_id,
+        get_project_context,
+    )
 
     project_id, user_id = get_project_context()
     pipeline_run_id = get_pipeline_run_id()
-    return project_id, user_id, pipeline_run_id
+    pipeline_task_id = get_pipeline_task_id()
+    return project_id, user_id, pipeline_run_id, pipeline_task_id
 
 
-def _get_current_task_sync(pipeline_run_id: str):
-    """Fetch the in-progress task for this pipeline run (sync)."""
+def _get_current_task_sync(
+    pipeline_run_id: str,
+    pipeline_task_id: str | None = None,
+):
+    """Fetch the active task for this pipeline run (sync)."""
     from agents.db.models import PipelineTask
 
     session = _get_sync_session()
     if session is None:
         return None
     try:
-        result = session.execute(
-            select(PipelineTask)
-            .where(
-                PipelineTask.pipeline_run_id == uuid.UUID(pipeline_run_id),
-                PipelineTask.status == "in_progress",
-            )
-            .limit(1)
+        query = select(PipelineTask).where(
+            PipelineTask.pipeline_run_id == uuid.UUID(pipeline_run_id)
         )
+        if pipeline_task_id:
+            query = query.where(PipelineTask.id == uuid.UUID(pipeline_task_id))
+        else:
+            query = query.where(PipelineTask.status == "in_progress")
+        result = session.execute(query.limit(1))
         return result.scalar_one_or_none()
     finally:
         session.close()
@@ -100,6 +114,7 @@ def _complete_and_create_sync(
     pipeline_run_id: str,
     project_id: str,
     task_id: str,
+    task_status: str,
     result_summary: str,
     next_tasks: list[dict],
     created_by: str,
@@ -116,18 +131,25 @@ def _complete_and_create_sync(
         ).scalar_one_or_none()
 
         if task:
-            task.status = "completed"
+            task.status = task_status
             task.result_summary = result_summary
             task.completed_at = datetime.now(timezone.utc)
 
         created = []
-        for t in next_tasks:
+        for idx, t in enumerate(next_tasks):
             new_task = PipelineTask(
                 pipeline_run_id=uuid.UUID(pipeline_run_id),
                 project_id=uuid.UUID(project_id),
                 assigned_to=t["assigned_to"],
                 created_by=created_by,
+                task_type=t["task_type"],
                 description=t["description"],
+                parent_task_id=(
+                    uuid.UUID(t["parent_task_id"])
+                    if t.get("parent_task_id")
+                    else uuid.UUID(task_id)
+                ),
+                sequence_index=t.get("sequence_index", idx),
                 status="pending",
                 context=t.get("context"),
             )
@@ -137,7 +159,12 @@ def _complete_and_create_sync(
                 {
                     "id": str(new_task.id),
                     "assigned_to": new_task.assigned_to,
+                    "task_type": new_task.task_type,
                     "description": new_task.description,
+                    "parent_task_id": (
+                        str(new_task.parent_task_id) if new_task.parent_task_id else None
+                    ),
+                    "sequence_index": new_task.sequence_index,
                 }
             )
 
@@ -167,6 +194,13 @@ class NextTask(BaseModel):
             "Include what needs to be done and why."
         ),
     )
+    task_type: str = Field(
+        ...,
+        description=(
+            "Canonical task type in <agent>.<action> format, such as "
+            "testing.run_tests or deployment.execute_deploy."
+        ),
+    )
     context: Optional[dict] = Field(
         default=None,
         description=(
@@ -174,11 +208,32 @@ class NextTask(BaseModel):
             "file paths, test results, etc."
         ),
     )
+    parent_task_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional explicit parent task UUID. If omitted, the current task "
+            "becomes the parent so this is recorded as a subtask."
+        ),
+    )
+    sequence_index: Optional[int] = Field(
+        default=None,
+        description=(
+            "Optional sibling order. Omit to use the order of next_tasks in "
+            "this completion call."
+        ),
+    )
 
 
 class CompleteTaskInput(BaseModel):
     """Input for completing the current task and creating follow-up tasks."""
 
+    task_status: Literal["completed", "failed"] = Field(
+        ...,
+        description=(
+            "Whether the current task succeeded or failed. Failed tasks may "
+            "still create remediation subtasks."
+        ),
+    )
     result_summary: str = Field(
         ...,
         description=(
@@ -191,11 +246,31 @@ class CompleteTaskInput(BaseModel):
         default_factory=list,
         description=(
             "Tasks to create for other agents. Leave empty ONLY when the "
-            "contract has been successfully deployed — that signals the "
-            "pipeline is complete. Otherwise, always create at least one "
-            "next task to keep the pipeline moving."
+            "current task is a successful terminal deployment task, or when "
+            "the current task failed with no viable recovery path."
         ),
     )
+
+
+def _is_valid_task_type(assigned_to: str, task_type: str) -> bool:
+    return (
+        "." in task_type
+        and task_type.split(".", 1)[0] == assigned_to
+        and bool(task_type.split(".", 1)[1].strip())
+    )
+
+
+def _normalize_next_tasks(current_task_id: str, next_tasks: List[NextTask]) -> list[dict]:
+    """Apply default parent/sequence metadata before writing follow-up tasks."""
+    normalized = []
+    for idx, task in enumerate(next_tasks):
+        payload = task.model_dump()
+        payload["parent_task_id"] = payload.get("parent_task_id") or current_task_id
+        payload["sequence_index"] = (
+            payload["sequence_index"] if payload.get("sequence_index") is not None else idx
+        )
+        normalized.append(payload)
+    return normalized
 
 
 @tool
@@ -213,7 +288,7 @@ def get_my_current_task() -> dict:
     if not _db_available():
         return {"error": "DATABASE_URL not configured; pipeline tasks require Neon"}
 
-    project_id, user_id, pipeline_run_id = _get_context()
+    project_id, user_id, pipeline_run_id, pipeline_task_id = _get_context()
 
     if not pipeline_run_id:
         return {
@@ -224,7 +299,7 @@ def get_my_current_task() -> dict:
         }
 
     try:
-        task = _get_current_task_sync(pipeline_run_id)
+        task = _get_current_task_sync(pipeline_run_id, pipeline_task_id)
         if task is None:
             return {"error": "No in-progress task found for this pipeline run."}
 
@@ -232,8 +307,13 @@ def get_my_current_task() -> dict:
             "task_id": str(task.id),
             "assigned_to": task.assigned_to,
             "created_by": task.created_by,
+            "task_type": task.task_type,
             "description": task.description,
             "status": task.status,
+            "parent_task_id": (
+                str(task.parent_task_id) if task.parent_task_id else None
+            ),
+            "sequence_index": task.sequence_index,
         }
         if task.context:
             result["context"] = task.context
@@ -253,24 +333,30 @@ def complete_task_and_create_next(input: CompleteTaskInput) -> dict:
     How to decide what next tasks to create:
 
     CODING AGENT:
-    - After generating code successfully → create task for "testing"
+    - Complete "coding.generate_contracts" → create task for "testing" with
+      task_type "testing.generate_tests"
     - If you cannot generate code (plan issue) → create task for "testing"
-      with error context so it can be diagnosed
+      with task_type "testing.generate_tests" and error context
 
     TESTING AGENT:
-    - If all tests pass → create task for "deployment"
+    - Complete "testing.generate_tests" → create task for "testing" with
+      task_type "testing.run_tests"
+    - If "testing.run_tests" passes → create task for "deployment" with
+      task_type "deployment.prepare_script"
     - If tests fail due to contract bugs → create task for "coding" with
-      the error output and file paths in context
+      task_type "coding.generate_contracts" and the error output in context
     - If tests fail due to test-only issues → fix tests yourself, re-run,
       then create the appropriate next task
 
     DEPLOYMENT AGENT:
-    - If deployment succeeds → create NO next tasks (empty list). This
-      signals the pipeline is complete.
+    - Complete "deployment.prepare_script" → create task for "deployment"
+      with task_type "deployment.execute_deploy"
+    - If "deployment.execute_deploy" or "deployment.retry_deploy" succeeds →
+      create NO next tasks (empty list). This signals the pipeline is complete.
     - If deployment fails due to contract issues → create task for "coding"
-      with the error in context
+      with task_type "coding.generate_contracts" and the error in context
     - If deployment fails due to config issues → create task for "deployment"
-      to retry with adjusted parameters
+      with task_type "deployment.retry_deploy" to retry with adjusted parameters
 
     AUDIT AGENT:
     - After completing audit → create task for the appropriate agent based
@@ -282,7 +368,7 @@ def complete_task_and_create_next(input: CompleteTaskInput) -> dict:
     if not _db_available():
         return {"error": "DATABASE_URL not configured; pipeline tasks require Neon"}
 
-    project_id, user_id, pipeline_run_id = _get_context()
+    project_id, user_id, pipeline_run_id, pipeline_task_id = _get_context()
 
     if not pipeline_run_id:
         return {
@@ -296,7 +382,7 @@ def complete_task_and_create_next(input: CompleteTaskInput) -> dict:
         return {"error": "No project_id in context."}
 
     try:
-        task = _get_current_task_sync(pipeline_run_id)
+        task = _get_current_task_sync(pipeline_run_id, pipeline_task_id)
         if task is None:
             return {"error": "No in-progress task found to complete."}
 
@@ -309,26 +395,64 @@ def complete_task_and_create_next(input: CompleteTaskInput) -> dict:
                         f"Must be one of: {', '.join(sorted(valid_agents))}"
                     )
                 }
+            if not _is_valid_task_type(nt.assigned_to, nt.task_type):
+                return {
+                    "error": (
+                        f"Invalid task_type '{nt.task_type}' for assigned_to "
+                        f"'{nt.assigned_to}'. Use <agent>.<action> with the "
+                        "agent prefix matching assigned_to."
+                    )
+                }
+            if nt.parent_task_id:
+                try:
+                    uuid.UUID(nt.parent_task_id)
+                except ValueError:
+                    return {
+                        "error": (
+                            f"Invalid parent_task_id '{nt.parent_task_id}'. "
+                            "Expected a UUID string."
+                        )
+                    }
+
+        if (
+            input.task_status == "completed"
+            and not input.next_tasks
+            and task.task_type not in TERMINAL_SUCCESS_TASK_TYPES
+        ):
+            return {
+                "error": (
+                    "Only successful terminal deployment tasks may complete "
+                    "without creating follow-up tasks."
+                )
+            }
+
+        normalized_next_tasks = _normalize_next_tasks(str(task.id), input.next_tasks)
 
         created = _complete_and_create_sync(
             pipeline_run_id=pipeline_run_id,
             project_id=project_id,
             task_id=str(task.id),
+            task_status=input.task_status,
             result_summary=input.result_summary,
-            next_tasks=[nt.model_dump() for nt in input.next_tasks],
+            next_tasks=normalized_next_tasks,
             created_by=task.assigned_to,  # current agent is the creator
         )
 
         result = {
             "success": True,
             "completed_task_id": str(task.id),
+            "task_status": input.task_status,
             "result_summary": input.result_summary,
             "next_tasks_created": len(created),
         }
         if created:
             result["next_tasks"] = created
         else:
-            result["pipeline_signal"] = "no_more_tasks"
+            result["pipeline_signal"] = (
+                "no_more_tasks"
+                if input.task_status == "completed"
+                else "terminal_failure"
+            )
 
         return result
     except Exception as e:

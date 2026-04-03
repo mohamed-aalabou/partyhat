@@ -93,6 +93,98 @@ async def _migrate_projects_add_screenshot_base64(conn) -> None:
     )
 
 
+async def _migrate_pipeline_tasks_add_hierarchy(conn) -> None:
+    """Add task_type, parent_task_id, and sequence_index to pipeline_tasks if missing."""
+    await conn.execute(
+        text(
+            """
+            DO $$
+            BEGIN
+              IF EXISTS (
+                SELECT 1 FROM information_schema.tables
+                WHERE table_schema = 'public' AND table_name = 'pipeline_tasks'
+              ) THEN
+                IF NOT EXISTS (
+                  SELECT 1 FROM information_schema.columns
+                  WHERE table_schema = 'public'
+                    AND table_name = 'pipeline_tasks'
+                    AND column_name = 'task_type'
+                ) THEN
+                  ALTER TABLE pipeline_tasks ADD COLUMN task_type TEXT;
+                END IF;
+
+                IF NOT EXISTS (
+                  SELECT 1 FROM information_schema.columns
+                  WHERE table_schema = 'public'
+                    AND table_name = 'pipeline_tasks'
+                    AND column_name = 'parent_task_id'
+                ) THEN
+                  ALTER TABLE pipeline_tasks ADD COLUMN parent_task_id UUID;
+                END IF;
+
+                IF NOT EXISTS (
+                  SELECT 1 FROM information_schema.columns
+                  WHERE table_schema = 'public'
+                    AND table_name = 'pipeline_tasks'
+                    AND column_name = 'sequence_index'
+                ) THEN
+                  ALTER TABLE pipeline_tasks ADD COLUMN sequence_index INTEGER DEFAULT 0;
+                END IF;
+
+                UPDATE pipeline_tasks
+                SET task_type = COALESCE(task_type, assigned_to || '.legacy');
+
+                UPDATE pipeline_tasks
+                SET sequence_index = 0
+                WHERE sequence_index IS NULL;
+
+                ALTER TABLE pipeline_tasks
+                  ALTER COLUMN task_type SET DEFAULT 'unknown';
+                ALTER TABLE pipeline_tasks
+                  ALTER COLUMN task_type SET NOT NULL;
+                ALTER TABLE pipeline_tasks
+                  ALTER COLUMN sequence_index SET DEFAULT 0;
+                ALTER TABLE pipeline_tasks
+                  ALTER COLUMN sequence_index SET NOT NULL;
+              END IF;
+            END $$;
+            """
+        )
+    )
+
+    await conn.execute(
+        text(
+            """
+            DO $$
+            BEGIN
+              IF EXISTS (
+                SELECT 1 FROM information_schema.tables
+                WHERE table_schema = 'public' AND table_name = 'pipeline_tasks'
+              ) AND NOT EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conname = 'pipeline_tasks_parent_task_id_fkey'
+              ) THEN
+                ALTER TABLE pipeline_tasks
+                  ADD CONSTRAINT pipeline_tasks_parent_task_id_fkey
+                  FOREIGN KEY (parent_task_id)
+                  REFERENCES pipeline_tasks(id)
+                  ON DELETE SET NULL;
+              END IF;
+            END $$;
+            """
+        )
+    )
+
+    await conn.execute(
+        text(
+            """
+            CREATE INDEX IF NOT EXISTS ix_pipeline_tasks_parent_task_id
+            ON pipeline_tasks (parent_task_id);
+            """
+        )
+    )
+
+
 async def create_tables() -> None:
     """Create all tables. Call on app startup or migrations."""
     if not os.getenv("DATABASE_URL"):
@@ -101,6 +193,7 @@ async def create_tables() -> None:
         await conn.run_sync(Base.metadata.create_all)
         await _migrate_users_email_to_wallet(conn)
         await _migrate_projects_add_screenshot_base64(conn)
+        await _migrate_pipeline_tasks_add_hierarchy(conn)
 
 
 async def drop_tables() -> None:

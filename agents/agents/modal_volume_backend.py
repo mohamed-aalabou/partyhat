@@ -1,4 +1,5 @@
 import io
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import datetime, timezone
 from pathlib import PurePosixPath
 
@@ -19,6 +20,25 @@ from deepagents.backends.utils import (
     perform_string_replacement,
 )
 from modal.volume import FileEntryType
+
+
+MODAL_IO_TIMEOUT = 30  # seconds — fail fast instead of hanging forever
+
+_timeout_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="modal-vol-io")
+
+
+def _run_with_timeout(fn, *args, timeout: int = MODAL_IO_TIMEOUT):
+    """Run *fn* in a background thread and raise TimeoutError if it doesn't
+    finish within *timeout* seconds.  This prevents Modal Volume API calls
+    (reload, listdir, read_file) from blocking the pipeline indefinitely."""
+    future = _timeout_pool.submit(fn, *args)
+    try:
+        return future.result(timeout=timeout)
+    except FuturesTimeoutError:
+        future.cancel()
+        raise TimeoutError(
+            f"Modal Volume operation timed out after {timeout}s"
+        ) from None
 
 
 class ModalVolumeBackend(BackendProtocol):
@@ -58,20 +78,28 @@ class ModalVolumeBackend(BackendProtocol):
         reload(); for those cases we intentionally proceed without reloading.
         """
         try:
-            self._volume.reload()
+            _run_with_timeout(self._volume.reload)
         except RuntimeError as e:
             if "can only be called from within a running function" in str(e):
                 return
             raise
+        except TimeoutError:
+            return
 
     def _read_bytes(self, volume_path: PurePosixPath) -> bytes:
         self._safe_reload()
-        chunks = list(self._volume.read_file(volume_path.as_posix()))
+        chunks = list(
+            _run_with_timeout(
+                lambda: list(self._volume.read_file(volume_path.as_posix()))
+            )
+        )
         return b"".join(chunks)
 
     def _list(self, volume_path: PurePosixPath, recursive: bool) -> list:
         self._safe_reload()
-        return self._volume.listdir(volume_path.as_posix(), recursive=recursive)
+        return _run_with_timeout(
+            self._volume.listdir, volume_path.as_posix(), recursive
+        )
 
     def ls_info(self, path: str) -> list[FileInfo]:
         try:

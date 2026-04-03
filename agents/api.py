@@ -1123,10 +1123,14 @@ async def run_pipeline(
                 status_code=404, detail="No plan found. Complete planning first."
             )
         plan_status = plan.get("status", "draft")
-        if "ready" not in str(plan_status).lower():
+        restartable_statuses = {"ready", "generating", "testing", "deploying", "failed"}
+        if plan_status not in restartable_statuses:
             raise HTTPException(
                 status_code=400,
-                detail=f"Plan is not ready for pipeline execution (current status: '{plan_status}'). Approve the plan first.",
+                detail=(
+                    f"Plan is not ready for pipeline execution (current status: '{plan_status}'). "
+                    f"Approve the plan first or restart the pipeline from a restartable status."
+                ),
             )
     except HTTPException:
         raise
@@ -1182,7 +1186,9 @@ async def pipeline_status(
                 status_code=500, detail=f"Could not find pipeline run: {e}"
             )
 
-    result = await get_pipeline_status(effective_project_id, pipeline_run_id)
+    result = await get_pipeline_status(
+        effective_project_id, ctx.user_id, pipeline_run_id
+    )
     if "error" in result:
         raise HTTPException(status_code=500, detail=result["error"])
     return result

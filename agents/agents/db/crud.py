@@ -19,6 +19,11 @@ from agents.db.models import (
 )
 
 
+def pending_task_sort_key(task) -> tuple:
+    """In-memory mirror of the FIFO dispatch ordering used by pending task queries."""
+    return (task.created_at, task.sequence_index, task.id)
+
+
 async def create_user(
     session: AsyncSession,
     wallet: str | None = None,
@@ -406,8 +411,11 @@ async def create_pipeline_task(
     project_id: uuid.UUID,
     assigned_to: str,
     created_by: str,
+    task_type: str,
     description: str,
     context: dict | None = None,
+    parent_task_id: uuid.UUID | None = None,
+    sequence_index: int = 0,
 ) -> "PipelineTask":
     """Push a new task onto the pipeline task stack."""
     from agents.db.models import PipelineTask
@@ -417,7 +425,10 @@ async def create_pipeline_task(
         project_id=project_id,
         assigned_to=assigned_to,
         created_by=created_by,
+        task_type=task_type,
         description=description,
+        parent_task_id=parent_task_id,
+        sequence_index=sequence_index,
         status="pending",
         context=context,
     )
@@ -431,7 +442,7 @@ async def get_next_pending_task(
     session: AsyncSession,
     pipeline_run_id: uuid.UUID,
 ) -> "PipelineTask | None":
-    """Get the most recently created pending task (LIFO stack behavior)."""
+    """Get the next pending task using FIFO ordering plus sibling sequence."""
     from agents.db.models import PipelineTask
 
     result = await session.execute(
@@ -440,7 +451,11 @@ async def get_next_pending_task(
             PipelineTask.pipeline_run_id == pipeline_run_id,
             PipelineTask.status == "pending",
         )
-        .order_by(desc(PipelineTask.created_at))
+        .order_by(
+            PipelineTask.created_at.asc(),
+            PipelineTask.sequence_index.asc(),
+            PipelineTask.id.asc(),
+        )
         .limit(1)
     )
     return result.scalar_one_or_none()
@@ -465,6 +480,19 @@ async def set_task_in_progress(
     return task
 
 
+async def get_pipeline_task(
+    session: AsyncSession,
+    task_id: uuid.UUID,
+) -> "PipelineTask | None":
+    """Fetch one pipeline task by its ID."""
+    from agents.db.models import PipelineTask
+
+    result = await session.execute(
+        select(PipelineTask).where(PipelineTask.id == task_id)
+    )
+    return result.scalar_one_or_none()
+
+
 async def get_pipeline_run_tasks(
     session: AsyncSession,
     pipeline_run_id: uuid.UUID,
@@ -475,9 +503,13 @@ async def get_pipeline_run_tasks(
     result = await session.execute(
         select(PipelineTask)
         .where(PipelineTask.pipeline_run_id == pipeline_run_id)
-        .order_by(PipelineTask.created_at.asc())
+        .order_by(
+            PipelineTask.created_at.asc(),
+            PipelineTask.sequence_index.asc(),
+            PipelineTask.id.asc(),
+        )
     )
-    return list(result.scalars().all())
+    return sorted(list(result.scalars().all()), key=pending_task_sort_key)
 
 
 async def get_latest_pipeline_run_id(

@@ -1,4 +1,4 @@
-"""Request-scoped context for project_id, user_id, and pipeline_run_id (contextvars)."""
+"""Request-scoped context for project_id, user_id, and pipeline identifiers."""
 
 from contextvars import ContextVar
 
@@ -6,6 +6,9 @@ project_id_var: ContextVar[str | None] = ContextVar("project_id", default=None)
 user_id_var: ContextVar[str | None] = ContextVar("user_id", default=None)
 pipeline_run_id_var: ContextVar[str | None] = ContextVar(
     "pipeline_run_id", default=None
+)
+pipeline_task_id_var: ContextVar[str | None] = ContextVar(
+    "pipeline_task_id", default=None
 )
 
 
@@ -30,6 +33,16 @@ def get_pipeline_run_id() -> str | None:
     return pipeline_run_id_var.get()
 
 
+def set_pipeline_task_id(pipeline_task_id: str | None) -> None:
+    """Set the active pipeline task ID for the current task."""
+    pipeline_task_id_var.set(pipeline_task_id)
+
+
+def get_pipeline_task_id() -> str | None:
+    """Return the active pipeline task ID, or None if not in a pipeline task."""
+    return pipeline_task_id_var.get()
+
+
 def clear_project_context() -> None:
     """Clear all context (e.g. after request)."""
     try:
@@ -42,5 +55,9 @@ def clear_project_context() -> None:
         pass
     try:
         pipeline_run_id_var.set(None)
+    except LookupError:
+        pass
+    try:
+        pipeline_task_id_var.set(None)
     except LookupError:
         pass

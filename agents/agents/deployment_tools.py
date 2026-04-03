@@ -307,9 +307,15 @@ def run_foundry_deploy(
     response length errors). tx_hash and deployed_address are always included.
     """
     try:
-        from agents.context import get_project_context
+        from agents.context import (
+            get_pipeline_run_id,
+            get_pipeline_task_id,
+            get_project_context,
+        )
 
         project_id_ctx, _ = get_project_context()
+        pipeline_run_id = get_pipeline_run_id()
+        pipeline_task_id = get_pipeline_task_id()
         if request.network != "avalanche_fuji":
             return {
                 "error": (
@@ -455,6 +461,8 @@ def run_foundry_deploy(
         history: List[Dict[str, Any]] = deployment_state.get("last_deploy_results", [])
         entry = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
+            "pipeline_run_id": pipeline_run_id,
+            "pipeline_task_id": pipeline_task_id,
             "project_root": root,
             "sandbox_workdir": sandbox_workdir,
             "network": request.network,
@@ -513,6 +521,8 @@ def run_foundry_deploy(
         response = {
             "success": exit_code == 0,
             "exit_code": exit_code,
+            "pipeline_run_id": pipeline_run_id,
+            "pipeline_task_id": pipeline_task_id,
             "stdout": stdout,
             "stderr": stderr,
             "project_root": root,

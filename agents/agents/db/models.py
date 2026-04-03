@@ -344,10 +344,29 @@ class PipelineTask(Base):
         nullable=False,
         comment="Who created: orchestrator | coding | testing | deployment | audit",
     )
+    task_type: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        default="unknown",
+        comment="Canonical task type, usually <agent>.<action>",
+    )
     description: Mapped[str] = mapped_column(
         Text,
         nullable=False,
         comment="Natural language instruction the agent receives",
+    )
+    parent_task_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("pipeline_tasks.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+        comment="Optional parent task for hierarchical subtasks",
+    )
+    sequence_index: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        comment="Sibling ordering index for predictable FIFO dispatch",
     )
     status: Mapped[str] = mapped_column(
         Text,

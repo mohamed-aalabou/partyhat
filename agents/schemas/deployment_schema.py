@@ -24,6 +24,8 @@ class DeploymentRecord(BaseModel):
     tx_hash: Optional[str] = None
     status: DeploymentStatus
     notes: Optional[str] = None
+    pipeline_run_id: Optional[str] = None
+    pipeline_task_id: Optional[str] = None
     deployed_address: Optional[str] = None
     contract_name: Optional[str] = None
     script_path: Optional[str] = None
@@ -125,6 +127,8 @@ class FoundryDeployResult(BaseModel):
     script_path: str
     network: str
     chain_id: int
+    pipeline_run_id: Optional[str] = None
+    pipeline_task_id: Optional[str] = None
     tx_hash: Optional[str] = None
     deployed_address: Optional[str] = None
     stdout: Optional[str] = None
@@ -172,4 +176,3 @@ class SnowtraceVerifyRequest(BaseModel):
         default=None,
         description="Foundry project root path. If omitted, uses FOUNDRY_ARTIFACT_ROOT/project_id.",
     )
-
