@@ -120,6 +120,18 @@ def _parse_project_uuid(project_id: str) -> uuid.UUID | None:
         return None
 
 
+def _compact_execution_history(entries: list[dict]) -> list[dict]:
+    compacted: list[dict] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        compact = dict(entry)
+        compact.pop("stdout", None)
+        compact.pop("stderr", None)
+        compacted.append(compact)
+    return compacted
+
+
 async def _append_chat_message(
     session: AsyncSession | None,
     project_id: str,
@@ -181,6 +193,11 @@ class AnswerRecommendationResponse(BaseModel):
     recommended: Optional[bool] = None
 
 
+class PendingQuestionResponse(BaseModel):
+    question: str
+    answer_recommendations: List[AnswerRecommendationResponse] = []
+
+
 class StartSessionRequest(BaseModel):
     project_id: Optional[str] = None
     user_id: Optional[str] = None
@@ -190,6 +207,7 @@ class StartSessionResponse(BaseModel):
     session_id: str
     message: str  # agent's opening message
     answer_recommendations: List[AnswerRecommendationResponse] = []
+    pending_questions: List[PendingQuestionResponse] = []
 
 
 class CreateUserResponse(BaseModel):
@@ -260,6 +278,7 @@ class MessageResponse(BaseModel):
     response: str
     tool_calls: list[str]  # which tools were called
     answer_recommendations: List[AnswerRecommendationResponse] = []
+    pending_questions: List[PendingQuestionResponse] = []
 
 
 class PlanResponse(BaseModel):
@@ -573,6 +592,7 @@ async def start_session(
             session_id=session_id,
             message=result["response"],
             answer_recommendations=result.get("answer_recommendations", []),
+            pending_questions=result.get("pending_questions", []),
         )
     except Exception as e:
         raise HTTPException(
@@ -619,6 +639,7 @@ async def send_message(
             response=result["response"],
             tool_calls=result["tool_calls"],
             answer_recommendations=result.get("answer_recommendations", []),
+            pending_questions=result.get("pending_questions", []),
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Agent error: {str(e)}")
@@ -707,7 +728,9 @@ async def get_current_deployment(
             ),
         )
         state = mm.get_agent_state("deployment")
-        last_deploy_results = state.get("last_deploy_results", [])
+        last_deploy_results = _compact_execution_history(
+            state.get("last_deploy_results", [])
+        )
         return DeploymentCurrentResponse(last_deploy_results=last_deploy_results)
     except Exception as e:
         raise HTTPException(
@@ -738,7 +761,9 @@ async def get_current_test_results(
             ),
         )
         state = mm.get_agent_state("testing")
-        last_test_results = state.get("last_test_results", [])
+        last_test_results = _compact_execution_history(
+            state.get("last_test_results", [])
+        )
         return TestingCurrentResponse(last_test_results=last_test_results)
     except Exception as e:
         raise HTTPException(
@@ -986,6 +1011,7 @@ async def routed_message(
             response=result["response"],
             tool_calls=result["tool_calls"],
             answer_recommendations=result.get("answer_recommendations", []),
+            pending_questions=result.get("pending_questions", []),
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -1118,6 +1144,7 @@ async def run_pipeline(
     try:
         mm = MemoryManager(user_id=user_id, project_id=project_id)
         plan = mm.get_plan()
+        print(f"Plan: {plan}")
         if not plan:
             raise HTTPException(
                 status_code=404, detail="No plan found. Complete planning first."

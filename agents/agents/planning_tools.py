@@ -3,11 +3,12 @@ Planning Agent Tool Registry
 -----------------------------
 Tools defined here:
     1. get_current_plan: to read current draft from memory
-    2. send_answer_recommendations: to expose suggested quick replies to UI
-    3. save_plan_draft: to persist intermediate draft mid-conversation
-    4. validate_plan: to run Pydantic schema check explicitly
-    5. publish_final_plan: to finalise and save to user + global memory
-    6. save_reasoning_note: to log WHY a decision was made (episodic memory)
+    2. send_question_batch: to expose up to 5 pending questions to UI
+    3. send_answer_recommendations: legacy quick replies for single-question UI
+    4. save_plan_draft: to persist intermediate draft mid-conversation
+    5. validate_plan: to run Pydantic schema check explicitly
+    6. publish_final_plan: to finalise and save to user + global memory
+    7. save_reasoning_note: to log WHY a decision was made (episodic memory)
 """
 
 import sys
@@ -40,6 +41,20 @@ class AnswerRecommendation(BaseModel):
         description=(
             "Optional hint whether this answer is the primary recommendation. "
             "Omit when no specific recommendation is intended."
+        ),
+    )
+
+
+class PlanningQuestion(BaseModel):
+    question: str = Field(
+        ...,
+        description="A concise planning question for the user to answer.",
+    )
+    answer_recommendations: List[AnswerRecommendation] = Field(
+        default_factory=list,
+        description=(
+            "Optional quick-reply suggestions for this specific question. "
+            "Use 0-5 items."
         ),
     )
 
@@ -83,6 +98,22 @@ def get_answer_recommendations() -> List[dict]:
         return []
 
 
+def get_pending_questions() -> List[dict]:
+    """
+    Read the latest structured planning questions from agent state.
+    Returns an empty list when no pending questions are available.
+    """
+    try:
+        mm = _get_memory_manager()
+        state = mm.get_agent_state("planning")
+        questions = state.get("pending_questions", [])
+        if isinstance(questions, list):
+            return questions
+        return []
+    except Exception:
+        return []
+
+
 def clear_answer_recommendations() -> None:
     """
     Clear transient answer recommendations before each planning turn.
@@ -96,6 +127,48 @@ def clear_answer_recommendations() -> None:
     except Exception:
         # Best-effort cleanup; failures should never block planning flow.
         pass
+
+
+def clear_pending_questions() -> None:
+    """
+    Clear transient structured planning questions before each planning turn.
+    """
+    try:
+        mm = _get_memory_manager()
+        state = mm.get_agent_state("planning")
+        updated = False
+        if state.get("pending_questions"):
+            state["pending_questions"] = []
+            updated = True
+        if state.get("answer_recommendations"):
+            state["answer_recommendations"] = []
+            updated = True
+        if updated:
+            mm.set_agent_state("planning", state)
+    except Exception:
+        # Best-effort cleanup; failures should never block planning flow.
+        pass
+
+
+def _deployment_address_issues(plan: SmartContractPlan) -> List[str]:
+    issues: List[str] = []
+    for contract in plan.contracts:
+        constructor = contract.constructor
+        if not constructor:
+            continue
+        for item in constructor.inputs:
+            if item.type.lower() != "address":
+                continue
+            if item.default_value and item.default_value.strip():
+                continue
+            issues.append(
+                (
+                    f"Contract '{contract.name}' constructor input '{item.name}' "
+                    "is an address and needs a deployment wallet. Ask for a "
+                    "specific wallet address or record default_value='deployer'."
+                )
+            )
+    return issues
 
 
 @tool
@@ -145,6 +218,58 @@ def save_plan_draft(plan: SmartContractPlan) -> dict:
 
 
 @tool
+def send_question_batch(questions: List[PlanningQuestion]) -> dict:
+    """
+    Save a batch of pending planning questions for the latest agent turn.
+
+    Use this whenever you ask the user one or more clarifying questions.
+    Rules:
+    - Ask at most 5 questions per turn
+    - Each question must be independently answerable
+    - Use answer_recommendations inside each question when quick replies help
+
+    For backward compatibility with older clients, the first question's
+    recommendations are also mirrored into answer_recommendations.
+    """
+    if len(questions) > 5:
+        return {"error": "A question batch may contain at most 5 questions."}
+
+    try:
+        mm = _get_memory_manager()
+        state = mm.get_agent_state("planning")
+        state["pending_questions"] = []
+
+        for question in questions:
+            if len(question.answer_recommendations) > 5:
+                return {
+                    "error": (
+                        "Each planning question may contain at most 5 "
+                        "answer recommendations."
+                    )
+                }
+            state["pending_questions"].append(
+                question.model_dump(exclude_none=True)
+            )
+
+        first_recommendations = (
+            questions[0].answer_recommendations if questions else []
+        )
+        state["answer_recommendations"] = [
+            rec.model_dump(exclude_none=True) for rec in first_recommendations
+        ]
+        mm.set_agent_state("planning", state)
+
+        return {
+            "success": True,
+            "count": len(state["pending_questions"]),
+            "pending_questions": state["pending_questions"],
+            "answer_recommendations": state["answer_recommendations"],
+        }
+    except Exception as e:
+        return {"error": f"Could not save question batch: {str(e)}"}
+
+
+@tool
 def send_answer_recommendations(recommendations: List[AnswerRecommendation]) -> dict:
     """
     Save answer recommendations for the latest planning question.
@@ -160,6 +285,14 @@ def send_answer_recommendations(recommendations: List[AnswerRecommendation]) -> 
         state["answer_recommendations"] = [
             rec.model_dump(exclude_none=True) for rec in recommendations
         ]
+        if state.get("pending_questions") and isinstance(
+            state["pending_questions"], list
+        ):
+            first_question = state["pending_questions"][0]
+            if isinstance(first_question, dict):
+                first_question["answer_recommendations"] = state[
+                    "answer_recommendations"
+                ]
         mm.set_agent_state("planning", state)
 
         return {
@@ -201,6 +334,8 @@ def validate_plan(plan: SmartContractPlan) -> dict:
             issues.append(f"Contract '{contract.name}' has no functions defined.")
         if not contract.constructor:
             issues.append(f"Contract '{contract.name}' has no constructor defined.")
+
+    issues.extend(_deployment_address_issues(plan))
 
     if issues:
         return {
@@ -248,6 +383,16 @@ def publish_final_plan(plan: SmartContractPlan) -> dict:
     Returns confirmation dict with plan summary.
     """
     try:
+        issues = _deployment_address_issues(plan)
+        if issues:
+            return {
+                "error": (
+                    "Plan is missing required deployment wallet decisions for one "
+                    "or more constructor address inputs."
+                ),
+                "issues": issues,
+            }
+
         # Setting status to ready, it signals to Create agent it can start
         plan.status = PlanStatus.READY
 
@@ -320,6 +465,7 @@ _mcp_tools: List = []
 
 PLANNING_TOOLS = [
     get_current_plan,
+    send_question_batch,
     send_answer_recommendations,
     save_plan_draft,
     validate_plan,
@@ -367,6 +513,7 @@ def set_planning_mcp_tools(tools: List) -> None:
     _mcp_tools = tools or []
     PLANNING_TOOLS = _mcp_tools + [
         get_current_plan,
+        send_question_batch,
         send_answer_recommendations,
         save_plan_draft,
         validate_plan,

@@ -21,6 +21,11 @@ from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
+from agents.pipeline_context import (
+    default_expected_outputs,
+    extract_plan_summary,
+    standardize_task_context,
+)
 
 
 def _get_sync_url() -> str:
@@ -84,6 +89,48 @@ def _get_context():
     pipeline_run_id = get_pipeline_run_id()
     pipeline_task_id = get_pipeline_task_id()
     return project_id, user_id, pipeline_run_id, pipeline_task_id
+
+
+def _get_memory_manager(project_id: str | None, user_id: str | None):
+    from agents.memory_manager import MemoryManager
+
+    return MemoryManager(user_id=user_id or "default", project_id=project_id)
+
+
+def _get_artifact_snapshot(project_id: str | None, user_id: str | None) -> dict:
+    mm = _get_memory_manager(project_id, user_id)
+    return {
+        "coding": mm.get_agent_state("coding").get("artifacts", []),
+        "testing": mm.get_agent_state("testing").get("artifacts", []),
+        "deployment": mm.get_agent_state("deployment").get("artifacts", []),
+    }
+
+
+def _get_plan_summary(project_id: str | None, user_id: str | None) -> dict:
+    mm = _get_memory_manager(project_id, user_id)
+    planning = mm.get_agent_state("planning")
+    summary = planning.get("plan_summary")
+    if summary:
+        return summary
+    plan = mm.get_plan()
+    return extract_plan_summary(plan)
+
+
+def _next_artifact_revision(task, task_status: str) -> int:
+    current = 0
+    if getattr(task, "artifact_revision", None) is not None:
+        current = int(task.artifact_revision)
+    elif getattr(task, "context", None):
+        current = int((task.context or {}).get("artifact_revision", 0) or 0)
+
+    if task.task_type == "coding.generate_contracts" and task_status == "completed":
+        return current + 1
+    return current
+
+
+def _update_revision_pointer(project_id: str | None, user_id: str | None, revision: int) -> None:
+    mm = _get_memory_manager(project_id, user_id)
+    mm.update_coding_state(latest_artifact_revision=revision)
 
 
 def _get_current_task_sync(
@@ -150,6 +197,8 @@ def _complete_and_create_sync(
                     else uuid.UUID(task_id)
                 ),
                 sequence_index=t.get("sequence_index", idx),
+                artifact_revision=t.get("artifact_revision", 0),
+                depends_on_task_ids=t.get("depends_on_task_ids"),
                 status="pending",
                 context=t.get("context"),
             )
@@ -222,6 +271,13 @@ class NextTask(BaseModel):
             "this completion call."
         ),
     )
+    depends_on_task_ids: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "Optional prerequisite task IDs that must be completed before this "
+            "task becomes runnable."
+        ),
+    )
 
 
 class CompleteTaskInput(BaseModel):
@@ -260,16 +316,58 @@ def _is_valid_task_type(assigned_to: str, task_type: str) -> bool:
     )
 
 
-def _normalize_next_tasks(current_task_id: str, next_tasks: List[NextTask]) -> list[dict]:
-    """Apply default parent/sequence metadata before writing follow-up tasks."""
+def _normalize_next_tasks(
+    current_task,
+    next_tasks: List[NextTask],
+    *,
+    project_id: str | None,
+    user_id: str | None,
+    task_status: str,
+    result_summary: str,
+) -> list[dict]:
+    """Apply default pipeline context before writing follow-up tasks."""
     normalized = []
+    artifact_snapshot = _get_artifact_snapshot(project_id, user_id)
+    plan_summary = _get_plan_summary(project_id, user_id)
+    artifact_revision = _next_artifact_revision(current_task, task_status)
+    upstream_task = {
+        "task_id": str(current_task.id),
+        "task_type": current_task.task_type,
+        "assigned_to": current_task.assigned_to,
+        "status": task_status,
+        "result_summary": result_summary,
+    }
+    failure_context = (
+        {
+            "task_id": str(current_task.id),
+            "task_type": current_task.task_type,
+            "result_summary": result_summary,
+        }
+        if task_status == "failed"
+        else None
+    )
+
     for idx, task in enumerate(next_tasks):
         payload = task.model_dump()
-        payload["parent_task_id"] = payload.get("parent_task_id") or current_task_id
+        payload["parent_task_id"] = payload.get("parent_task_id") or str(current_task.id)
         payload["sequence_index"] = (
             payload["sequence_index"] if payload.get("sequence_index") is not None else idx
         )
+        payload["artifact_revision"] = artifact_revision
+        payload["context"] = standardize_task_context(
+            payload.get("context"),
+            plan_summary=plan_summary,
+            artifact_revision=artifact_revision,
+            input_artifacts=artifact_snapshot,
+            upstream_task=upstream_task,
+            failure_context=failure_context,
+            expected_outputs=payload.get("context", {}).get("expected_outputs")
+            if isinstance(payload.get("context"), dict)
+            else default_expected_outputs(payload["task_type"]),
+        )
         normalized.append(payload)
+
+    _update_revision_pointer(project_id, user_id, artifact_revision)
     return normalized
 
 
@@ -314,6 +412,8 @@ def get_my_current_task() -> dict:
                 str(task.parent_task_id) if task.parent_task_id else None
             ),
             "sequence_index": task.sequence_index,
+            "artifact_revision": getattr(task, "artifact_revision", 0),
+            "depends_on_task_ids": getattr(task, "depends_on_task_ids", None),
         }
         if task.context:
             result["context"] = task.context
@@ -413,6 +513,17 @@ def complete_task_and_create_next(input: CompleteTaskInput) -> dict:
                             "Expected a UUID string."
                         )
                     }
+            if nt.depends_on_task_ids:
+                for dep_id in nt.depends_on_task_ids:
+                    try:
+                        uuid.UUID(dep_id)
+                    except ValueError:
+                        return {
+                            "error": (
+                                f"Invalid dependency task id '{dep_id}'. "
+                                "Expected UUID strings in depends_on_task_ids."
+                            )
+                        }
 
         if (
             input.task_status == "completed"
@@ -426,7 +537,14 @@ def complete_task_and_create_next(input: CompleteTaskInput) -> dict:
                 )
             }
 
-        normalized_next_tasks = _normalize_next_tasks(str(task.id), input.next_tasks)
+        normalized_next_tasks = _normalize_next_tasks(
+            task,
+            input.next_tasks,
+            project_id=project_id,
+            user_id=user_id,
+            task_status=input.task_status,
+            result_summary=input.result_summary,
+        )
 
         created = _complete_and_create_sync(
             pipeline_run_id=pipeline_run_id,

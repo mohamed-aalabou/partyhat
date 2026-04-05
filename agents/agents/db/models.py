@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, ForeignKey, Integer, Text, JSON
+from sqlalchemy import DateTime, ForeignKey, Integer, Text, JSON, Index
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -318,6 +318,25 @@ class PipelineTask(Base):
     """
 
     __tablename__ = "pipeline_tasks"
+    __table_args__ = (
+        Index(
+            "ix_pipeline_tasks_dispatch_status_created",
+            "pipeline_run_id",
+            "status",
+            "created_at",
+            "sequence_index",
+            "id",
+        ),
+        Index(
+            "ix_pipeline_tasks_dispatch_revision",
+            "pipeline_run_id",
+            "status",
+            "artifact_revision",
+            "created_at",
+            "sequence_index",
+            "id",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
@@ -368,6 +387,17 @@ class PipelineTask(Base):
         default=0,
         comment="Sibling ordering index for predictable FIFO dispatch",
     )
+    artifact_revision: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        comment="Monotonic code artifact revision propagated through the pipeline.",
+    )
+    depends_on_task_ids: Mapped[list[str] | None] = mapped_column(
+        JSON,
+        nullable=True,
+        comment="Optional list of prerequisite pipeline task UUID strings.",
+    )
     status: Mapped[str] = mapped_column(
         Text,
         nullable=False,
@@ -387,6 +417,10 @@ class PipelineTask(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),
+    )
+    claimed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
     )
     completed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),

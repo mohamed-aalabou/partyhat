@@ -3,9 +3,8 @@ from io import BytesIO
 from pathlib import Path
 from typing import Protocol
 
-import modal
-
 from schemas.coding_schema import CodeArtifact
+from agents.modal_runtime import get_modal_volume
 
 
 def _resolve_project_id(project_id: str | None) -> str | None:
@@ -110,10 +109,7 @@ class ModalVolumeCodeStorage:
             volume_name = f"{base_name}-{project_id}"
         else:
             volume_name = base_name
-        self._volume = modal.Volume.from_name(
-            volume_name,
-            create_if_missing=True,
-        )
+        self._volume = get_modal_volume(volume_name)
         if base_dir is None:
             root = os.getenv("FOUNDRY_ARTIFACT_ROOT", "generated_contracts")
             if project_id:
@@ -193,6 +189,9 @@ class ModalVolumeCodeStorage:
         return out
 
 
+_STORAGE_CACHE: dict[tuple[bool, str | None], CodeStorage] = {}
+
+
 def get_code_storage(project_id: str | None = None) -> CodeStorage:
     """
     Factory that chooses the appropriate storage backend.
@@ -207,5 +206,50 @@ def get_code_storage(project_id: str | None = None) -> CodeStorage:
         "true",
         "yes",
     }
-    return ModalVolumeCodeStorage(project_id=pid)
+    key = (use_modal, pid)
+    if key not in _STORAGE_CACHE:
+        if use_modal:
+            _STORAGE_CACHE[key] = ModalVolumeCodeStorage(project_id=pid)
+        else:
+            _STORAGE_CACHE[key] = LocalCodeStorage(project_id=pid)
+    return _STORAGE_CACHE[key]
 
+
+def save_text_artifact(
+    path: str,
+    content: str,
+    project_id: str | None = None,
+) -> str:
+    storage = get_code_storage(project_id=project_id)
+    storage.save_code(
+        CodeArtifact(
+            path=path,
+            language="text",
+        ),
+        content or "",
+    )
+    return path
+
+
+def save_execution_logs(
+    *,
+    project_id: str | None,
+    pipeline_run_id: str | None,
+    pipeline_task_id: str | None,
+    stdout: str,
+    stderr: str,
+) -> tuple[str, str]:
+    run_segment = pipeline_run_id or "manual"
+    task_segment = pipeline_task_id or "standalone"
+    base = f"logs/{run_segment}/{task_segment}"
+    stdout_path = save_text_artifact(
+        f"{base}/stdout.log",
+        stdout,
+        project_id=project_id,
+    )
+    stderr_path = save_text_artifact(
+        f"{base}/stderr.log",
+        stderr,
+        project_id=project_id,
+    )
+    return stdout_path, stderr_path

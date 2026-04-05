@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import select, desc
+from sqlalchemy import select, desc, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 
@@ -416,6 +416,8 @@ async def create_pipeline_task(
     context: dict | None = None,
     parent_task_id: uuid.UUID | None = None,
     sequence_index: int = 0,
+    artifact_revision: int = 0,
+    depends_on_task_ids: list[str] | None = None,
 ) -> "PipelineTask":
     """Push a new task onto the pipeline task stack."""
     from agents.db.models import PipelineTask
@@ -429,6 +431,8 @@ async def create_pipeline_task(
         description=description,
         parent_task_id=parent_task_id,
         sequence_index=sequence_index,
+        artifact_revision=artifact_revision,
+        depends_on_task_ids=depends_on_task_ids,
         status="pending",
         context=context,
     )
@@ -461,6 +465,49 @@ async def get_next_pending_task(
     return result.scalar_one_or_none()
 
 
+async def claim_next_pending_task(
+    session: AsyncSession,
+    pipeline_run_id: uuid.UUID,
+) -> "PipelineTask | None":
+    """Atomically claim the next runnable pending task for a pipeline run."""
+    from agents.db.models import PipelineTask
+
+    result = await session.execute(
+        select(PipelineTask)
+        .where(PipelineTask.pipeline_run_id == pipeline_run_id)
+        .order_by(
+            PipelineTask.created_at.asc(),
+            PipelineTask.sequence_index.asc(),
+            PipelineTask.id.asc(),
+        )
+    )
+    tasks = list(result.scalars().all())
+    completed_ids = {str(task.id) for task in tasks if task.status == "completed"}
+
+    for task in tasks:
+        if task.status != "pending":
+            continue
+        dependencies = task.depends_on_task_ids or []
+        if any(dep not in completed_ids for dep in dependencies):
+            continue
+
+        claim_time = datetime.now(timezone.utc)
+        claim_result = await session.execute(
+            update(PipelineTask)
+            .where(PipelineTask.id == task.id, PipelineTask.status == "pending")
+            .values(status="in_progress", claimed_at=claim_time)
+        )
+        if claim_result.rowcount:
+            await session.commit()
+            refresh_result = await session.execute(
+                select(PipelineTask).where(PipelineTask.id == task.id)
+            )
+            return refresh_result.scalar_one_or_none()
+        await session.rollback()
+
+    return None
+
+
 async def set_task_in_progress(
     session: AsyncSession,
     task_id: uuid.UUID,
@@ -475,6 +522,7 @@ async def set_task_in_progress(
     if task is None:
         return None
     task.status = "in_progress"
+    task.claimed_at = datetime.now(timezone.utc)
     await session.commit()
     await session.refresh(task)
     return task
@@ -509,7 +557,60 @@ async def get_pipeline_run_tasks(
             PipelineTask.id.asc(),
         )
     )
-    return sorted(list(result.scalars().all()), key=pending_task_sort_key)
+    return list(result.scalars().all())
+
+
+async def complete_pipeline_task_and_create_next(
+    session: AsyncSession,
+    *,
+    pipeline_run_id: uuid.UUID,
+    project_id: uuid.UUID,
+    task_id: uuid.UUID,
+    task_status: str,
+    result_summary: str,
+    next_tasks: list[dict],
+    created_by: str,
+) -> tuple["PipelineTask | None", list["PipelineTask"]]:
+    """Complete a task and create the next tasks in one async transaction."""
+    from agents.db.models import PipelineTask
+
+    result = await session.execute(
+        select(PipelineTask).where(PipelineTask.id == task_id)
+    )
+    task = result.scalar_one_or_none()
+    if task is None:
+        return None, []
+
+    task.status = task_status
+    task.result_summary = result_summary
+    task.completed_at = datetime.now(timezone.utc)
+
+    created: list[PipelineTask] = []
+    for idx, payload in enumerate(next_tasks):
+        new_task = PipelineTask(
+            pipeline_run_id=pipeline_run_id,
+            project_id=project_id,
+            assigned_to=payload["assigned_to"],
+            created_by=created_by,
+            task_type=payload["task_type"],
+            description=payload["description"],
+            context=payload.get("context"),
+            parent_task_id=uuid.UUID(payload["parent_task_id"])
+            if payload.get("parent_task_id")
+            else task_id,
+            sequence_index=payload.get("sequence_index", idx),
+            artifact_revision=payload.get("artifact_revision", task.artifact_revision),
+            depends_on_task_ids=payload.get("depends_on_task_ids"),
+            status="pending",
+        )
+        session.add(new_task)
+        created.append(new_task)
+
+    await session.commit()
+    await session.refresh(task)
+    for new_task in created:
+        await session.refresh(new_task)
+    return task, created
 
 
 async def get_latest_pipeline_run_id(

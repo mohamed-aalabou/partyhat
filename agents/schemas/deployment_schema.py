@@ -33,6 +33,8 @@ class DeploymentRecord(BaseModel):
     command: Optional[str] = None
     stdout: Optional[str] = None
     stderr: Optional[str] = None
+    stdout_path: Optional[str] = None
+    stderr_path: Optional[str] = None
     exit_code: Optional[int] = None
 
 
@@ -55,8 +57,10 @@ class FoundryDeployScriptGenerationRequest(BaseModel):
     constructor_args: List[str] = Field(
         default_factory=list,
         description=(
-            "Constructor arguments as Solidity literals (e.g. "
-            "\"\\\"Party\\\"\", \"\\\"PRTY\\\"\", \"1000000 ether\")."
+            "Constructor arguments as Solidity expressions (e.g. "
+            "\"\\\"Party\\\"\", \"\\\"PRTY\\\"\", \"1000000 ether\", "
+            "or \"deployer\" for the broadcaster address derived from the "
+            "deployment private key)."
         ),
     )
     plan_summary: Optional[str] = Field(
@@ -100,7 +104,10 @@ class FoundryDeployRequest(BaseModel):
     )
     constructor_args: List[str] = Field(
         default_factory=list,
-        description="Optional constructor args as Solidity literals passed via --sig run(...).",
+        description=(
+            "Optional constructor args as Solidity expressions passed via "
+            "--sig run(...)."
+        ),
     )
     extra_args: List[str] = Field(
         default_factory=list,
@@ -133,6 +140,8 @@ class FoundryDeployResult(BaseModel):
     deployed_address: Optional[str] = None
     stdout: Optional[str] = None
     stderr: Optional[str] = None
+    stdout_path: Optional[str] = None
+    stderr_path: Optional[str] = None
 
 
 class SnowtraceVerifyRequest(BaseModel):

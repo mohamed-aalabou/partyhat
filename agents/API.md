@@ -316,11 +316,21 @@ Or rely on `X-Project-Id` / `X-User-Id` headers.
 		{ "text": "Create an ERC-20 token", "recommended": true },
 		{ "text": "Create an ERC-721 NFT collection" },
 		{ "text": "Create an ERC-1155 multi-token contract" }
+	],
+	"pending_questions": [
+		{
+			"question": "What type of contract do you want to build?",
+			"answer_recommendations": [
+				{ "text": "ERC-20 token", "recommended": true },
+				{ "text": "ERC-721 NFT collection" },
+				{ "text": "ERC-1155 multi-token contract" }
+			]
+		}
 	]
 }
 ```
 
-**Frontend:** After calling this, save `session_id` (e.g. in state or URL) and show `message` as the first bot message.
+**Frontend:** After calling this, save `session_id` and show `message` as the first bot message. If `pending_questions` is present, render the questions directly; `answer_recommendations` remains as a backward-compatible shortcut for the first question.
 
 ---
 
@@ -348,19 +358,42 @@ Send a user message to the planning agent.
 ```json
 {
 	"session_id": "770e8400-e29b-41d4-a716-446655440002",
-	"response": "I'll help you design an ERC-20 with mint and burn...",
-	"tool_calls": ["send_answer_recommendations", "save_plan_draft"],
+	"response": "I have enough to start. Please answer these three questions in one reply: 1. Should supply be fixed or mintable? 2. Who can mint? 3. Do you want a cap?",
+	"tool_calls": ["send_question_batch", "save_plan_draft"],
 	"answer_recommendations": [
 		{ "text": "Fixed initial supply (e.g. 1,000,000)", "recommended": true },
 		{ "text": "Mintable supply controlled by owner" },
 		{ "text": "No cap for now; decide later" }
+	],
+	"pending_questions": [
+		{
+			"question": "Should the token supply be fixed or mintable after deployment?",
+			"answer_recommendations": [
+				{ "text": "Fixed initial supply (e.g. 1,000,000)", "recommended": true },
+				{ "text": "Mintable supply controlled by owner" }
+			]
+		},
+		{
+			"question": "Who should be allowed to mint new tokens?",
+			"answer_recommendations": [
+				{ "text": "Only the owner", "recommended": true },
+				{ "text": "Addresses with a MINTER_ROLE" }
+			]
+		},
+		{
+			"question": "Do you want a maximum token cap?",
+			"answer_recommendations": [
+				{ "text": "No cap for now; decide later", "recommended": true },
+				{ "text": "Yes, set a fixed cap" }
+			]
+		}
 	]
 }
 ```
 
 **Errors:** `400` empty message, `500` agent error.
 
-**Frontend:** Append user message to UI, send request, then append `response` as the assistant message. Use `answer_recommendations` as optional quick-reply chips/buttons (each item has `text` and optional `recommended`).
+**Frontend:** Append the user message, then append `response` as the assistant message. Prefer `pending_questions` for rendering a multi-question batch UI. `answer_recommendations` is still returned for older clients and mirrors the first question's quick replies.
 
 ---
 
@@ -503,7 +536,7 @@ Return the last deploy results for this user/project (from `run_foundry_deploy`)
 }
 ```
 
-**Frontend:** Poll or call after deploy; treat latest entry with `exit_code === 0` and `tx_hash` as successful.
+**Frontend:** Poll or call after deploy; treat `success === true` as authoritative. Successful deploys require a clean forge exit plus either a deployment `tx_hash` or a confirmed deployed contract address.
 
 ---
 
@@ -664,7 +697,8 @@ Single request/response.
 	"session_id": "770e8400-e29b-41d4-a716-446655440002",
 	"response": "I've added a pause function...",
 	"tool_calls": ["save_coding_note"],
-	"answer_recommendations": []
+	"answer_recommendations": [],
+	"pending_questions": []
 }
 ```
 
@@ -699,6 +733,15 @@ Each event is a JSON line after `data: `:
     "answer_recommendations": [
       { "text": "Option A", "recommended": true },
       { "text": "Option B" }
+    ],
+    "pending_questions": [
+      {
+        "question": "Which ERC standard do you want?",
+        "answer_recommendations": [
+          { "text": "ERC-20", "recommended": true },
+          { "text": "ERC-721" }
+        ]
+      }
     ]
   }
   ```

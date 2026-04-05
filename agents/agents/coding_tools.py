@@ -14,6 +14,12 @@ from schemas.coding_schema import CodeArtifact, CodeGenerationRequest
 from agents.code_storage import get_code_storage
 from agents.task_tools import TASK_TOOLS
 from modal_foundry_app import foundry_image
+from agents.modal_runtime import (
+    build_foundry_bootstrap_cmd,
+    build_project_volume_name,
+    get_modal_app,
+    get_modal_volume,
+)
 
 
 def _get_memory_manager():
@@ -232,37 +238,17 @@ def ensure_chainlink_contracts(project_root: Optional[str] = None) -> dict:
         app_name = os.getenv("MODAL_APP_NAME", "partyhat-foundry-tests")
         timeout = int(os.getenv("FOUNDRY_SANDBOX_TIMEOUT", "900"))
 
-        app = modal.App.lookup(app_name, create_if_missing=True)
+        app = get_modal_app(app_name)
 
         base_volume_name = os.getenv(
             "FOUNDRY_ARTIFACT_VOLUME_NAME", "partyhat-foundry-artifacts"
         )
-        volume_name = (
-            f"{base_volume_name}-{project_id_ctx}"
-            if project_id_ctx
-            else base_volume_name
-        )
-        vol = modal.Volume.from_name(volume_name, create_if_missing=True)
+        volume_name = build_project_volume_name(base_volume_name, project_id_ctx)
+        vol = get_modal_volume(volume_name)
 
         sandbox_workdir = "/workspace/project"
-        quoted_root = shlex.quote(root)
-        bootstrap_cmd = (
-            "set -e; " + f"cd {quoted_root}; " + "mkdir -p lib; "
-            "if [ ! -d lib/chainlink-evm ]; then "
-            "  if [ -d /opt/foundry-deps/chainlink-evm ]; then cp -R /opt/foundry-deps/chainlink-evm lib/chainlink-evm; "
-            "  else git clone --depth 1 https://github.com/smartcontractkit/chainlink-evm lib/chainlink-evm; fi; "
-            "fi; "
-            "if [ ! -f lib/chainlink-evm/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol ]; then "
-            "  rm -rf lib/chainlink-evm; "
-            "  if [ -d /opt/foundry-deps/chainlink-evm ]; then cp -R /opt/foundry-deps/chainlink-evm lib/chainlink-evm; "
-            "  else git clone --depth 1 https://github.com/smartcontractkit/chainlink-evm lib/chainlink-evm; fi; "
-            "fi; "
-            "mkdir -p lib/chainlink-evm/contracts/src/v0.8/interfaces; "
-            "if [ ! -f lib/chainlink-evm/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol ] "
-            "&& [ -f lib/chainlink-evm/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol ]; then "
-            "  cp lib/chainlink-evm/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol "
-            "lib/chainlink-evm/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol; "
-            "fi; "
+        bootstrap_cmd = build_foundry_bootstrap_cmd(
+            root,
             "touch remappings.txt; "
             "grep -qxF '@chainlink/contracts/=lib/chainlink-evm/contracts/' remappings.txt "
             "|| echo '@chainlink/contracts/=lib/chainlink-evm/contracts/' >> remappings.txt; "

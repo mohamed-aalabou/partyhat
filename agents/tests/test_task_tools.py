@@ -14,6 +14,17 @@ from agents.db.crud import pending_task_sort_key
 def test_normalize_next_tasks_defaults_parent_and_sequence():
     current_task_id = str(uuid.uuid4())
     explicit_parent = str(uuid.uuid4())
+    current_task = SimpleNamespace(
+        id=uuid.UUID(current_task_id),
+        task_type="coding.generate_contracts",
+        assigned_to="coding",
+        artifact_revision=0,
+        context={
+            "artifact_revision": 0,
+            "plan_summary": {"project_name": "PartyToken"},
+            "input_artifacts": {"coding": [], "testing": [], "deployment": []},
+        },
+    )
     next_tasks = [
         NextTask(
             assigned_to="testing",
@@ -29,10 +40,29 @@ def test_normalize_next_tasks_defaults_parent_and_sequence():
         ),
     ]
 
-    normalized = _normalize_next_tasks(current_task_id, next_tasks)
+    from agents import task_tools
+
+    task_tools._get_artifact_snapshot = lambda project_id, user_id: {
+        "coding": [],
+        "testing": [],
+        "deployment": [],
+    }
+    task_tools._get_plan_summary = lambda project_id, user_id: {"project_name": "PartyToken"}
+    task_tools._update_revision_pointer = lambda project_id, user_id, revision: None
+
+    normalized = _normalize_next_tasks(
+        current_task,
+        next_tasks,
+        project_id="project-id",
+        user_id="user-id",
+        task_status="completed",
+        result_summary="Generated contracts.",
+    )
 
     assert normalized[0]["parent_task_id"] == current_task_id
     assert normalized[0]["sequence_index"] == 0
+    assert normalized[0]["artifact_revision"] == 1
+    assert normalized[0]["context"]["plan_summary"]["project_name"] == "PartyToken"
     assert normalized[1]["parent_task_id"] == explicit_parent
     assert normalized[1]["sequence_index"] == 7
 
@@ -86,7 +116,25 @@ def test_complete_task_passes_failed_status_and_normalized_subtasks(monkeypatch)
             id=current_task_id,
             task_type="deployment.execute_deploy",
             assigned_to="deployment",
+            artifact_revision=1,
+            context={
+                "artifact_revision": 1,
+                "plan_summary": {"project_name": "PartyToken"},
+                "input_artifacts": {"coding": [], "testing": [], "deployment": []},
+            },
         ),
+    )
+    monkeypatch.setattr(
+        "agents.task_tools._get_artifact_snapshot",
+        lambda project_id, user_id: {"coding": [], "testing": [], "deployment": []},
+    )
+    monkeypatch.setattr(
+        "agents.task_tools._get_plan_summary",
+        lambda project_id, user_id: {"project_name": "PartyToken"},
+    )
+    monkeypatch.setattr(
+        "agents.task_tools._update_revision_pointer",
+        lambda project_id, user_id, revision: None,
     )
 
     def fake_complete_and_create_sync(**kwargs):
@@ -125,6 +173,8 @@ def test_complete_task_passes_failed_status_and_normalized_subtasks(monkeypatch)
     assert captured["task_status"] == "failed"
     assert captured["next_tasks"][0]["parent_task_id"] == str(current_task_id)
     assert captured["next_tasks"][0]["sequence_index"] == 0
+    assert captured["next_tasks"][0]["artifact_revision"] == 1
+    assert captured["next_tasks"][0]["context"]["failure_context"]["task_id"] == str(current_task_id)
 
 
 def test_pending_task_sort_key_prefers_fifo_then_sequence_index():

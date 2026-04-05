@@ -15,13 +15,21 @@ from langchain_core.messages import HumanMessage
 from pydantic import BaseModel, Field
 
 from schemas.coding_schema import CodeArtifact
-from agents.code_storage import get_code_storage
+from agents.code_storage import get_code_storage, save_execution_logs
 from agents.planning_tools import get_current_plan as planning_get_current_plan
 from agents.coding_tools import (
     get_current_artifacts as coding_get_current_artifacts,
     load_code_artifact as coding_load_code_artifact,
     ensure_chainlink_contracts as coding_ensure_chainlink_contracts,
 )
+from agents.modal_runtime import (
+    build_foundry_bootstrap_cmd,
+    build_project_volume_name,
+    default_foundry_remappings,
+    get_modal_app,
+    get_modal_volume,
+)
+from agents.pipeline_context import compact_execution_summary
 from agents.task_tools import TASK_TOOLS
 
 
@@ -32,6 +40,57 @@ def _get_memory_manager():
 
     project_id, user_id = get_project_context()
     return MemoryManager(user_id=user_id or "default", project_id=project_id)
+
+
+def _record_test_result(
+    *,
+    project_id: str | None,
+    pipeline_run_id: str | None,
+    pipeline_task_id: str | None,
+    root: str,
+    sandbox_workdir: str,
+    command: str,
+    exit_code: int,
+    stdout: str,
+    stderr: str,
+    modal_app: str,
+) -> dict:
+    stdout_path, stderr_path = save_execution_logs(
+        project_id=project_id,
+        pipeline_run_id=pipeline_run_id,
+        pipeline_task_id=pipeline_task_id,
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    mm = _get_memory_manager()
+    data, block = mm._read_user_block()  # type: ignore[attr-defined]
+    mm._ensure_agents_structure(data)  # type: ignore[attr-defined]
+    testing_state = data["agents"]["testing"]
+
+    history: List[Dict[str, Any]] = testing_state.get("last_test_results", [])
+    entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "pipeline_run_id": pipeline_run_id,
+        "pipeline_task_id": pipeline_task_id,
+        "project_root": root,
+        "sandbox_workdir": sandbox_workdir,
+        "command": command,
+        "exit_code": exit_code,
+        "stdout_path": stdout_path,
+        "stderr_path": stderr_path,
+        "summary": compact_execution_summary(exit_code, stdout, stderr),
+        "modal_app": modal_app,
+    }
+    history.append(entry)
+    testing_state["last_test_results"] = history
+    testing_state["last_test_status"] = "passed" if exit_code == 0 else "failed"
+
+    mm.client.blocks.update(  # type: ignore[attr-defined]
+        block.id,
+        value=mm._serialize(data),  # type: ignore[attr-defined]
+    )
+    return entry
 
 
 class FoundryTestGenerationRequest(BaseModel):
@@ -118,7 +177,8 @@ def generate_foundry_tests_direct(
         "- Contract imports in tests MUST use `../contracts/<ContractName>.sol`.\n"
         "- NEVER import from `../src/...`.\n"
         '- Keep `forge-std` import as `import {Test} from "forge-std/Test.sol";`.\n'
-        "- OpenZeppelin imports MUST use `@openzeppelin/contracts/...` remapping.\n"
+        "- OpenZeppelin imports MUST use `@openzeppelin/contracts/...` or\n"
+        "  `@openzeppelin/contracts-upgradeable/...` remappings as appropriate.\n"
         "- Cover constructor behaviour, state initialisation, happy-path flows,\n"
         "  revert conditions, access control, and relevant edge cases.\n"
         "- When mocking a Solidity interface, the mock contract MUST implement every\n"
@@ -278,65 +338,24 @@ def run_foundry_tests(
             a == "--remappings" or a.startswith("--remappings=") for a in user_args
         )
         if not has_remappings:
-            forge_cmd.extend(
-                [
-                    "--remappings",
-                    "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
-                    "--remappings",
-                    "forge-std/=lib/forge-std/src/",
-                    "--remappings",
-                    "@chainlink/contracts/=lib/chainlink-evm/contracts/",
-                    "--remappings",
-                    "@chainlink/contracts/src/v0.8/interfaces/=lib/chainlink-evm/contracts/src/v0.8/shared/interfaces/",
-                ]
-            )
+            forge_cmd.extend(default_foundry_remappings())
 
         app_name = os.getenv("MODAL_APP_NAME", "partyhat-foundry-tests")
         timeout = int(os.getenv("FOUNDRY_SANDBOX_TIMEOUT", "900"))
 
-        app = modal.App.lookup(app_name, create_if_missing=True)
+        app = get_modal_app(app_name)
 
         base_volume_name = os.getenv(
             "FOUNDRY_ARTIFACT_VOLUME_NAME", "partyhat-foundry-artifacts"
         )
-        volume_name = (
-            f"{base_volume_name}-{project_id_ctx}"
-            if project_id_ctx
-            else base_volume_name
-        )
-        vol = modal.Volume.from_name(volume_name, create_if_missing=True)
+        volume_name = build_project_volume_name(base_volume_name, project_id_ctx)
+        vol = get_modal_volume(volume_name)
 
         sandbox_workdir = "/workspace/project"
         sandbox_image = foundry_image
 
-        quoted_root = shlex.quote(root)
         forge_cmd_str = " ".join(shlex.quote(part) for part in forge_cmd)
-        bootstrap_cmd = (
-            "set -e; " + f"cd {quoted_root}; " + "mkdir -p lib; "
-            "if [ ! -d lib/forge-std ]; then "
-            "  if [ -d /opt/foundry-deps/forge-std ]; then cp -R /opt/foundry-deps/forge-std lib/forge-std; "
-            "  else git clone --depth 1 https://github.com/foundry-rs/forge-std lib/forge-std; fi; "
-            "fi; "
-            "if [ ! -d lib/openzeppelin-contracts ]; then "
-            "  if [ -d /opt/foundry-deps/openzeppelin-contracts ]; then cp -R /opt/foundry-deps/openzeppelin-contracts lib/openzeppelin-contracts; "
-            "  else git clone --depth 1 https://github.com/OpenZeppelin/openzeppelin-contracts lib/openzeppelin-contracts; fi; "
-            "fi; "
-            "if [ ! -d lib/chainlink-evm ]; then "
-            "  if [ -d /opt/foundry-deps/chainlink-evm ]; then cp -R /opt/foundry-deps/chainlink-evm lib/chainlink-evm; "
-            "  else git clone --depth 1 https://github.com/smartcontractkit/chainlink-evm lib/chainlink-evm; fi; "
-            "fi; "
-            "if [ ! -f lib/chainlink-evm/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol ]; then "
-            "  rm -rf lib/chainlink-evm; "
-            "  if [ -d /opt/foundry-deps/chainlink-evm ]; then cp -R /opt/foundry-deps/chainlink-evm lib/chainlink-evm; "
-            "  else git clone --depth 1 https://github.com/smartcontractkit/chainlink-evm lib/chainlink-evm; fi; "
-            "fi; "
-            "mkdir -p lib/chainlink-evm/contracts/src/v0.8/interfaces; "
-            "if [ ! -f lib/chainlink-evm/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol ] "
-            "&& [ -f lib/chainlink-evm/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol ]; then "
-            "  cp lib/chainlink-evm/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol "
-            "lib/chainlink-evm/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol; "
-            "fi; " + forge_cmd_str
-        )
+        bootstrap_cmd = build_foundry_bootstrap_cmd(root, forge_cmd_str)
 
         sandbox = modal.Sandbox.create(
             "bash",
@@ -354,52 +373,31 @@ def run_foundry_tests(
         stderr = sandbox.stderr.read()
         sandbox.wait(raise_on_termination=False)
         exit_code = sandbox.returncode
+        entry = _record_test_result(
+            project_id=project_id_ctx,
+            pipeline_run_id=pipeline_run_id,
+            pipeline_task_id=pipeline_task_id,
+            root=root,
+            sandbox_workdir=sandbox_workdir,
+            command=" ".join(forge_cmd),
+            exit_code=exit_code,
+            stdout=stdout,
+            stderr=stderr,
+            modal_app=app_name,
+        )
+        stdout_path = entry["stdout_path"]
+        stderr_path = entry["stderr_path"]
 
         mm = _get_memory_manager()
-        data, block = mm._read_user_block()  # type: ignore[attr-defined]
-        mm._ensure_agents_structure(data)  # type: ignore[attr-defined]
-        testing_state = data["agents"]["testing"]
 
-        history: List[Dict[str, Any]] = testing_state.get("last_test_results", [])
-        entry = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "pipeline_run_id": pipeline_run_id,
-            "pipeline_task_id": pipeline_task_id,
-            "project_root": root,
-            "sandbox_workdir": sandbox_workdir,
-            "command": " ".join(forge_cmd),
-            "exit_code": exit_code,
-            "stdout": stdout,
-            "stderr": stderr,
-            "modal_app": app_name,
-        }
-        history.append(entry)
-        testing_state["last_test_results"] = history
-
-        mm.client.blocks.update(  # type: ignore[attr-defined]
-            block.id,
-            value=mm._serialize(data),  # type: ignore[attr-defined]
-        )
-
-        # Keep existing Letta behavior, and additionally persist this run in Neon
-        # when DB/project context is available.
         try:
-            project_uuid = mm._project_uuid()  # type: ignore[attr-defined]
-            if project_uuid and getattr(mm, "_db_available", False):
-                from agents.db.crud import save_test_run as db_save_test_run
-
-                mm._db_call(  # type: ignore[attr-defined]
-                    lambda session: db_save_test_run(
-                        session,
-                        project_id=project_uuid,
-                        status="passed" if exit_code == 0 else "failed",
-                        tests_run=None,
-                        tests_passed=None,
-                        output=f"stdout:\n{stdout}\n\nstderr:\n{stderr}",
-                    )
-                )
+            mm.save_test_run(
+                status="passed" if exit_code == 0 else "failed",
+                tests_run=None,
+                tests_passed=None,
+                output=f"stdout:\n{stdout}\n\nstderr:\n{stderr}",
+            )
         except Exception:
-            # DB persistence must not change current tool behavior.
             pass
 
         mm.log_agent_action(
@@ -418,12 +416,58 @@ def run_foundry_tests(
             "pipeline_task_id": pipeline_task_id,
             "stdout": stdout,
             "stderr": stderr,
+            "stdout_path": stdout_path,
+            "stderr_path": stderr_path,
             "project_root": root,
             "sandbox_workdir": sandbox_workdir,
             "modal_app": app_name,
         }
     except Exception as e:
-        return {"error": f"Could not run forge test in Modal Sandbox: {str(e)}"}
+        try:
+            from agents.context import (
+                get_pipeline_run_id,
+                get_pipeline_task_id,
+                get_project_context,
+            )
+
+            project_id_ctx, _ = get_project_context()
+            pipeline_run_id = get_pipeline_run_id()
+            pipeline_task_id = get_pipeline_task_id()
+            default_root = os.getenv("FOUNDRY_ARTIFACT_ROOT", "generated_contracts")
+            if project_id_ctx:
+                default_root = f"{default_root.rstrip('/')}/{project_id_ctx}"
+            root = project_root or os.getenv("FOUNDRY_PROJECT_ROOT") or default_root
+            sandbox_workdir = "/workspace/project"
+            app_name = os.getenv("MODAL_APP_NAME", "partyhat-foundry-tests")
+            command = "forge test"
+            entry = _record_test_result(
+                project_id=project_id_ctx,
+                pipeline_run_id=pipeline_run_id,
+                pipeline_task_id=pipeline_task_id,
+                root=root,
+                sandbox_workdir=sandbox_workdir,
+                command=command,
+                exit_code=1,
+                stdout="",
+                stderr=str(e),
+                modal_app=app_name,
+            )
+            return {
+                "success": False,
+                "exit_code": 1,
+                "pipeline_run_id": pipeline_run_id,
+                "pipeline_task_id": pipeline_task_id,
+                "stdout": "",
+                "stderr": str(e),
+                "stdout_path": entry["stdout_path"],
+                "stderr_path": entry["stderr_path"],
+                "project_root": root,
+                "sandbox_workdir": sandbox_workdir,
+                "modal_app": app_name,
+                "error": f"Could not run forge test in Modal Sandbox: {str(e)}",
+            }
+        except Exception:
+            return {"error": f"Could not run forge test in Modal Sandbox: {str(e)}"}
 
 
 @tool

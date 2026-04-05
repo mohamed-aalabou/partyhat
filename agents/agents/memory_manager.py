@@ -5,11 +5,13 @@ import json
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from functools import lru_cache
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from dotenv import load_dotenv
 from letta_client import Letta
+from agents.pipeline_context import extract_plan_summary
 
 try:
     # Prefer TOON for token-efficient storage, but fall back to JSON if unavailable
@@ -41,7 +43,14 @@ def _run_db(coro):
     return future.result()
 
 
+@lru_cache(maxsize=1)
+def _get_letta_client(api_key: str | None):
+    return Letta(api_key=api_key)
+
+
 class MemoryManager:
+    _block_id_cache_global: dict[str, str] = {}
+
     def __init__(self, user_id: str = "default", project_id: str | None = None):
         """
         Args:
@@ -49,7 +58,7 @@ class MemoryManager:
                         Defaults to "default" for local testing only.
             project_id: When set, all memory is scoped to this project.
         """
-        self.client = Letta(api_key=os.getenv("LETTA_API_KEY"))
+        self.client = _get_letta_client(os.getenv("LETTA_API_KEY"))
         self.user_id = user_id
         self.project_id = project_id
 
@@ -61,7 +70,7 @@ class MemoryManager:
 
         # Block ID cache that are populated on first _get_or_create call
         # Avoids repeated blocks.list() calls within the same instance
-        self._block_id_cache: dict[str, str] = {}
+        self._block_id_cache = self._block_id_cache_global
 
         # DB available flag: False if DATABASE_URL is not set
         self._db_available = bool(os.getenv("DATABASE_URL"))
@@ -148,21 +157,23 @@ class MemoryManager:
                 "planning": {
                     "plan_id": None,  # Neon plans.id
                     "plan_status": None,  # draft | ready | generating | testing | deployed
+                    "plan_summary": {},
                     "note_count": 0,  # how many reasoning notes exist in Neon
-                    # Letta-local copies of the current and previous plan JSON.
-                    # Only the most recent two versions are kept to avoid unbounded growth.
                     "current_plan": None,
-                    "previous_plan": None,
                 },
                 "coding": {
                     "artifact_count": 0,
                     "last_artifact_path": None,
+                    "latest_artifact_revision": 0,
                 },
                 "testing": {
                     "last_test_status": None,  # passed | failed | error
                     "last_run_id": None,  # Neon test_runs.id
+                    "last_run": None,
                 },
                 "deployment": {
+                    "last_deploy_status": None,
+                    "last_deploy_ref": None,
                     "deployed_address": None,
                     "tx_hash": None,
                     "snowtrace_url": None,
@@ -203,24 +214,35 @@ class MemoryManager:
         planning = agents.setdefault("planning", {})
         planning.setdefault("plan_id", None)
         planning.setdefault("plan_status", None)
+        planning.setdefault("plan_summary", {})
         planning.setdefault("note_count", 0)
         planning.setdefault("current_plan", None)
-        planning.setdefault("previous_plan", None)
 
         coding = agents.setdefault("coding", {})
         coding.setdefault("artifact_count", 0)
         coding.setdefault("last_artifact_path", None)
+        coding.setdefault("latest_artifact_revision", 0)
         coding.setdefault("artifacts", [])
         coding.setdefault("notes", [])
 
         testing = agents.setdefault("testing", {})
         testing.setdefault("last_test_status", None)
         testing.setdefault("last_run_id", None)
+        testing.setdefault("last_run", None)
+        testing.setdefault("last_test_results", [])
+        testing.setdefault("artifacts", [])
+        testing.setdefault("notes", [])
 
         deployment = agents.setdefault("deployment", {})
+        deployment.setdefault("last_deploy_status", None)
+        deployment.setdefault("last_deploy_ref", None)
         deployment.setdefault("deployed_address", None)
         deployment.setdefault("tx_hash", None)
         deployment.setdefault("snowtrace_url", None)
+        deployment.setdefault("last_deploy_results", [])
+        deployment.setdefault("artifacts", [])
+        deployment.setdefault("targets", [])
+        deployment.setdefault("deployments", [])
 
         audit = agents.setdefault("audit", {})
         audit.setdefault("open_issues", 0)
@@ -310,19 +332,19 @@ class MemoryManager:
                 lambda session: db_upsert_plan(session, project_uuid, plan, status)
             )
 
+        compact_summary = extract_plan_summary(plan)
+
         # Updating Letta planning slice in Letta
         data, block = self._read_user_block()
+        self._ensure_agents_structure(data)
         planning = self._get_agent_slice(data, "planning")
-
-        # Shift current_plan to previous_plan and store the new plan as current_plan.
-        # This keeps a one-step history in Letta while Neon stores the full history.
-        if planning.get("current_plan") is not None:
-            planning["previous_plan"] = planning.get("current_plan")
-        planning["current_plan"] = plan
-
         planning["plan_status"] = status
+        planning["plan_summary"] = compact_summary
         if saved_plan:
             planning["plan_id"] = str(saved_plan.id)
+            planning["current_plan"] = None
+        else:
+            planning["current_plan"] = plan
         self._write_user_block(data, block)
 
     def get_plan(self) -> dict | None:
@@ -365,6 +387,7 @@ class MemoryManager:
 
         # Updating Letta pointer
         data, block = self._read_user_block()
+        self._ensure_agents_structure(data)
         planning = self._get_agent_slice(data, "planning")
         planning["plan_status"] = status
         self._write_user_block(data, block)
@@ -534,10 +557,16 @@ class MemoryManager:
             )
             # Updating Letta pointer
             data, block = self._read_user_block()
+            self._ensure_agents_structure(data)
             testing = self._get_agent_slice(data, "testing")
             testing["last_test_status"] = status
             if run:
                 testing["last_run_id"] = str(run.id)
+                testing["last_run"] = {
+                    "id": str(run.id),
+                    "status": status,
+                    "created_at": run.created_at.isoformat(),
+                }
             self._write_user_block(data, block)
 
     def get_last_test_run(self) -> dict | None:
@@ -593,13 +622,22 @@ class MemoryManager:
 
         # Updating Letta pointer with only the small strings agents actually need
         data, block = self._read_user_block()
+        self._ensure_agents_structure(data)
         deployment = self._get_agent_slice(data, "deployment")
+        deployment["last_deploy_status"] = status
         if deployed_address:
             deployment["deployed_address"] = deployed_address
         if tx_hash:
             deployment["tx_hash"] = tx_hash
         if snowtrace_url:
             deployment["snowtrace_url"] = snowtrace_url
+        deployment["last_deploy_ref"] = {
+            "status": status,
+            "contract_name": contract_name,
+            "network": network,
+            "deployed_address": deployed_address,
+            "tx_hash": tx_hash,
+        }
         self._write_user_block(data, block)
 
     def get_last_deployment(self) -> dict | None:
@@ -656,19 +694,24 @@ class MemoryManager:
         self,
         artifact_count: int | None = None,
         last_artifact_path: str | None = None,
+        latest_artifact_revision: int | None = None,
     ) -> None:
         """Update the coding agent's working state pointer in Letta."""
         data, block = self._read_user_block()
+        self._ensure_agents_structure(data)
         coding = self._get_agent_slice(data, "coding")
         if artifact_count is not None:
             coding["artifact_count"] = artifact_count
         if last_artifact_path is not None:
             coding["last_artifact_path"] = last_artifact_path
+        if latest_artifact_revision is not None:
+            coding["latest_artifact_revision"] = latest_artifact_revision
         self._write_user_block(data, block)
 
     def update_audit_state(self, open_issues: int) -> None:
         """Update the audit agent's open issue count in Letta."""
         data, block = self._read_user_block()
+        self._ensure_agents_structure(data)
         audit = self._get_agent_slice(data, "audit")
         audit["open_issues"] = open_issues
         self._write_user_block(data, block)
@@ -692,11 +735,13 @@ class MemoryManager:
     def get_agent_state(self, agent_name: str) -> dict:
         """Return the working state slice for a given agent from Letta."""
         data, _ = self._read_user_block()
+        self._ensure_agents_structure(data)
         return data.get("agents", {}).get(agent_name, {})
 
     def set_agent_state(self, agent_name: str, state: dict) -> None:
         """Replace the working state slice for a given agent in Letta."""
         data, block = self._read_user_block()
+        self._ensure_agents_structure(data)
         data.setdefault("agents", {})[agent_name] = state
         self._write_user_block(data, block)
 

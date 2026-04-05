@@ -3,7 +3,6 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeou
 from datetime import datetime, timezone
 from pathlib import PurePosixPath
 
-import modal
 import wcmatch.glob as wcglob
 from deepagents.backends.protocol import (
     BackendProtocol,
@@ -20,6 +19,7 @@ from deepagents.backends.utils import (
     perform_string_replacement,
 )
 from modal.volume import FileEntryType
+from agents.modal_runtime import get_modal_volume
 
 
 MODAL_IO_TIMEOUT = 30  # seconds — fail fast instead of hanging forever
@@ -55,7 +55,7 @@ class ModalVolumeBackend(BackendProtocol):
         volume_name: str,
         base_dir: str = "generated_contracts",
     ) -> None:
-        self._volume = modal.Volume.from_name(volume_name, create_if_missing=True)
+        self._volume = get_modal_volume(volume_name)
         self._base_dir = PurePosixPath(base_dir.strip("/"))
 
     def _to_volume_path(self, key: str) -> PurePosixPath:
@@ -292,4 +292,3 @@ class ModalVolumeBackend(BackendProtocol):
             except Exception:
                 responses.append(FileDownloadResponse(path=path, content=None, error="invalid_path"))
         return responses
-

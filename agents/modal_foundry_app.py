@@ -40,6 +40,7 @@ foundry_image = (
         "mkdir -p /opt/foundry-deps",
         "git clone --depth 1 https://github.com/foundry-rs/forge-std /opt/foundry-deps/forge-std",
         "git clone --depth 1 https://github.com/OpenZeppelin/openzeppelin-contracts /opt/foundry-deps/openzeppelin-contracts",
+        "git clone --depth 1 https://github.com/OpenZeppelin/openzeppelin-contracts-upgradeable /opt/foundry-deps/openzeppelin-contracts-upgradeable",
         "git clone --depth 1 https://github.com/smartcontractkit/chainlink-evm /opt/foundry-deps/chainlink-evm",
     )
     .env({
@@ -73,4 +74,3 @@ def print_forge_version() -> None:
     print(result.stdout)
     print("STDERR:")
     print(result.stderr)
-

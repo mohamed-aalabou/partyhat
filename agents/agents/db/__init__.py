@@ -94,7 +94,7 @@ async def _migrate_projects_add_screenshot_base64(conn) -> None:
 
 
 async def _migrate_pipeline_tasks_add_hierarchy(conn) -> None:
-    """Add task_type, parent_task_id, and sequence_index to pipeline_tasks if missing."""
+    """Add hierarchy and dispatch fields to pipeline_tasks if missing."""
     await conn.execute(
         text(
             """
@@ -131,12 +131,43 @@ async def _migrate_pipeline_tasks_add_hierarchy(conn) -> None:
                   ALTER TABLE pipeline_tasks ADD COLUMN sequence_index INTEGER DEFAULT 0;
                 END IF;
 
+                IF NOT EXISTS (
+                  SELECT 1 FROM information_schema.columns
+                  WHERE table_schema = 'public'
+                    AND table_name = 'pipeline_tasks'
+                    AND column_name = 'artifact_revision'
+                ) THEN
+                  ALTER TABLE pipeline_tasks ADD COLUMN artifact_revision INTEGER DEFAULT 0;
+                END IF;
+
+                IF NOT EXISTS (
+                  SELECT 1 FROM information_schema.columns
+                  WHERE table_schema = 'public'
+                    AND table_name = 'pipeline_tasks'
+                    AND column_name = 'depends_on_task_ids'
+                ) THEN
+                  ALTER TABLE pipeline_tasks ADD COLUMN depends_on_task_ids JSONB;
+                END IF;
+
+                IF NOT EXISTS (
+                  SELECT 1 FROM information_schema.columns
+                  WHERE table_schema = 'public'
+                    AND table_name = 'pipeline_tasks'
+                    AND column_name = 'claimed_at'
+                ) THEN
+                  ALTER TABLE pipeline_tasks ADD COLUMN claimed_at TIMESTAMPTZ;
+                END IF;
+
                 UPDATE pipeline_tasks
                 SET task_type = COALESCE(task_type, assigned_to || '.legacy');
 
                 UPDATE pipeline_tasks
                 SET sequence_index = 0
                 WHERE sequence_index IS NULL;
+
+                UPDATE pipeline_tasks
+                SET artifact_revision = 0
+                WHERE artifact_revision IS NULL;
 
                 ALTER TABLE pipeline_tasks
                   ALTER COLUMN task_type SET DEFAULT 'unknown';
@@ -146,6 +177,10 @@ async def _migrate_pipeline_tasks_add_hierarchy(conn) -> None:
                   ALTER COLUMN sequence_index SET DEFAULT 0;
                 ALTER TABLE pipeline_tasks
                   ALTER COLUMN sequence_index SET NOT NULL;
+                ALTER TABLE pipeline_tasks
+                  ALTER COLUMN artifact_revision SET DEFAULT 0;
+                ALTER TABLE pipeline_tasks
+                  ALTER COLUMN artifact_revision SET NOT NULL;
               END IF;
             END $$;
             """
@@ -180,6 +215,22 @@ async def _migrate_pipeline_tasks_add_hierarchy(conn) -> None:
             """
             CREATE INDEX IF NOT EXISTS ix_pipeline_tasks_parent_task_id
             ON pipeline_tasks (parent_task_id);
+            """
+        )
+    )
+    await conn.execute(
+        text(
+            """
+            CREATE INDEX IF NOT EXISTS ix_pipeline_tasks_dispatch_status_created
+            ON pipeline_tasks (pipeline_run_id, status, created_at, sequence_index, id);
+            """
+        )
+    )
+    await conn.execute(
+        text(
+            """
+            CREATE INDEX IF NOT EXISTS ix_pipeline_tasks_dispatch_revision
+            ON pipeline_tasks (pipeline_run_id, status, artifact_revision, created_at, sequence_index, id);
             """
         )
     )

@@ -39,8 +39,8 @@ def start_planning(
     Start or continue a smart contract planning conversation.
 
     Use this tool to describe what smart contract you want to build.
-    The planning agent will ask clarifying questions one at a time and
-    build a structured plan. Call this tool repeatedly to continue
+    The planning agent will ask clarifying questions in batches of up to 5
+    and build a structured plan. Call this tool repeatedly to continue
     the conversation until the plan is complete.
 
     Args:
@@ -58,6 +58,8 @@ def start_planning(
             session_id:  Session identifier (pass back on subsequent calls)
             response:    The planning agent's reply
             tool_calls:  Which internal tools were called
+            answer_recommendations: Backward-compatible quick replies
+            pending_questions: Structured clarifying questions for the UI
             plan_status: Current plan status (draft/ready/etc.)
     """
     verify_payment("start_planning", payment_proof)
@@ -81,6 +83,8 @@ def start_planning(
         "session_id": result["session_id"],
         "response": result["response"],
         "tool_calls": result.get("tool_calls", []),
+        "answer_recommendations": result.get("answer_recommendations", []),
+        "pending_questions": result.get("pending_questions", []),
         "plan_status": plan_status,
     }
 

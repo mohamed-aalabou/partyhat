@@ -79,7 +79,7 @@ def partyhat_start_planning(
     Start or continue a smart contract planning conversation with PartyHat.
 
     Describe what smart contract you want to build. The planning agent will
-    ask clarifying questions one at a time and build a structured plan.
+    ask clarifying questions in batches of up to 5 and build a structured plan.
     Keep calling this tool to answer questions until plan_status is "ready".
 
     Args:

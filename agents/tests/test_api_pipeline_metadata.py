@@ -16,6 +16,7 @@ class FakeMemoryManager:
                         "pipeline_run_id": "run-123",
                         "pipeline_task_id": "task-456",
                         "exit_code": 1,
+                        "stdout": "large stdout",
                     }
                 ]
             }
@@ -26,6 +27,7 @@ class FakeMemoryManager:
                         "pipeline_run_id": "run-123",
                         "pipeline_task_id": "task-789",
                         "exit_code": 0,
+                        "stderr": "large stderr",
                     }
                 ]
             }
@@ -110,6 +112,7 @@ def test_get_current_deployment_includes_pipeline_tags(monkeypatch):
 
     assert response.last_deploy_results[0]["pipeline_run_id"] == "run-123"
     assert response.last_deploy_results[0]["pipeline_task_id"] == "task-456"
+    assert "stdout" not in response.last_deploy_results[0]
 
 
 def test_get_current_test_results_includes_pipeline_tags(monkeypatch):
@@ -127,3 +130,4 @@ def test_get_current_test_results_includes_pipeline_tags(monkeypatch):
 
     assert response.last_test_results[0]["pipeline_run_id"] == "run-123"
     assert response.last_test_results[0]["pipeline_task_id"] == "task-789"
+    assert "stderr" not in response.last_test_results[0]

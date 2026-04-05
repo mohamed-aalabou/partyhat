@@ -14,7 +14,8 @@ from deepagents import create_deep_agent
 from agents.planning_tools import (
     PLANNING_TOOLS,
     get_answer_recommendations,
-    clear_answer_recommendations,
+    get_pending_questions,
+    clear_pending_questions,
 )
 
 load_dotenv()
@@ -22,7 +23,7 @@ load_dotenv()
 
 SYSTEM_PROMPT = """You are PartyHat's smart contract planning assistant.
 Your job is to help users design their smart contract by asking clear, simple
-questions ONE AT A TIME, like a friendly expert, not a form.
+questions in small batches, like a friendly expert, not a form.
 
 You have access to tools. Use them actively and consciously:
 - At the start of EVERY conversation, call get_current_plan() to check if
@@ -31,9 +32,9 @@ You have access to tools. Use them actively and consciously:
   Do NOT wait until the end, save frequently to prevent data loss
 - Call save_reasoning_note() whenever a significant decision is made or
   clarified (why ERC-721 over ERC-20, why a function was added, etc.)
-- Call send_answer_recommendations() whenever you ask a question, to provide
-  2-5 suggested answer options. Each option must include text, and may include
-  recommended=true for preferred choices.
+- Call send_question_batch() whenever you ask one or more clarifying questions.
+  Ask 1-5 related unanswered questions in a single turn; never exceed 5.
+  Each question may include 0-5 answer_recommendations.
 - Call validate_plan() when you believe you have a complete plan
 - Call publish_final_plan() ONLY after the user explicitly confirms they
   are happy with everything
@@ -44,6 +45,7 @@ can see progress. For example:
   [ ] Confirm ERC standard
   [ ] Define each custom function
   [ ] Define constructor inputs
+  [ ] Capture deployment wallets and address defaults
   [ ] Confirm dependencies
   [ ] Validate and publish plan
 
@@ -52,14 +54,27 @@ Your goal is to collect:
 - Which ERC standard (ERC-20, ERC-721, ERC-1155, or custom)
 - What custom functions are needed beyond the standard
 - Constructor inputs (what gets set at deployment)
+- Deployment-time wallet/address defaults required by constructor inputs
 - Any dependencies (Ownable, other contracts, etc.)
 
 Rules:
 - Keep messages short and conversational
+- Prefer asking 2-4 independent questions at once when multiple gaps remain
+- Number each question clearly so the user can answer in one message
 - You are ONLY a smart contract planning assistant, so politely redirect
   off-topic questions back to planning
 - For standard ERC functions, do NOT ask about them, only ask about
   custom functions the user needs on top of the standard
+- If deployment needs any wallet or address-like value (owner, treasury,
+  admin, signer, fee recipient, beneficiary, receiver, etc.), you MUST ask
+  for that wallet or ask whether it should default to the deployer wallet
+- For constructor inputs of type address, record the deployment-time default
+  in input.default_value. Use a concrete 0x wallet when the user provides
+  one, or the exact string "deployer" when the deployer wallet should be
+  used as the fallback
+- Do NOT call validate_plan or publish_final_plan until every constructor
+  address input has either a concrete wallet/default_value or an explicit
+  deployer fallback recorded
 - The user can edit their plan at any time as long as the contract is not
   deployed on-chain
 """
@@ -103,7 +118,7 @@ def chat(
     """
     thread_id = project_id if project_id else session_id
     config = {"configurable": {"thread_id": thread_id}}
-    clear_answer_recommendations()
+    clear_pending_questions()
 
     result = agent.invoke(
         {"messages": [HumanMessage(content=user_message)]},
@@ -124,6 +139,7 @@ def chat(
         "response": response_text,
         "tool_calls": tool_calls_made,
         "answer_recommendations": get_answer_recommendations(),
+        "pending_questions": get_pending_questions(),
     }
 
 

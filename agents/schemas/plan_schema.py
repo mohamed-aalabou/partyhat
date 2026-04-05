@@ -1,6 +1,6 @@
 from typing import Optional
 from enum import Enum
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class PlanStatus(str, Enum):
@@ -24,6 +24,14 @@ class FunctionInput(BaseModel):
     name: str
     type: str
     description: str
+    default_value: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional deployment-time default. For constructor address inputs, "
+            "use a concrete wallet address or the string 'deployer' when the "
+            "deployer wallet should be used as the fallback."
+        ),
+    )
 
 
 class FunctionOutput(BaseModel):

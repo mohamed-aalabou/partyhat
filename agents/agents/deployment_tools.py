@@ -6,6 +6,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Dict, Any, Optional
+from urllib import request as urllib_request
 
 # Platform limit for tool response payload (e.g. Modal/OpenAI). Stay under to avoid INVALID_ARGUMENT.
 MAX_RESPONSE_CHARS = 48_000
@@ -33,7 +34,15 @@ from agents.coding_tools import (
     load_code_artifact as coding_load_code_artifact,
 )
 from agents.task_tools import TASK_TOOLS
-from agents.code_storage import get_code_storage
+from agents.code_storage import get_code_storage, save_execution_logs
+from agents.modal_runtime import (
+    build_foundry_bootstrap_cmd,
+    build_project_volume_name,
+    default_foundry_remappings,
+    get_modal_app,
+    get_modal_volume,
+)
+from agents.pipeline_context import compact_execution_summary
 
 
 def _get_memory_manager():
@@ -59,6 +68,274 @@ def _extract_first(pattern: str, text: str) -> Optional[str]:
     return match.group(1) if match else None
 
 
+def _safe_volume_reload(volume: Any) -> None:
+    try:
+        volume.reload()
+    except RuntimeError as e:
+        if "can only be called from within a running function" in str(e):
+            return
+        raise
+    except Exception as e:
+        if "No such file or directory" in str(e):
+            return
+        raise
+
+
+def _normalize_hex_match(value: Any, hex_len: int) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    if not re.fullmatch(rf"0x[0-9a-fA-F]{{{hex_len}}}", normalized):
+        return None
+    return f"0x{normalized[2:]}"
+
+
+def _normalize_contract_name(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    if not normalized:
+        return None
+    return normalized.rsplit(":", 1)[-1]
+
+
+def _contract_has_code(rpc_url: str, contract_address: str) -> bool:
+    payload = json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "method": "eth_getCode",
+            "params": [contract_address, "latest"],
+            "id": 1,
+        }
+    ).encode("utf-8")
+    req = urllib_request.Request(
+        rpc_url,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib_request.urlopen(req, timeout=10) as response:
+            body = response.read().decode("utf-8")
+    except Exception:
+        return False
+
+    try:
+        parsed = json.loads(body)
+    except json.JSONDecodeError:
+        return False
+
+    result = parsed.get("result")
+    if not isinstance(result, str):
+        return False
+    normalized = result.strip().lower()
+    return normalized.startswith("0x") and len(normalized) > 2
+
+
+def _evaluate_deploy_success(
+    *,
+    exit_code: int,
+    tx_hash: str | None,
+    deployed_address: str | None,
+    rpc_url: str,
+) -> tuple[bool, Optional[str]]:
+    normalized_tx_hash = _normalize_hex_match(tx_hash, 64)
+    normalized_address = _normalize_hex_match(deployed_address, 40)
+
+    if exit_code != 0:
+        return False, "forge script returned non-zero exit code"
+    if normalized_tx_hash:
+        return True, None
+    if normalized_address and _contract_has_code(rpc_url, normalized_address):
+        return True, None
+    if normalized_address:
+        return (
+            False,
+            "forge script exited successfully but no deployment transaction hash was found "
+            f"and contract bytecode could not be confirmed at {normalized_address}",
+        )
+    return (
+        False,
+        "forge script exited successfully but produced no deployment transaction hash "
+        "or confirmed contract address",
+    )
+
+
+def _read_project_artifact(
+    root: str,
+    relative_path: str,
+    *,
+    volume: Any | None = None,
+) -> Optional[str]:
+    rel = Path(relative_path.lstrip("/"))
+    if ".." in rel.parts:
+        raise ValueError("Attempted to escape project root while reading artifact.")
+
+    if volume is not None:
+        _safe_volume_reload(volume)
+        volume_path = (Path(str(root).lstrip("/")) / rel).as_posix().lstrip("/")
+        try:
+            chunks = list(volume.read_file(volume_path))
+        except Exception as e:
+            if "No such file or directory" in str(e):
+                return None
+            raise
+        return b"".join(chunks).decode("utf-8")
+
+    full_path = Path(root) / rel
+    if not full_path.exists():
+        return None
+    return full_path.read_text(encoding="utf-8")
+
+
+def _broadcast_run_artifact_path(script_path: str, chain_id: int) -> str:
+    return f"broadcast/{Path(script_path).name}/{chain_id}/run-latest.json"
+
+
+def _extract_returned_contract_address(
+    broadcast: Dict[str, Any],
+    contract_name: str | None,
+) -> Optional[str]:
+    returns = broadcast.get("returns")
+    if not isinstance(returns, dict):
+        return None
+
+    expected_name = _normalize_contract_name(contract_name)
+    addresses: list[str] = []
+    for value in returns.values():
+        if not isinstance(value, dict):
+            continue
+        addr = _normalize_hex_match(value.get("value"), 40)
+        if not addr:
+            continue
+        internal_type = str(value.get("internal_type") or value.get("internalType") or "")
+        normalized_internal = _normalize_contract_name(internal_type.removeprefix("contract "))
+        if expected_name and normalized_internal == expected_name:
+            return addr
+        addresses.append(addr)
+
+    if len(addresses) == 1:
+        return addresses[0]
+    return None
+
+
+def _select_broadcast_transaction(
+    transactions: List[Dict[str, Any]],
+    *,
+    contract_name: str | None,
+    returned_address: str | None,
+    receipt_addresses: Dict[str, str],
+) -> Optional[Dict[str, Optional[str]]]:
+    expected_name = _normalize_contract_name(contract_name)
+    candidates: list[tuple[int, int, Dict[str, Optional[str]]]] = []
+
+    for idx, tx in enumerate(transactions):
+        if not isinstance(tx, dict):
+            continue
+
+        tx_hash = _normalize_hex_match(tx.get("hash"), 64)
+        receipt_address = receipt_addresses.get(tx_hash or "")
+        contract_address = receipt_address or _normalize_hex_match(
+            tx.get("contractAddress"), 40
+        )
+        tx_type = str(tx.get("transactionType") or tx.get("type") or "").upper()
+        normalized_name = _normalize_contract_name(tx.get("contractName"))
+
+        is_create = tx_type in {"CREATE", "CREATE2"} or contract_address is not None
+        if not is_create:
+            continue
+
+        score = 0
+        if expected_name and normalized_name == expected_name:
+            score += 100
+        if returned_address and contract_address == returned_address:
+            score += 50
+        if contract_address:
+            score += 10
+        if tx_hash:
+            score += 1
+
+        candidates.append(
+            (
+                score,
+                idx,
+                {
+                    "tx_hash": tx_hash,
+                    "deployed_address": contract_address,
+                },
+            )
+        )
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    return candidates[-1][2]
+
+
+def _parse_broadcast_deploy_output(
+    broadcast_text: str,
+    *,
+    contract_name: str | None,
+) -> Dict[str, Optional[str]]:
+    try:
+        payload = json.loads(broadcast_text)
+    except json.JSONDecodeError:
+        return {"tx_hash": None, "deployed_address": None}
+
+    transactions = payload.get("transactions")
+    if not isinstance(transactions, list):
+        return {"tx_hash": None, "deployed_address": None}
+
+    receipt_addresses: Dict[str, str] = {}
+    receipts = payload.get("receipts")
+    if isinstance(receipts, list):
+        for receipt in receipts:
+            if not isinstance(receipt, dict):
+                continue
+            tx_hash = _normalize_hex_match(
+                receipt.get("transactionHash") or receipt.get("hash"), 64
+            )
+            contract_address = _normalize_hex_match(receipt.get("contractAddress"), 40)
+            if tx_hash and contract_address:
+                receipt_addresses[tx_hash] = contract_address
+
+    returned_address = _extract_returned_contract_address(payload, contract_name)
+    selected = _select_broadcast_transaction(
+        transactions,
+        contract_name=contract_name,
+        returned_address=returned_address,
+        receipt_addresses=receipt_addresses,
+    )
+    if selected:
+        return selected
+
+    return {
+        "tx_hash": None,
+        "deployed_address": returned_address,
+    }
+
+
+def _extract_deploy_metadata(
+    *,
+    root: str,
+    request: FoundryDeployRequest,
+    stdout: str,
+    stderr: str,
+    volume: Any | None = None,
+) -> Dict[str, Optional[str]]:
+    broadcast_path = _broadcast_run_artifact_path(request.script_path, request.chain_id)
+    broadcast_text = _read_project_artifact(root, broadcast_path, volume=volume)
+    if broadcast_text:
+        parsed = _parse_broadcast_deploy_output(
+            broadcast_text,
+            contract_name=request.contract_name,
+        )
+        if parsed.get("tx_hash") or parsed.get("deployed_address"):
+            return parsed
+    return _parse_deploy_output(stdout, stderr)
+
+
 def _normalize_private_key_hex(value: str) -> str:
     normalized = (value or "").strip()
     if normalized.startswith(("0x", "0X")):
@@ -66,6 +343,68 @@ def _normalize_private_key_hex(value: str) -> str:
     if re.fullmatch(r"[0-9a-fA-F]{64}", normalized):
         return f"0x{normalized}"
     return normalized
+
+
+def _record_deploy_result(
+    *,
+    project_id: str | None,
+    pipeline_run_id: str | None,
+    pipeline_task_id: str | None,
+    root: str,
+    sandbox_workdir: str,
+    request: FoundryDeployRequest,
+    command: str,
+    exit_code: int,
+    stdout: str,
+    stderr: str,
+    modal_app: str,
+    tx_hash: str | None = None,
+    deployed_address: str | None = None,
+    status: str | None = None,
+) -> dict:
+    stdout_path, stderr_path = save_execution_logs(
+        project_id=project_id,
+        pipeline_run_id=pipeline_run_id,
+        pipeline_task_id=pipeline_task_id,
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    mm = _get_memory_manager()
+    data, block = mm._read_user_block()  # type: ignore[attr-defined]
+    mm._ensure_agents_structure(data)  # type: ignore[attr-defined]
+    deployment_state = data["agents"]["deployment"]
+
+    history: List[Dict[str, Any]] = deployment_state.get("last_deploy_results", [])
+    entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "pipeline_run_id": pipeline_run_id,
+        "pipeline_task_id": pipeline_task_id,
+        "project_root": root,
+        "sandbox_workdir": sandbox_workdir,
+        "network": request.network,
+        "chain_id": request.chain_id,
+        "script_path": request.script_path,
+        "command": command,
+        "exit_code": exit_code,
+        "stdout_path": stdout_path,
+        "stderr_path": stderr_path,
+        "summary": compact_execution_summary(exit_code, stdout, stderr),
+        "modal_app": modal_app,
+        "tx_hash": tx_hash,
+        "deployed_address": deployed_address,
+    }
+    history.append(entry)
+    deployment_state["last_deploy_results"] = history
+    deployment_state["last_deploy_status"] = status or (
+        "success" if exit_code == 0 else "failed"
+    )
+
+    mm.client.blocks.update(  # type: ignore[attr-defined]
+        block.id,
+        value=mm._serialize(data),  # type: ignore[attr-defined]
+    )
+    return entry
 
 
 def _truncate_for_display(text: str, max_chars: int, label: str = "output") -> str:
@@ -121,15 +460,15 @@ def _cap_deploy_response(response: Dict[str, Any]) -> Dict[str, Any]:
 
 def _parse_deploy_output(stdout: str, stderr: str) -> Dict[str, Optional[str]]:
     combined = f"{stdout}\n{stderr}"
-    tx_hash = _extract_first(r"(0x[a-fA-F0-9]{64})", combined)
+    tx_hash = _extract_first(
+        r"(?:tx hash|transaction hash|hash)\s*[:=]\s*(0x[a-fA-F0-9]{64})",
+        combined,
+    )
 
-    # Prefer lines that look like deployment output if present.
     deployed_address = _extract_first(
         r"(?:deployed to|deployed at|contract address)\s*[:=]\s*(0x[a-fA-F0-9]{40})",
         combined,
     )
-    if not deployed_address:
-        deployed_address = _extract_first(r"\b(0x[a-fA-F0-9]{40})\b", combined)
 
     return {"tx_hash": tx_hash, "deployed_address": deployed_address}
 
@@ -170,13 +509,16 @@ def generate_foundry_deploy_script_direct(
         "- Implement run() with vm.startBroadcast() and vm.stopBroadcast().\n"
         "- Load PRIVATE_KEY in a robust way: accept both `0x`-prefixed and non-prefixed hex env values.\n"
         "- Prefer `vm.envString(\"FUJI_PRIVATE_KEY\")` + normalization + `vm.parseUint(...)` over plain `vm.envUint(...)`.\n"
+        "- Derive `address deployer = vm.addr(privateKey);` (or an equivalent broadcaster address) before deployment.\n"
         "- Deploy exactly one requested contract instance.\n"
-        "- Keep constructor arguments hardcoded literals in script for v1.\n"
+        "- Treat the provided constructor arguments as authoritative Solidity expressions; preserve identifiers like `deployer` as script-local variables instead of converting them to literals.\n"
+        "- Never infer `address(0)` for an address input. If no explicit non-zero wallet is provided, use `deployer` as the fallback.\n"
+        "- For optional address env vars such as treasury/admin/owner recipients, use `deployer` as the non-zero fallback unless the plan explicitly requires another address.\n"
         "- Add brief inline comments where non-obvious.\n\n"
         f"Deployment goal:\n{request.goal.strip()}\n\n"
         f"Target contract name: {request.contract_name}\n"
         f"Script contract name: {request.script_name}\n"
-        f"Constructor arguments (Solidity literals): {args_comment}"
+        f"Constructor arguments (Solidity expressions): {args_comment}"
         f"{constraints_section}"
         f"{plan_section}"
         f"{source_section}"
@@ -304,7 +646,8 @@ def run_foundry_deploy(
     Requires FUJI_RPC_URL and FUJI_PRIVATE_KEY to be set in the environment.
     Set quiet_output=True to avoid high verbosity and to truncate stdout/stderr so the
     response stays under the platform 50k character limit (use if you get INVALID_ARGUMENT
-    response length errors). tx_hash and deployed_address are always included.
+    response length errors). A deployment is successful only when forge exits cleanly and
+    the run yields either a deployment tx hash or a contract address with confirmed bytecode.
     """
     try:
         from agents.context import (
@@ -316,26 +659,121 @@ def run_foundry_deploy(
         project_id_ctx, _ = get_project_context()
         pipeline_run_id = get_pipeline_run_id()
         pipeline_task_id = get_pipeline_task_id()
+        default_root = os.getenv("FOUNDRY_ARTIFACT_ROOT", "generated_contracts")
+        if project_id_ctx:
+            default_root = f"{default_root.rstrip('/')}/{project_id_ctx}"
+        root = project_root or os.getenv("FOUNDRY_PROJECT_ROOT") or default_root
+        app_name = os.getenv("MODAL_APP_NAME", "partyhat-foundry-tests")
+        sandbox_workdir = "/workspace/project"
         if request.network != "avalanche_fuji":
+            entry = _record_deploy_result(
+                project_id=project_id_ctx,
+                pipeline_run_id=pipeline_run_id,
+                pipeline_task_id=pipeline_task_id,
+                root=root,
+                sandbox_workdir=sandbox_workdir,
+                request=request,
+                command=f"forge script {request.script_path}",
+                exit_code=1,
+                stdout="",
+                stderr=(
+                    "Unsupported network. This deployment tool currently supports "
+                    "only avalanche_fuji."
+                ),
+                modal_app=app_name,
+            )
             return {
+                "success": False,
+                "exit_code": 1,
+                "pipeline_run_id": pipeline_run_id,
+                "pipeline_task_id": pipeline_task_id,
+                "stdout": "",
+                "stderr": (
+                    "Unsupported network. This deployment tool currently supports "
+                    "only avalanche_fuji."
+                ),
+                "stdout_path": entry["stdout_path"],
+                "stderr_path": entry["stderr_path"],
+                "project_root": root,
+                "sandbox_workdir": sandbox_workdir,
+                "modal_app": app_name,
+                "network": request.network,
+                "chain_id": request.chain_id,
+                "script_path": request.script_path,
+                "command": f"forge script {request.script_path}",
                 "error": (
                     "Unsupported network. This deployment tool currently supports "
                     "only avalanche_fuji."
-                )
+                ),
             }
 
         rpc_url = os.getenv(request.rpc_url_env_var)
         private_key = os.getenv(request.private_key_env_var)
         if not rpc_url:
-            return {"error": f"Missing required env var: {request.rpc_url_env_var}"}
+            entry = _record_deploy_result(
+                project_id=project_id_ctx,
+                pipeline_run_id=pipeline_run_id,
+                pipeline_task_id=pipeline_task_id,
+                root=root,
+                sandbox_workdir=sandbox_workdir,
+                request=request,
+                command=f"forge script {request.script_path}",
+                exit_code=1,
+                stdout="",
+                stderr=f"Missing required env var: {request.rpc_url_env_var}",
+                modal_app=app_name,
+            )
+            return {
+                "success": False,
+                "exit_code": 1,
+                "pipeline_run_id": pipeline_run_id,
+                "pipeline_task_id": pipeline_task_id,
+                "stdout": "",
+                "stderr": f"Missing required env var: {request.rpc_url_env_var}",
+                "stdout_path": entry["stdout_path"],
+                "stderr_path": entry["stderr_path"],
+                "project_root": root,
+                "sandbox_workdir": sandbox_workdir,
+                "modal_app": app_name,
+                "network": request.network,
+                "chain_id": request.chain_id,
+                "script_path": request.script_path,
+                "command": f"forge script {request.script_path}",
+                "error": f"Missing required env var: {request.rpc_url_env_var}",
+            }
         if not private_key:
-            return {"error": f"Missing required env var: {request.private_key_env_var}"}
+            entry = _record_deploy_result(
+                project_id=project_id_ctx,
+                pipeline_run_id=pipeline_run_id,
+                pipeline_task_id=pipeline_task_id,
+                root=root,
+                sandbox_workdir=sandbox_workdir,
+                request=request,
+                command=f"forge script {request.script_path}",
+                exit_code=1,
+                stdout="",
+                stderr=f"Missing required env var: {request.private_key_env_var}",
+                modal_app=app_name,
+            )
+            return {
+                "success": False,
+                "exit_code": 1,
+                "pipeline_run_id": pipeline_run_id,
+                "pipeline_task_id": pipeline_task_id,
+                "stdout": "",
+                "stderr": f"Missing required env var: {request.private_key_env_var}",
+                "stdout_path": entry["stdout_path"],
+                "stderr_path": entry["stderr_path"],
+                "project_root": root,
+                "sandbox_workdir": sandbox_workdir,
+                "modal_app": app_name,
+                "network": request.network,
+                "chain_id": request.chain_id,
+                "script_path": request.script_path,
+                "command": f"forge script {request.script_path}",
+                "error": f"Missing required env var: {request.private_key_env_var}",
+            }
         private_key = _normalize_private_key_hex(private_key)
-
-        default_root = os.getenv("FOUNDRY_ARTIFACT_ROOT", "generated_contracts")
-        if project_id_ctx:
-            default_root = f"{default_root.rstrip('/')}/{project_id_ctx}"
-        root = project_root or os.getenv("FOUNDRY_PROJECT_ROOT") or default_root
 
         forge_cmd = [
             "forge",
@@ -362,36 +800,18 @@ def run_foundry_deploy(
             a == "--remappings" or a.startswith("--remappings=") for a in user_args
         )
         if not has_remappings:
-            forge_cmd.extend(
-                [
-                    "--remappings",
-                    "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
-                    "--remappings",
-                    "forge-std/=lib/forge-std/src/",
-                    "--remappings",
-                    "@chainlink/contracts/=lib/chainlink-evm/contracts/",
-                    "--remappings",
-                    "@chainlink/contracts/src/v0.8/interfaces/=lib/chainlink-evm/contracts/src/v0.8/shared/interfaces/",
-                ]
-            )
+            forge_cmd.extend(default_foundry_remappings())
 
-        app_name = os.getenv("MODAL_APP_NAME", "partyhat-foundry-tests")
         timeout = int(os.getenv("FOUNDRY_SANDBOX_TIMEOUT", "900"))
-        app = modal.App.lookup(app_name, create_if_missing=True)
+        app = get_modal_app(app_name)
         base_volume_name = os.getenv(
             "FOUNDRY_ARTIFACT_VOLUME_NAME", "partyhat-foundry-artifacts"
         )
-        volume_name = (
-            f"{base_volume_name}-{project_id_ctx}"
-            if project_id_ctx
-            else base_volume_name
-        )
-        vol = modal.Volume.from_name(volume_name, create_if_missing=True)
+        volume_name = build_project_volume_name(base_volume_name, project_id_ctx)
+        vol = get_modal_volume(volume_name)
 
-        sandbox_workdir = "/workspace/project"
         sandbox_image = foundry_image
 
-        quoted_root = shlex.quote(root)
         forge_cmd_str = " ".join(
             (
                 part
@@ -400,32 +820,7 @@ def run_foundry_deploy(
             )
             for part in forge_cmd
         )
-        bootstrap_cmd = (
-            "set -e; " + f"cd {quoted_root}; " + "mkdir -p lib; "
-            "if [ ! -d lib/forge-std ]; then "
-            "  if [ -d /opt/foundry-deps/forge-std ]; then cp -R /opt/foundry-deps/forge-std lib/forge-std; "
-            "  else git clone --depth 1 https://github.com/foundry-rs/forge-std lib/forge-std; fi; "
-            "fi; "
-            "if [ ! -d lib/openzeppelin-contracts ]; then "
-            "  if [ -d /opt/foundry-deps/openzeppelin-contracts ]; then cp -R /opt/foundry-deps/openzeppelin-contracts lib/openzeppelin-contracts; "
-            "  else git clone --depth 1 https://github.com/OpenZeppelin/openzeppelin-contracts lib/openzeppelin-contracts; fi; "
-            "fi; "
-            "if [ ! -d lib/chainlink-evm ]; then "
-            "  if [ -d /opt/foundry-deps/chainlink-evm ]; then cp -R /opt/foundry-deps/chainlink-evm lib/chainlink-evm; "
-            "  else git clone --depth 1 https://github.com/smartcontractkit/chainlink-evm lib/chainlink-evm; fi; "
-            "fi; "
-            "if [ ! -f lib/chainlink-evm/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol ]; then "
-            "  rm -rf lib/chainlink-evm; "
-            "  if [ -d /opt/foundry-deps/chainlink-evm ]; then cp -R /opt/foundry-deps/chainlink-evm lib/chainlink-evm; "
-            "  else git clone --depth 1 https://github.com/smartcontractkit/chainlink-evm lib/chainlink-evm; fi; "
-            "fi; "
-            "mkdir -p lib/chainlink-evm/contracts/src/v0.8/interfaces; "
-            "if [ ! -f lib/chainlink-evm/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol ] "
-            "&& [ -f lib/chainlink-evm/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol ]; then "
-            "  cp lib/chainlink-evm/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol "
-            "lib/chainlink-evm/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol; "
-            "fi; " + forge_cmd_str
-        )
+        bootstrap_cmd = build_foundry_bootstrap_cmd(root, forge_cmd_str)
 
         sandbox = modal.Sandbox.create(
             "bash",
@@ -450,61 +845,50 @@ def run_foundry_deploy(
         secrets = [rpc_url, private_key]
         stdout = _redact_text(stdout_raw, secrets)
         stderr = _redact_text(stderr_raw, secrets)
-        parsed = _parse_deploy_output(stdout, stderr)
-        command_display = " ".join(forge_cmd)
-
-        mm = _get_memory_manager()
-        data, block = mm._read_user_block()  # type: ignore[attr-defined]
-        mm._ensure_agents_structure(data)  # type: ignore[attr-defined]
-        deployment_state = data["agents"]["deployment"]
-
-        history: List[Dict[str, Any]] = deployment_state.get("last_deploy_results", [])
-        entry = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "pipeline_run_id": pipeline_run_id,
-            "pipeline_task_id": pipeline_task_id,
-            "project_root": root,
-            "sandbox_workdir": sandbox_workdir,
-            "network": request.network,
-            "chain_id": request.chain_id,
-            "script_path": request.script_path,
-            "command": command_display,
-            "exit_code": exit_code,
-            "stdout": stdout,
-            "stderr": stderr,
-            "modal_app": app_name,
-            "tx_hash": parsed.get("tx_hash"),
-            "deployed_address": parsed.get("deployed_address"),
-        }
-        history.append(entry)
-        deployment_state["last_deploy_results"] = history
-
-        mm.client.blocks.update(  # type: ignore[attr-defined]
-            block.id,
-            value=mm._serialize(data),  # type: ignore[attr-defined]
+        parsed = _extract_deploy_metadata(
+            root=root,
+            request=request,
+            stdout=stdout,
+            stderr=stderr,
+            volume=vol,
         )
+        success, deploy_error = _evaluate_deploy_success(
+            exit_code=exit_code,
+            tx_hash=parsed.get("tx_hash"),
+            deployed_address=parsed.get("deployed_address"),
+            rpc_url=rpc_url,
+        )
+        command_display = " ".join(forge_cmd)
+        entry = _record_deploy_result(
+            project_id=project_id_ctx,
+            pipeline_run_id=pipeline_run_id,
+            pipeline_task_id=pipeline_task_id,
+            root=root,
+            sandbox_workdir=sandbox_workdir,
+            request=request,
+            command=command_display,
+            exit_code=exit_code,
+            stdout=stdout,
+            stderr=stderr,
+            modal_app=app_name,
+            tx_hash=parsed.get("tx_hash"),
+            deployed_address=parsed.get("deployed_address"),
+            status="success" if success else "failed",
+        )
+        stdout_path = entry["stdout_path"]
+        stderr_path = entry["stderr_path"]
+        mm = _get_memory_manager()
 
-        # Keep existing Letta behavior, and additionally persist this run in Neon
-        # when DB/project context is available.
         try:
-            project_uuid = mm._project_uuid()  # type: ignore[attr-defined]
-            if project_uuid and getattr(mm, "_db_available", False):
-                from agents.db.crud import save_deployment as db_save_deployment
-
-                mm._db_call(  # type: ignore[attr-defined]
-                    lambda session: db_save_deployment(
-                        session,
-                        project_id=project_uuid,
-                        status="success" if exit_code == 0 else "failed",
-                        contract_name=request.contract_name,
-                        deployed_address=parsed.get("deployed_address"),
-                        tx_hash=parsed.get("tx_hash"),
-                        snowtrace_url=None,
-                        network=request.network,
-                    )
-                )
+            mm.save_deployment(
+                status="success" if success else "failed",
+                contract_name=request.contract_name,
+                deployed_address=parsed.get("deployed_address"),
+                tx_hash=parsed.get("tx_hash"),
+                snowtrace_url=None,
+                network=request.network,
+            )
         except Exception:
-            # DB persistence must not change current tool behavior.
             pass
 
         mm.log_agent_action(
@@ -513,18 +897,18 @@ def run_foundry_deploy(
             output_produced=entry,
             why="Deployment agent executed forge script broadcast in Modal Sandbox",
             how="run_foundry_deploy tool (Modal Sandbox)",
-            error=(
-                None if exit_code == 0 else "forge script returned non-zero exit code"
-            ),
+            error=deploy_error,
         )
 
         response = {
-            "success": exit_code == 0,
+            "success": success,
             "exit_code": exit_code,
             "pipeline_run_id": pipeline_run_id,
             "pipeline_task_id": pipeline_task_id,
             "stdout": stdout,
             "stderr": stderr,
+            "stdout_path": stdout_path,
+            "stderr_path": stderr_path,
             "project_root": root,
             "sandbox_workdir": sandbox_workdir,
             "modal_app": app_name,
@@ -535,9 +919,63 @@ def run_foundry_deploy(
             "tx_hash": parsed.get("tx_hash"),
             "deployed_address": parsed.get("deployed_address"),
         }
+        if deploy_error:
+            response["error"] = deploy_error
         return _cap_deploy_response(response)
     except Exception as e:
-        return {"error": f"Could not run forge deployment in Modal Sandbox: {str(e)}"}
+        try:
+            from agents.context import (
+                get_pipeline_run_id,
+                get_pipeline_task_id,
+                get_project_context,
+            )
+
+            project_id_ctx, _ = get_project_context()
+            pipeline_run_id = get_pipeline_run_id()
+            pipeline_task_id = get_pipeline_task_id()
+            default_root = os.getenv("FOUNDRY_ARTIFACT_ROOT", "generated_contracts")
+            if project_id_ctx:
+                default_root = f"{default_root.rstrip('/')}/{project_id_ctx}"
+            root = project_root or os.getenv("FOUNDRY_PROJECT_ROOT") or default_root
+            sandbox_workdir = "/workspace/project"
+            app_name = os.getenv("MODAL_APP_NAME", "partyhat-foundry-tests")
+            entry = _record_deploy_result(
+                project_id=project_id_ctx,
+                pipeline_run_id=pipeline_run_id,
+                pipeline_task_id=pipeline_task_id,
+                root=root,
+                sandbox_workdir=sandbox_workdir,
+                request=request,
+                command=f"forge script {request.script_path}",
+                exit_code=1,
+                stdout="",
+                stderr=str(e),
+                modal_app=app_name,
+            )
+            return _cap_deploy_response(
+                {
+                    "success": False,
+                    "exit_code": 1,
+                    "pipeline_run_id": pipeline_run_id,
+                    "pipeline_task_id": pipeline_task_id,
+                    "stdout": "",
+                    "stderr": str(e),
+                    "stdout_path": entry["stdout_path"],
+                    "stderr_path": entry["stderr_path"],
+                    "project_root": root,
+                    "sandbox_workdir": sandbox_workdir,
+                    "modal_app": app_name,
+                    "network": request.network,
+                    "chain_id": request.chain_id,
+                    "script_path": request.script_path,
+                    "command": f"forge script {request.script_path}",
+                    "tx_hash": None,
+                    "deployed_address": None,
+                    "error": f"Could not run forge deployment in Modal Sandbox: {str(e)}",
+                }
+            )
+        except Exception:
+            return {"error": f"Could not run forge deployment in Modal Sandbox: {str(e)}"}
 
 
 @tool
@@ -552,7 +990,10 @@ def record_deployment(record: DeploymentRecord) -> dict:
         deployment_state = data["agents"]["deployment"]
 
         deployments: List[dict] = deployment_state.get("deployments", [])
-        deployments.append(record.model_dump())
+        payload = record.model_dump()
+        payload.pop("stdout", None)
+        payload.pop("stderr", None)
+        deployments.append(payload)
         deployment_state["deployments"] = deployments
 
         mm.client.blocks.update(  # type: ignore[attr-defined]
@@ -563,7 +1004,7 @@ def record_deployment(record: DeploymentRecord) -> dict:
         mm.log_agent_action(
             agent_name="deployment",
             action="deployment_recorded",
-            output_produced=record.model_dump(),
+            output_produced=payload,
             why="Deployment agent recorded a deployment attempt",
             how="record_deployment tool",
         )
@@ -654,61 +1095,21 @@ def verify_contract_on_snowtrace(
         if request.optimizer_runs is not None:
             forge_cmd.extend(["--optimizer-runs", str(request.optimizer_runs)])
 
-        remappings = [
-            "--remappings",
-            "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
-            "--remappings",
-            "forge-std/=lib/forge-std/src/",
-            "--remappings",
-            "@chainlink/contracts/=lib/chainlink-evm/contracts/",
-            "--remappings",
-            "@chainlink/contracts/src/v0.8/interfaces/=lib/chainlink-evm/contracts/src/v0.8/shared/interfaces/",
-        ]
-        forge_cmd.extend(remappings)
+        forge_cmd.extend(default_foundry_remappings())
 
         app_name = os.getenv("MODAL_APP_NAME", "partyhat-foundry-tests")
         timeout = int(os.getenv("FOUNDRY_SANDBOX_TIMEOUT", "900"))
-        app = modal.App.lookup(app_name, create_if_missing=True)
+        app = get_modal_app(app_name)
         base_volume_name = os.getenv(
             "FOUNDRY_ARTIFACT_VOLUME_NAME", "partyhat-foundry-artifacts"
         )
-        volume_name = (
-            f"{base_volume_name}-{project_id_ctx}"
-            if project_id_ctx
-            else base_volume_name
-        )
-        vol = modal.Volume.from_name(volume_name, create_if_missing=True)
+        volume_name = build_project_volume_name(base_volume_name, project_id_ctx)
+        vol = get_modal_volume(volume_name)
         sandbox_workdir = "/workspace/project"
         sandbox_image = foundry_image
 
-        quoted_root = shlex.quote(root)
         forge_cmd_str = " ".join(shlex.quote(str(part)) for part in forge_cmd)
-        bootstrap_cmd = (
-            "set -e; " + f"cd {quoted_root}; " + "mkdir -p lib; "
-            "if [ ! -d lib/forge-std ]; then "
-            "  if [ -d /opt/foundry-deps/forge-std ]; then cp -R /opt/foundry-deps/forge-std lib/forge-std; "
-            "  else git clone --depth 1 https://github.com/foundry-rs/forge-std lib/forge-std; fi; "
-            "fi; "
-            "if [ ! -d lib/openzeppelin-contracts ]; then "
-            "  if [ -d /opt/foundry-deps/openzeppelin-contracts ]; then cp -R /opt/foundry-deps/openzeppelin-contracts lib/openzeppelin-contracts; "
-            "  else git clone --depth 1 https://github.com/OpenZeppelin/openzeppelin-contracts lib/openzeppelin-contracts; fi; "
-            "fi; "
-            "if [ ! -d lib/chainlink-evm ]; then "
-            "  if [ -d /opt/foundry-deps/chainlink-evm ]; then cp -R /opt/foundry-deps/chainlink-evm lib/chainlink-evm; "
-            "  else git clone --depth 1 https://github.com/smartcontractkit/chainlink-evm lib/chainlink-evm; fi; "
-            "fi; "
-            "if [ ! -f lib/chainlink-evm/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol ]; then "
-            "  rm -rf lib/chainlink-evm; "
-            "  if [ -d /opt/foundry-deps/chainlink-evm ]; then cp -R /opt/foundry-deps/chainlink-evm lib/chainlink-evm; "
-            "  else git clone --depth 1 https://github.com/smartcontractkit/chainlink-evm lib/chainlink-evm; fi; "
-            "fi; "
-            "mkdir -p lib/chainlink-evm/contracts/src/v0.8/interfaces; "
-            "if [ ! -f lib/chainlink-evm/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol ] "
-            "&& [ -f lib/chainlink-evm/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol ]; then "
-            "  cp lib/chainlink-evm/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol "
-            "lib/chainlink-evm/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol; "
-            "fi; " + forge_cmd_str
-        )
+        bootstrap_cmd = build_foundry_bootstrap_cmd(root, forge_cmd_str)
 
         sandbox = modal.Sandbox.create(
             "bash",
