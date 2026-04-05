@@ -3,6 +3,7 @@ import os
 import re
 import shlex
 import sys
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Dict, Any, Optional
@@ -42,7 +43,9 @@ from agents.modal_runtime import (
     get_modal_app,
     get_modal_volume,
 )
+from agents.pipeline_cancel import is_pipeline_cancelled
 from agents.pipeline_context import compact_execution_summary
+from agents.tracing import current_trace_id, start_span
 
 
 def _get_memory_manager():
@@ -407,6 +410,57 @@ def _record_deploy_result(
     return entry
 
 
+def _terminate_sandbox(sandbox: Any) -> None:
+    for method_name in ("terminate", "kill"):
+        method = getattr(sandbox, method_name, None)
+        if callable(method):
+            try:
+                method()
+            except Exception:
+                pass
+            return
+
+
+def _safe_stream_read(stream: Any) -> str:
+    if stream is None:
+        return ""
+    try:
+        return stream.read()
+    except Exception:
+        return ""
+
+
+def _wait_for_sandbox_completion(
+    sandbox: Any,
+    pipeline_run_id: str | None,
+    *,
+    poll_interval_s: float = 1.0,
+) -> bool:
+    wait_exc: list[Exception] = []
+
+    def _wait() -> None:
+        try:
+            sandbox.wait(raise_on_termination=False)
+        except TypeError:
+            sandbox.wait()
+        except Exception as exc:  # pragma: no cover - defensive
+            wait_exc.append(exc)
+
+    worker = threading.Thread(target=_wait, daemon=True)
+    worker.start()
+
+    while worker.is_alive():
+        if pipeline_run_id and is_pipeline_cancelled(pipeline_run_id):
+            _terminate_sandbox(sandbox)
+            worker.join(timeout=2)
+            return True
+        worker.join(timeout=poll_interval_s)
+
+    if wait_exc:
+        raise wait_exc[0]
+    return False
+
+
 def _truncate_for_display(text: str, max_chars: int, label: str = "output") -> str:
     """Return text truncated to max_chars with head and tail kept and a middle notice."""
     if not text or len(text) <= max_chars:
@@ -528,7 +582,18 @@ def generate_foundry_deploy_script_direct(
     llm = ChatOpenAI(model=model_name, temperature=0.1)
 
     try:
-        response = llm.invoke([HumanMessage(content=prompt)])
+        with start_span(
+            "model.call",
+            {
+                "task_type": "deployment.prepare_script",
+                "model": model_name,
+            },
+        ) as span:
+            response = llm.invoke([HumanMessage(content=prompt)])
+            usage = getattr(response, "usage_metadata", None) or {}
+            total_tokens = usage.get("total_tokens")
+            if total_tokens is not None:
+                span.set_attribute("token_count", int(total_tokens))
         generated_text = response.content or ""
     except Exception as e:
         return {"error": f"Failed to generate Foundry deployment script: {str(e)}"}
@@ -578,7 +643,14 @@ def save_deploy_artifact(artifact: CodeArtifact) -> Dict[str, Any]:
         code = raw.pop("code", None)
 
         if code:
-            stored_path = storage.save_code(artifact, code)
+            with start_span(
+                "artifact.write",
+                {
+                    "artifact.path": artifact.path,
+                    "artifact.language": artifact.language,
+                },
+            ):
+                stored_path = storage.save_code(artifact, code)
             raw["path"] = stored_path
 
         artifacts: List[Dict[str, Any]] = deployment_state.get("artifacts", [])
@@ -663,6 +735,8 @@ def run_foundry_deploy(
         if project_id_ctx:
             default_root = f"{default_root.rstrip('/')}/{project_id_ctx}"
         root = project_root or os.getenv("FOUNDRY_PROJECT_ROOT") or default_root
+        trace_id = current_trace_id()
+        mm = _get_memory_manager()
         app_name = os.getenv("MODAL_APP_NAME", "partyhat-foundry-tests")
         sandbox_workdir = "/workspace/project"
         if request.network != "avalanche_fuji":
@@ -682,6 +756,20 @@ def run_foundry_deploy(
                 ),
                 modal_app=app_name,
             )
+            try:
+                mm.save_deployment(
+                    status="failed",
+                    contract_name=request.contract_name,
+                    network=request.network,
+                    pipeline_run_id=pipeline_run_id,
+                    pipeline_task_id=pipeline_task_id,
+                    stdout_path=entry["stdout_path"],
+                    stderr_path=entry["stderr_path"],
+                    exit_code=1,
+                    trace_id=trace_id,
+                )
+            except Exception:
+                pass
             return {
                 "success": False,
                 "exit_code": 1,
@@ -723,6 +811,20 @@ def run_foundry_deploy(
                 stderr=f"Missing required env var: {request.rpc_url_env_var}",
                 modal_app=app_name,
             )
+            try:
+                mm.save_deployment(
+                    status="failed",
+                    contract_name=request.contract_name,
+                    network=request.network,
+                    pipeline_run_id=pipeline_run_id,
+                    pipeline_task_id=pipeline_task_id,
+                    stdout_path=entry["stdout_path"],
+                    stderr_path=entry["stderr_path"],
+                    exit_code=1,
+                    trace_id=trace_id,
+                )
+            except Exception:
+                pass
             return {
                 "success": False,
                 "exit_code": 1,
@@ -755,6 +857,20 @@ def run_foundry_deploy(
                 stderr=f"Missing required env var: {request.private_key_env_var}",
                 modal_app=app_name,
             )
+            try:
+                mm.save_deployment(
+                    status="failed",
+                    contract_name=request.contract_name,
+                    network=request.network,
+                    pipeline_run_id=pipeline_run_id,
+                    pipeline_task_id=pipeline_task_id,
+                    stdout_path=entry["stdout_path"],
+                    stderr_path=entry["stderr_path"],
+                    exit_code=1,
+                    trace_id=trace_id,
+                )
+            except Exception:
+                pass
             return {
                 "success": False,
                 "exit_code": 1,
@@ -822,25 +938,39 @@ def run_foundry_deploy(
         )
         bootstrap_cmd = build_foundry_bootstrap_cmd(root, forge_cmd_str)
 
-        sandbox = modal.Sandbox.create(
-            "bash",
-            "-lc",
-            bootstrap_cmd,
-            image=sandbox_image,
-            app=app,
-            workdir=sandbox_workdir,
-            timeout=timeout,
-            volumes={sandbox_workdir: vol},
-            env={
-                request.rpc_url_env_var: rpc_url,
-                request.private_key_env_var: private_key,
+        with start_span(
+            "deploy.execute",
+            {
+                "project_id": project_id_ctx,
+                "pipeline_run_id": pipeline_run_id,
+                "pipeline_task_id": pipeline_task_id,
+                "task_type": "deployment.execute_deploy",
             },
-        )
+        ) as span:
+            sandbox = modal.Sandbox.create(
+                "bash",
+                "-lc",
+                bootstrap_cmd,
+                image=sandbox_image,
+                app=app,
+                workdir=sandbox_workdir,
+                timeout=timeout,
+                volumes={sandbox_workdir: vol},
+                env={
+                    request.rpc_url_env_var: rpc_url,
+                    request.private_key_env_var: private_key,
+                },
+            )
 
-        stdout_raw = sandbox.stdout.read()
-        stderr_raw = sandbox.stderr.read()
-        sandbox.wait(raise_on_termination=False)
-        exit_code = sandbox.returncode
+            cancelled = _wait_for_sandbox_completion(sandbox, pipeline_run_id)
+            stdout_raw = _safe_stream_read(getattr(sandbox, "stdout", None))
+            stderr_raw = _safe_stream_read(getattr(sandbox, "stderr", None))
+            exit_code = getattr(sandbox, "returncode", None)
+            if cancelled:
+                exit_code = 130 if exit_code is None else exit_code
+                span.set_attribute("failure_class", "cancelled")
+            elif exit_code is not None:
+                span.set_attribute("exit_code", int(exit_code))
 
         secrets = [rpc_url, private_key]
         stdout = _redact_text(stdout_raw, secrets)
@@ -858,6 +988,9 @@ def run_foundry_deploy(
             deployed_address=parsed.get("deployed_address"),
             rpc_url=rpc_url,
         )
+        if cancelled:
+            success = False
+            deploy_error = "Deployment cancelled."
         command_display = " ".join(forge_cmd)
         entry = _record_deploy_result(
             project_id=project_id_ctx,
@@ -873,20 +1006,24 @@ def run_foundry_deploy(
             modal_app=app_name,
             tx_hash=parsed.get("tx_hash"),
             deployed_address=parsed.get("deployed_address"),
-            status="success" if success else "failed",
+            status="cancelled" if cancelled else ("success" if success else "failed"),
         )
         stdout_path = entry["stdout_path"]
         stderr_path = entry["stderr_path"]
-        mm = _get_memory_manager()
-
         try:
             mm.save_deployment(
-                status="success" if success else "failed",
+                status="cancelled" if cancelled else ("success" if success else "failed"),
                 contract_name=request.contract_name,
                 deployed_address=parsed.get("deployed_address"),
                 tx_hash=parsed.get("tx_hash"),
                 snowtrace_url=None,
                 network=request.network,
+                pipeline_run_id=pipeline_run_id,
+                pipeline_task_id=pipeline_task_id,
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                exit_code=exit_code,
+                trace_id=trace_id,
             )
         except Exception:
             pass
@@ -901,7 +1038,8 @@ def run_foundry_deploy(
         )
 
         response = {
-            "success": success,
+            "success": success and not cancelled,
+            "cancelled": cancelled,
             "exit_code": exit_code,
             "pipeline_run_id": pipeline_run_id,
             "pipeline_task_id": pipeline_task_id,
@@ -952,6 +1090,20 @@ def run_foundry_deploy(
                 stderr=str(e),
                 modal_app=app_name,
             )
+            try:
+                _get_memory_manager().save_deployment(
+                    status="failed",
+                    contract_name=request.contract_name,
+                    network=request.network,
+                    pipeline_run_id=pipeline_run_id,
+                    pipeline_task_id=pipeline_task_id,
+                    stdout_path=entry["stdout_path"],
+                    stderr_path=entry["stderr_path"],
+                    exit_code=1,
+                    trace_id=current_trace_id(),
+                )
+            except Exception:
+                pass
             return _cap_deploy_response(
                 {
                     "success": False,

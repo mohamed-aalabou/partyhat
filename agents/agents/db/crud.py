@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import select, desc, update
+from sqlalchemy import select, desc, func, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 
@@ -16,6 +16,9 @@ from agents.db.models import (
     TestRun,
     Deployment,
     Message,
+    PipelineEvaluation,
+    PipelineHumanGate,
+    PipelineRun,
 )
 
 
@@ -279,6 +282,13 @@ async def save_test_run(
     tests_run: int | None = None,
     tests_passed: int | None = None,
     output: str | None = None,
+    pipeline_run_id: uuid.UUID | None = None,
+    pipeline_task_id: uuid.UUID | None = None,
+    artifact_revision: int = 0,
+    stdout_path: str | None = None,
+    stderr_path: str | None = None,
+    exit_code: int | None = None,
+    trace_id: str | None = None,
 ) -> TestRun:
     """Save a test run result for a project."""
     run = TestRun(
@@ -287,6 +297,13 @@ async def save_test_run(
         tests_run=tests_run,
         tests_passed=tests_passed,
         output=output,
+        pipeline_run_id=pipeline_run_id,
+        pipeline_task_id=pipeline_task_id,
+        artifact_revision=artifact_revision,
+        stdout_path=stdout_path,
+        stderr_path=stderr_path,
+        exit_code=exit_code,
+        trace_id=trace_id,
     )
     session.add(run)
     await session.commit()
@@ -308,6 +325,37 @@ async def get_last_test_run(
     return result.scalar_one_or_none()
 
 
+async def list_test_runs(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    limit: int = 20,
+) -> list[TestRun]:
+    result = await session.execute(
+        select(TestRun)
+        .where(TestRun.project_id == project_id)
+        .order_by(TestRun.created_at.desc())
+        .limit(limit)
+    )
+    return list(result.scalars().all())
+
+
+async def get_test_run_for_task(
+    session: AsyncSession,
+    pipeline_run_id: uuid.UUID,
+    pipeline_task_id: uuid.UUID,
+) -> TestRun | None:
+    result = await session.execute(
+        select(TestRun)
+        .where(
+            TestRun.pipeline_run_id == pipeline_run_id,
+            TestRun.pipeline_task_id == pipeline_task_id,
+        )
+        .order_by(TestRun.created_at.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
 # The deployments
 async def save_deployment(
     session: AsyncSession,
@@ -318,6 +366,13 @@ async def save_deployment(
     tx_hash: str | None = None,
     snowtrace_url: str | None = None,
     network: str = "avalanche_fuji",
+    pipeline_run_id: uuid.UUID | None = None,
+    pipeline_task_id: uuid.UUID | None = None,
+    artifact_revision: int = 0,
+    stdout_path: str | None = None,
+    stderr_path: str | None = None,
+    exit_code: int | None = None,
+    trace_id: str | None = None,
 ) -> Deployment:
     """Record a deployment result for a project."""
     dep = Deployment(
@@ -328,6 +383,13 @@ async def save_deployment(
         tx_hash=tx_hash,
         snowtrace_url=snowtrace_url,
         status=status,
+        pipeline_run_id=pipeline_run_id,
+        pipeline_task_id=pipeline_task_id,
+        artifact_revision=artifact_revision,
+        stdout_path=stdout_path,
+        stderr_path=stderr_path,
+        exit_code=exit_code,
+        trace_id=trace_id,
     )
     session.add(dep)
     await session.commit()
@@ -352,14 +414,273 @@ async def get_last_deployment(
 async def list_deployments(
     session: AsyncSession,
     project_id: uuid.UUID,
+    limit: int | None = None,
 ) -> list[Deployment]:
     """Get all deployments for a project, newest first."""
-    result = await session.execute(
+    query = (
         select(Deployment)
         .where(Deployment.project_id == project_id)
         .order_by(Deployment.created_at.desc())
     )
+    if limit is not None:
+        query = query.limit(limit)
+    result = await session.execute(query)
     return list(result.scalars().all())
+
+
+async def get_deployment_for_task(
+    session: AsyncSession,
+    pipeline_run_id: uuid.UUID,
+    pipeline_task_id: uuid.UUID,
+) -> Deployment | None:
+    result = await session.execute(
+        select(Deployment)
+        .where(
+            Deployment.pipeline_run_id == pipeline_run_id,
+            Deployment.pipeline_task_id == pipeline_task_id,
+        )
+        .order_by(Deployment.created_at.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_successful_terminal_deployment(
+    session: AsyncSession,
+    pipeline_run_id: uuid.UUID,
+) -> Deployment | None:
+    result = await session.execute(
+        select(Deployment)
+        .where(
+            Deployment.pipeline_run_id == pipeline_run_id,
+            Deployment.status == "success",
+        )
+        .order_by(Deployment.created_at.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+async def create_pipeline_run(
+    session: AsyncSession,
+    *,
+    project_id: uuid.UUID,
+    user_id: uuid.UUID | None,
+    plan_id: uuid.UUID | None = None,
+    deployment_target: dict | None = None,
+    trace_id: str | None = None,
+    pipeline_run_id: uuid.UUID | None = None,
+) -> PipelineRun:
+    run = PipelineRun(
+        id=pipeline_run_id or uuid.uuid4(),
+        project_id=project_id,
+        user_id=user_id,
+        plan_id=plan_id,
+        deployment_target=deployment_target,
+        trace_id=trace_id,
+        status="created",
+    )
+    session.add(run)
+    await session.commit()
+    await session.refresh(run)
+    return run
+
+
+async def get_pipeline_run(
+    session: AsyncSession,
+    pipeline_run_id: uuid.UUID,
+) -> PipelineRun | None:
+    result = await session.execute(
+        select(PipelineRun).where(PipelineRun.id == pipeline_run_id)
+    )
+    return result.scalar_one_or_none()
+
+
+async def update_pipeline_run(
+    session: AsyncSession,
+    pipeline_run_id: uuid.UUID,
+    **fields,
+) -> PipelineRun | None:
+    run = await get_pipeline_run(session, pipeline_run_id)
+    if run is None:
+        return None
+    for key, value in fields.items():
+        setattr(run, key, value)
+    run.updated_at = datetime.now(timezone.utc)
+    await session.commit()
+    await session.refresh(run)
+    return run
+
+
+async def request_pipeline_cancellation(
+    session: AsyncSession,
+    pipeline_run_id: uuid.UUID,
+    reason: str | None = None,
+) -> PipelineRun | None:
+    run = await get_pipeline_run(session, pipeline_run_id)
+    if run is None:
+        return None
+    if run.cancellation_requested_at is None:
+        run.cancellation_requested_at = datetime.now(timezone.utc)
+        run.cancellation_reason = reason
+    if run.status not in {"completed", "failed", "cancelled"}:
+        run.status = "cancellation_requested"
+    run.updated_at = datetime.now(timezone.utc)
+    await session.commit()
+    await session.refresh(run)
+    return run
+
+
+async def create_pipeline_human_gate(
+    session: AsyncSession,
+    *,
+    project_id: uuid.UUID,
+    pipeline_run_id: uuid.UUID,
+    gate_type: str,
+    pipeline_task_id: uuid.UUID | None = None,
+    evaluation_id: uuid.UUID | None = None,
+    requested_payload: dict | None = None,
+    requested_reason: str | None = None,
+    requested_by: str | None = None,
+    trace_id: str | None = None,
+) -> PipelineHumanGate:
+    gate = PipelineHumanGate(
+        project_id=project_id,
+        pipeline_run_id=pipeline_run_id,
+        pipeline_task_id=pipeline_task_id,
+        evaluation_id=evaluation_id,
+        gate_type=gate_type,
+        requested_payload=requested_payload,
+        requested_reason=requested_reason,
+        requested_by=requested_by,
+        trace_id=trace_id,
+    )
+    session.add(gate)
+    await session.commit()
+    await session.refresh(gate)
+    return gate
+
+
+async def get_pipeline_human_gate(
+    session: AsyncSession,
+    gate_id: uuid.UUID,
+) -> PipelineHumanGate | None:
+    result = await session.execute(
+        select(PipelineHumanGate).where(PipelineHumanGate.id == gate_id)
+    )
+    return result.scalar_one_or_none()
+
+
+async def list_pipeline_human_gates(
+    session: AsyncSession,
+    pipeline_run_id: uuid.UUID,
+) -> list[PipelineHumanGate]:
+    result = await session.execute(
+        select(PipelineHumanGate)
+        .where(PipelineHumanGate.pipeline_run_id == pipeline_run_id)
+        .order_by(PipelineHumanGate.created_at.asc())
+    )
+    return list(result.scalars().all())
+
+
+async def resolve_pipeline_human_gate(
+    session: AsyncSession,
+    gate_id: uuid.UUID,
+    *,
+    status: str,
+    resolved_payload: dict | None = None,
+    resolved_reason: str | None = None,
+    resolved_by: str | None = None,
+) -> PipelineHumanGate | None:
+    gate = await get_pipeline_human_gate(session, gate_id)
+    if gate is None:
+        return None
+    gate.status = status
+    gate.resolved_payload = resolved_payload
+    gate.resolved_reason = resolved_reason
+    gate.resolved_by = resolved_by
+    gate.resolved_at = datetime.now(timezone.utc)
+    await session.commit()
+    await session.refresh(gate)
+    return gate
+
+
+async def create_pipeline_evaluation(
+    session: AsyncSession,
+    *,
+    project_id: uuid.UUID,
+    pipeline_run_id: uuid.UUID,
+    stage: str,
+    evaluation_type: str,
+    blocking: bool,
+    status: str,
+    summary: str,
+    details_json: dict | None = None,
+    artifact_revision: int = 0,
+    pipeline_task_id: uuid.UUID | None = None,
+    trace_id: str | None = None,
+) -> PipelineEvaluation:
+    evaluation = PipelineEvaluation(
+        project_id=project_id,
+        pipeline_run_id=pipeline_run_id,
+        pipeline_task_id=pipeline_task_id,
+        stage=stage,
+        evaluation_type=evaluation_type,
+        blocking=blocking,
+        status=status,
+        summary=summary,
+        details_json=details_json,
+        artifact_revision=artifact_revision,
+        trace_id=trace_id,
+    )
+    session.add(evaluation)
+    await session.commit()
+    await session.refresh(evaluation)
+    return evaluation
+
+
+async def list_pipeline_evaluations(
+    session: AsyncSession,
+    pipeline_run_id: uuid.UUID,
+) -> list[PipelineEvaluation]:
+    result = await session.execute(
+        select(PipelineEvaluation)
+        .where(PipelineEvaluation.pipeline_run_id == pipeline_run_id)
+        .order_by(PipelineEvaluation.created_at.asc())
+    )
+    return list(result.scalars().all())
+
+
+async def count_claimed_tasks_for_run(
+    session: AsyncSession,
+    pipeline_run_id: uuid.UUID,
+) -> int:
+    from agents.db.models import PipelineTask
+
+    result = await session.execute(
+        select(func.count(PipelineTask.id)).where(
+            PipelineTask.pipeline_run_id == pipeline_run_id,
+            PipelineTask.claimed_at.is_not(None),
+        )
+    )
+    return int(result.scalar() or 0)
+
+
+async def get_next_retry_attempt(
+    session: AsyncSession,
+    pipeline_run_id: uuid.UUID,
+    retry_budget_key: str,
+) -> int:
+    from agents.db.models import PipelineTask
+
+    result = await session.execute(
+        select(func.max(PipelineTask.retry_attempt)).where(
+            PipelineTask.pipeline_run_id == pipeline_run_id,
+            PipelineTask.retry_budget_key == retry_budget_key,
+        )
+    )
+    current = result.scalar()
+    return int(current or -1) + 1
 
 
 # Messages
@@ -418,6 +739,11 @@ async def create_pipeline_task(
     sequence_index: int = 0,
     artifact_revision: int = 0,
     depends_on_task_ids: list[str] | None = None,
+    retry_budget_key: str | None = None,
+    retry_attempt: int = 0,
+    failure_class: str | None = None,
+    gate_id: uuid.UUID | None = None,
+    status: str = "pending",
 ) -> "PipelineTask":
     """Push a new task onto the pipeline task stack."""
     from agents.db.models import PipelineTask
@@ -433,7 +759,11 @@ async def create_pipeline_task(
         sequence_index=sequence_index,
         artifact_revision=artifact_revision,
         depends_on_task_ids=depends_on_task_ids,
-        status="pending",
+        retry_budget_key=retry_budget_key,
+        retry_attempt=retry_attempt,
+        failure_class=failure_class,
+        gate_id=gate_id,
+        status=status,
         context=context,
     )
     session.add(task)
@@ -601,7 +931,13 @@ async def complete_pipeline_task_and_create_next(
             sequence_index=payload.get("sequence_index", idx),
             artifact_revision=payload.get("artifact_revision", task.artifact_revision),
             depends_on_task_ids=payload.get("depends_on_task_ids"),
-            status="pending",
+            retry_budget_key=payload.get("retry_budget_key"),
+            retry_attempt=payload.get("retry_attempt", 0),
+            failure_class=payload.get("failure_class"),
+            gate_id=uuid.UUID(payload["gate_id"])
+            if payload.get("gate_id")
+            else None,
+            status=payload.get("status", "pending"),
         )
         session.add(new_task)
         created.append(new_task)
@@ -618,12 +954,47 @@ async def get_latest_pipeline_run_id(
     project_id: uuid.UUID,
 ) -> uuid.UUID | None:
     """Get the most recent pipeline_run_id for a project."""
-    from agents.db.models import PipelineTask
-
     result = await session.execute(
-        select(PipelineTask.pipeline_run_id)
-        .where(PipelineTask.project_id == project_id)
-        .order_by(desc(PipelineTask.created_at))
+        select(PipelineRun.id)
+        .where(PipelineRun.project_id == project_id)
+        .order_by(desc(PipelineRun.created_at))
         .limit(1)
     )
     return result.scalar_one_or_none()
+
+
+async def update_pipeline_task(
+    session: AsyncSession,
+    task_id: uuid.UUID,
+    **fields,
+):
+    from agents.db.models import PipelineTask
+
+    task = await get_pipeline_task(session, task_id)
+    if task is None:
+        return None
+    for key, value in fields.items():
+        setattr(task, key, value)
+    await session.commit()
+    await session.refresh(task)
+    return task
+
+
+async def cancel_pending_followup_tasks(
+    session: AsyncSession,
+    pipeline_run_id: uuid.UUID,
+    parent_task_id: uuid.UUID,
+) -> int:
+    from agents.db.models import PipelineTask
+
+    result = await session.execute(
+        update(PipelineTask)
+        .where(
+            PipelineTask.pipeline_run_id == pipeline_run_id,
+            PipelineTask.parent_task_id == parent_task_id,
+            PipelineTask.status == "pending",
+        )
+        .values(status="cancelled", completed_at=datetime.now(timezone.utc))
+    )
+    await session.commit()
+    return int(result.rowcount or 0)

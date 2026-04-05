@@ -1,4 +1,5 @@
 from agents import planning_tools
+from schemas.deployment_schema import DeploymentTarget
 from schemas.plan_schema import (
     Constructor,
     ContractFunction,
@@ -112,6 +113,13 @@ def _build_plan(*, constructor_inputs):
     return SmartContractPlan(
         project_name="PartyToken",
         description="Token plan",
+        deployment_target=DeploymentTarget(
+            network="avalanche_fuji",
+            name="Avalanche Fuji",
+            chain_id=43113,
+            rpc_url_env_var="FUJI_RPC_URL",
+            private_key_env_var="FUJI_PRIVATE_KEY",
+        ),
         contracts=[
             ContractPlan(
                 name="PartyToken",

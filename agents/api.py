@@ -2,6 +2,7 @@ import json
 import uuid
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -37,6 +38,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from agents.pipeline_orchestrator import run_autonomous_pipeline, get_pipeline_status
 from agents.pipeline_cancel import cancel_pipeline_run
 from agents.db import async_session_factory
+from agents.tracing import configure_tracing
 
 load_dotenv()
 
@@ -79,6 +81,7 @@ async def load_mcp_tools_startup() -> None:
 async def db_startup() -> None:
     """Create Neon DB tables on startup."""
     await create_tables()
+    configure_tracing()
 
 
 async def ensure_project_context(
@@ -727,10 +730,7 @@ async def get_current_deployment(
                 effective_project_id if effective_project_id != "default" else None
             ),
         )
-        state = mm.get_agent_state("deployment")
-        last_deploy_results = _compact_execution_history(
-            state.get("last_deploy_results", [])
-        )
+        last_deploy_results = _compact_execution_history(mm.list_deployments(limit=20))
         return DeploymentCurrentResponse(last_deploy_results=last_deploy_results)
     except Exception as e:
         raise HTTPException(
@@ -760,10 +760,7 @@ async def get_current_test_results(
                 effective_project_id if effective_project_id != "default" else None
             ),
         )
-        state = mm.get_agent_state("testing")
-        last_test_results = _compact_execution_history(
-            state.get("last_test_results", [])
-        )
+        last_test_results = _compact_execution_history(mm.list_test_runs(limit=20))
         return TestingCurrentResponse(last_test_results=last_test_results)
     except Exception as e:
         raise HTTPException(
@@ -1118,6 +1115,17 @@ class PipelineRunRequest(BaseModel):
 class PipelineCancelRequest(BaseModel):
     project_id: str
     pipeline_run_id: str
+    reason: Optional[str] = None
+
+
+class PipelineResumeRequest(BaseModel):
+    project_id: str
+    pipeline_run_id: str
+
+
+class GateDecisionRequest(BaseModel):
+    project_id: str
+    reason: Optional[str] = None
 
 
 @app.post("/pipeline/run")
@@ -1185,6 +1193,37 @@ async def run_pipeline(
     )
 
 
+@app.post("/pipeline/resume")
+async def resume_pipeline(
+    request: PipelineResumeRequest,
+    ctx: RequestContext = Depends(get_request_context),
+    session: AsyncSession = Depends(get_session),
+):
+    effective_project_id = request.project_id or ctx.project_id
+    await ensure_project_context(effective_project_id, ctx.user_id, session)
+
+    async def event_stream():
+        try:
+            async for event in run_autonomous_pipeline(
+                project_id=effective_project_id,
+                user_id=ctx.user_id,
+                pipeline_run_id=request.pipeline_run_id,
+            ):
+                yield f"data: {json.dumps(event)}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'pipeline_error', 'error': str(e)})}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @app.get("/pipeline/status")
 async def pipeline_status(
     project_id: str,
@@ -1229,9 +1268,156 @@ async def cancel_pipeline(
 ):
     """Cancel a running pipeline."""
     await ensure_project_context(request.project_id, ctx.user_id, session)
-    cancel_pipeline_run(request.pipeline_run_id)
+    success = cancel_pipeline_run(request.pipeline_run_id, reason=request.reason)
     return {
-        "success": True,
+        "success": success,
         "message": "Cancellation requested. The pipeline will stop at the next safe point.",
         "pipeline_run_id": request.pipeline_run_id,
+        "reason": request.reason,
     }
+
+
+async def _resolve_gate_transition(
+    *,
+    gate_id: str,
+    action: str,
+    request: GateDecisionRequest,
+    ctx: RequestContext,
+    session: AsyncSession,
+):
+    from agents.db.crud import (
+        get_pipeline_human_gate,
+        get_pipeline_run,
+        get_pipeline_run_tasks,
+        resolve_pipeline_human_gate,
+        update_pipeline_run,
+        update_pipeline_task,
+    )
+
+    gate_uuid = uuid.UUID(gate_id)
+    gate = await get_pipeline_human_gate(session, gate_uuid)
+    if gate is None or str(gate.project_id) != request.project_id:
+        raise HTTPException(status_code=404, detail="Gate not found")
+    if gate.status != "pending":
+        raise HTTPException(status_code=400, detail="Gate is no longer pending")
+
+    if gate.gate_type == "pre_deploy" and action != "approve":
+        raise HTTPException(status_code=400, detail="Use approve/reject for pre_deploy gates")
+    if gate.gate_type == "override" and action not in {"override", "reject"}:
+        raise HTTPException(status_code=400, detail="Use override/reject for override gates")
+
+    gate = await resolve_pipeline_human_gate(
+        session,
+        gate_uuid,
+        status="approved" if action == "approve" else ("overridden" if action == "override" else "rejected"),
+        resolved_payload={"reason": request.reason},
+        resolved_reason=request.reason,
+        resolved_by=ctx.user_id,
+    )
+
+    run = await get_pipeline_run(session, gate.pipeline_run_id)
+    tasks = await get_pipeline_run_tasks(session, gate.pipeline_run_id)
+    waiting_tasks = [
+        task
+        for task in tasks
+        if getattr(task, "gate_id", None) == gate.id
+        and task.status == "waiting_for_approval"
+    ]
+    waiting_task = waiting_tasks[-1] if waiting_tasks else None
+
+    if action in {"approve", "override"} and waiting_task is not None:
+        await update_pipeline_task(
+            session,
+            waiting_task.id,
+            status="pending",
+            claimed_at=None,
+            completed_at=None,
+            result_summary=None,
+            failure_class=None if action == "approve" else waiting_task.failure_class,
+        )
+        await update_pipeline_run(
+            session,
+            gate.pipeline_run_id,
+            status="running",
+            resumed_at=datetime.now(timezone.utc),
+            failure_class=None,
+            failure_reason=None,
+        )
+    else:
+        if waiting_task is not None:
+            await update_pipeline_task(
+                session,
+                waiting_task.id,
+                status="cancelled",
+                completed_at=datetime.now(timezone.utc),
+                result_summary=request.reason or "Operator rejected the human gate.",
+                failure_class="human_gate",
+            )
+        await update_pipeline_run(
+            session,
+            gate.pipeline_run_id,
+            status="failed",
+            completed_at=datetime.now(timezone.utc),
+            failure_class="human_gate",
+            failure_reason=request.reason or "Operator rejected the human gate.",
+        )
+
+    return {
+        "success": True,
+        "gate_id": gate_id,
+        "action": action,
+        "pipeline_run_id": str(gate.pipeline_run_id),
+        "reason": request.reason,
+        "run_status": "running" if action in {"approve", "override"} else "failed",
+    }
+
+
+@app.post("/pipeline/gates/{gate_id}/approve")
+async def approve_pipeline_gate(
+    gate_id: str,
+    request: GateDecisionRequest,
+    ctx: RequestContext = Depends(get_request_context),
+    session: AsyncSession = Depends(get_session),
+):
+    await ensure_project_context(request.project_id, ctx.user_id, session)
+    return await _resolve_gate_transition(
+        gate_id=gate_id,
+        action="approve",
+        request=request,
+        ctx=ctx,
+        session=session,
+    )
+
+
+@app.post("/pipeline/gates/{gate_id}/reject")
+async def reject_pipeline_gate(
+    gate_id: str,
+    request: GateDecisionRequest,
+    ctx: RequestContext = Depends(get_request_context),
+    session: AsyncSession = Depends(get_session),
+):
+    await ensure_project_context(request.project_id, ctx.user_id, session)
+    return await _resolve_gate_transition(
+        gate_id=gate_id,
+        action="reject",
+        request=request,
+        ctx=ctx,
+        session=session,
+    )
+
+
+@app.post("/pipeline/gates/{gate_id}/override")
+async def override_pipeline_gate(
+    gate_id: str,
+    request: GateDecisionRequest,
+    ctx: RequestContext = Depends(get_request_context),
+    session: AsyncSession = Depends(get_session),
+):
+    await ensure_project_context(request.project_id, ctx.user_id, session)
+    return await _resolve_gate_transition(
+        gate_id=gate_id,
+        action="override",
+        request=request,
+        ctx=ctx,
+        session=session,
+    )

@@ -2,6 +2,7 @@ import uuid
 from types import SimpleNamespace
 
 from agents.memory_manager import MemoryManager
+from agents.pipeline_specs import default_deployment_target_payload
 
 
 class FakeBlocks:
@@ -69,9 +70,13 @@ def test_save_plan_keeps_compact_letta_state_and_full_neon_plan(monkeypatch):
     assert planning["plan_summary"]["contract_names"] == ["PartyToken"]
     assert planning["current_plan"] is None
 
+    expected_plan = {
+        **plan,
+        "deployment_target": default_deployment_target_payload(),
+    }
     monkeypatch.setattr(
         mm,
         "_db_call",
         lambda coro_factory: SimpleNamespace(plan_data=plan),
     )
-    assert mm.get_plan() == plan
+    assert mm.get_plan() == expected_plan

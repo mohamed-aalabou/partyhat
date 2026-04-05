@@ -21,6 +21,10 @@ from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
+from agents.pipeline_specs import (
+    TERMINAL_SUCCESS_TASK_TYPES,
+    retry_budget_key_for_task,
+)
 from agents.pipeline_context import (
     default_expected_outputs,
     extract_plan_summary,
@@ -59,12 +63,6 @@ _sync_engine = (
 )
 
 _SyncSession = sessionmaker(bind=_sync_engine) if _sync_engine else None
-
-
-TERMINAL_SUCCESS_TASK_TYPES = {
-    "deployment.execute_deploy",
-    "deployment.retry_deploy",
-}
 
 
 def _get_sync_session() -> Session | None:
@@ -199,7 +197,15 @@ def _complete_and_create_sync(
                 sequence_index=t.get("sequence_index", idx),
                 artifact_revision=t.get("artifact_revision", 0),
                 depends_on_task_ids=t.get("depends_on_task_ids"),
-                status="pending",
+                retry_budget_key=t.get("retry_budget_key"),
+                retry_attempt=t.get("retry_attempt", 0),
+                failure_class=t.get("failure_class"),
+                gate_id=(
+                    uuid.UUID(t["gate_id"])
+                    if t.get("gate_id")
+                    else None
+                ),
+                status=t.get("status", "pending"),
                 context=t.get("context"),
             )
             session.add(new_task)
@@ -347,13 +353,22 @@ def _normalize_next_tasks(
         else None
     )
 
+    next_attempts: dict[str, int] = {}
     for idx, task in enumerate(next_tasks):
         payload = task.model_dump()
+        retry_budget_key = retry_budget_key_for_task(payload["task_type"])
+        if retry_budget_key not in next_attempts:
+            next_attempts[retry_budget_key] = _get_next_retry_attempt_sync(
+                pipeline_run_id=str(current_task.pipeline_run_id),
+                retry_budget_key=retry_budget_key,
+            )
         payload["parent_task_id"] = payload.get("parent_task_id") or str(current_task.id)
         payload["sequence_index"] = (
             payload["sequence_index"] if payload.get("sequence_index") is not None else idx
         )
         payload["artifact_revision"] = artifact_revision
+        payload["retry_budget_key"] = retry_budget_key
+        payload["retry_attempt"] = next_attempts[retry_budget_key]
         payload["context"] = standardize_task_context(
             payload.get("context"),
             plan_summary=plan_summary,
@@ -366,9 +381,35 @@ def _normalize_next_tasks(
             else default_expected_outputs(payload["task_type"]),
         )
         normalized.append(payload)
+        next_attempts[retry_budget_key] += 1
 
     _update_revision_pointer(project_id, user_id, artifact_revision)
     return normalized
+
+
+def _get_next_retry_attempt_sync(
+    *,
+    pipeline_run_id: str,
+    retry_budget_key: str,
+) -> int:
+    from agents.db.models import PipelineTask
+
+    session = _get_sync_session()
+    if session is None:
+        return 0
+    try:
+        result = session.execute(
+            select(PipelineTask.retry_attempt)
+            .where(
+                PipelineTask.pipeline_run_id == uuid.UUID(pipeline_run_id),
+                PipelineTask.retry_budget_key == retry_budget_key,
+            )
+            .order_by(PipelineTask.retry_attempt.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+        return int(result or -1) + 1
+    finally:
+        session.close()
 
 
 @tool
@@ -414,6 +455,12 @@ def get_my_current_task() -> dict:
             "sequence_index": task.sequence_index,
             "artifact_revision": getattr(task, "artifact_revision", 0),
             "depends_on_task_ids": getattr(task, "depends_on_task_ids", None),
+            "retry_budget_key": getattr(task, "retry_budget_key", None),
+            "retry_attempt": getattr(task, "retry_attempt", 0),
+            "failure_class": getattr(task, "failure_class", None),
+            "gate_id": str(getattr(task, "gate_id", None))
+            if getattr(task, "gate_id", None)
+            else None,
         }
         if task.context:
             result["context"] = task.context

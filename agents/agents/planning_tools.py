@@ -171,6 +171,43 @@ def _deployment_address_issues(plan: SmartContractPlan) -> List[str]:
     return issues
 
 
+def _deployment_manifest_issues(plan: SmartContractPlan) -> List[str]:
+    issues: List[str] = []
+    target = plan.deployment_target
+    if not target.network or target.network != "avalanche_fuji":
+        issues.append(
+            "deployment_target.network must be 'avalanche_fuji' for the current runtime."
+        )
+    if not target.chain_id:
+        issues.append("deployment_target.chain_id is required.")
+    if not target.rpc_url_env_var:
+        issues.append("deployment_target.rpc_url_env_var is required.")
+    if not target.private_key_env_var:
+        issues.append("deployment_target.private_key_env_var is required.")
+
+    if len(plan.contracts) <= 1:
+        return issues
+
+    primary = [c for c in plan.contracts if c.deployment_role == "primary_deployable"]
+    if len(primary) != 1:
+        issues.append(
+            "Multi-contract plans must mark exactly one contract as deployment_role='primary_deployable'."
+        )
+
+    deploy_orders = [
+        c.deploy_order for c in plan.contracts if c.deployment_role and c.deploy_order
+    ]
+    if len(deploy_orders) != len(
+        [c for c in plan.contracts if c.deployment_role and c.deploy_order is not None]
+    ):
+        issues.append(
+            "Every deployable contract in a multi-contract plan must define deploy_order."
+        )
+    if len(deploy_orders) != len(set(deploy_orders)):
+        issues.append("deploy_order values must be unique across deployable contracts.")
+    return issues
+
+
 @tool
 def save_plan_draft(plan: SmartContractPlan) -> dict:
     """
@@ -336,6 +373,7 @@ def validate_plan(plan: SmartContractPlan) -> dict:
             issues.append(f"Contract '{contract.name}' has no constructor defined.")
 
     issues.extend(_deployment_address_issues(plan))
+    issues.extend(_deployment_manifest_issues(plan))
 
     if issues:
         return {

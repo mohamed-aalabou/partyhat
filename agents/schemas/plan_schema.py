@@ -2,6 +2,8 @@ from typing import Optional
 from enum import Enum
 from pydantic import BaseModel, Field
 
+from schemas.deployment_schema import DeploymentTarget
+
 
 class PlanStatus(str, Enum):
     """
@@ -59,6 +61,20 @@ class ContractPlan(BaseModel):
     description: str
     erc_template: Optional[str]
     dependencies: list[str]
+    deployment_role: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional deployment role. Use 'primary_deployable' for the contract "
+            "the default deployment pipeline should deploy."
+        ),
+    )
+    deploy_order: Optional[int] = Field(
+        default=None,
+        description=(
+            "Optional explicit deployment order for deployable contracts. "
+            "Required when more than one contract participates in deployment."
+        ),
+    )
     constructor: Constructor
     functions: list[ContractFunction]
 
@@ -68,6 +84,7 @@ class SmartContractPlan(BaseModel):
     project_name: str
     description: str
     status: PlanStatus = PlanStatus.DRAFT  # always starts as draft
+    deployment_target: DeploymentTarget
     contracts: list[ContractPlan]
 
 
@@ -75,12 +92,22 @@ EXAMPLE_PLAN = SmartContractPlan(
     project_name="PartyToken",
     description="A simple ERC-20 token with minting and burning capabilities",
     status=PlanStatus.DRAFT,
+    deployment_target=DeploymentTarget(
+        network="avalanche_fuji",
+        name="Avalanche Fuji",
+        description="Default Avalanche Fuji deployment target.",
+        chain_id=43113,
+        rpc_url_env_var="FUJI_RPC_URL",
+        private_key_env_var="FUJI_PRIVATE_KEY",
+    ),
     contracts=[
         ContractPlan(
             name="PartyToken",
             description="Main ERC-20 token contract",
             erc_template="ERC-20",
             dependencies=["Ownable"],
+            deployment_role="primary_deployable",
+            deploy_order=1,
             constructor=Constructor(
                 description="Sets token name, symbol, and mints initial supply to deployer",
                 inputs=[

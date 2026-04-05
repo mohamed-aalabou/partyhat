@@ -236,6 +236,304 @@ async def _migrate_pipeline_tasks_add_hierarchy(conn) -> None:
     )
 
 
+async def _migrate_pipeline_tasks_add_runtime_fields(conn) -> None:
+    await conn.execute(
+        text(
+            """
+            DO $$
+            BEGIN
+              IF EXISTS (
+                SELECT 1 FROM information_schema.tables
+                WHERE table_schema = 'public' AND table_name = 'pipeline_tasks'
+              ) THEN
+                IF NOT EXISTS (
+                  SELECT 1 FROM information_schema.columns
+                  WHERE table_schema = 'public'
+                    AND table_name = 'pipeline_tasks'
+                    AND column_name = 'retry_budget_key'
+                ) THEN
+                  ALTER TABLE pipeline_tasks ADD COLUMN retry_budget_key TEXT;
+                END IF;
+
+                IF NOT EXISTS (
+                  SELECT 1 FROM information_schema.columns
+                  WHERE table_schema = 'public'
+                    AND table_name = 'pipeline_tasks'
+                    AND column_name = 'retry_attempt'
+                ) THEN
+                  ALTER TABLE pipeline_tasks ADD COLUMN retry_attempt INTEGER DEFAULT 0;
+                END IF;
+
+                IF NOT EXISTS (
+                  SELECT 1 FROM information_schema.columns
+                  WHERE table_schema = 'public'
+                    AND table_name = 'pipeline_tasks'
+                    AND column_name = 'failure_class'
+                ) THEN
+                  ALTER TABLE pipeline_tasks ADD COLUMN failure_class TEXT;
+                END IF;
+
+                IF NOT EXISTS (
+                  SELECT 1 FROM information_schema.columns
+                  WHERE table_schema = 'public'
+                    AND table_name = 'pipeline_tasks'
+                    AND column_name = 'gate_id'
+                ) THEN
+                  ALTER TABLE pipeline_tasks ADD COLUMN gate_id UUID;
+                END IF;
+
+                UPDATE pipeline_tasks
+                SET retry_attempt = 0
+                WHERE retry_attempt IS NULL;
+
+                ALTER TABLE pipeline_tasks
+                  ALTER COLUMN retry_attempt SET DEFAULT 0;
+                ALTER TABLE pipeline_tasks
+                  ALTER COLUMN retry_attempt SET NOT NULL;
+              END IF;
+            END $$;
+            """
+        )
+    )
+    await conn.execute(
+        text(
+            """
+            CREATE INDEX IF NOT EXISTS ix_pipeline_tasks_retry_budget_key
+            ON pipeline_tasks (retry_budget_key);
+            """
+        )
+    )
+    await conn.execute(
+        text(
+            """
+            CREATE INDEX IF NOT EXISTS ix_pipeline_tasks_gate_id
+            ON pipeline_tasks (gate_id);
+            """
+        )
+    )
+
+
+async def _migrate_test_runs_runtime_fields(conn) -> None:
+    await conn.execute(
+        text(
+            """
+            DO $$
+            BEGIN
+              IF EXISTS (
+                SELECT 1 FROM information_schema.tables
+                WHERE table_schema = 'public' AND table_name = 'test_runs'
+              ) THEN
+                IF NOT EXISTS (
+                  SELECT 1 FROM information_schema.columns
+                  WHERE table_schema = 'public'
+                    AND table_name = 'test_runs'
+                    AND column_name = 'pipeline_run_id'
+                ) THEN
+                  ALTER TABLE test_runs ADD COLUMN pipeline_run_id UUID;
+                END IF;
+                IF NOT EXISTS (
+                  SELECT 1 FROM information_schema.columns
+                  WHERE table_schema = 'public'
+                    AND table_name = 'test_runs'
+                    AND column_name = 'pipeline_task_id'
+                ) THEN
+                  ALTER TABLE test_runs ADD COLUMN pipeline_task_id UUID;
+                END IF;
+                IF NOT EXISTS (
+                  SELECT 1 FROM information_schema.columns
+                  WHERE table_schema = 'public'
+                    AND table_name = 'test_runs'
+                    AND column_name = 'artifact_revision'
+                ) THEN
+                  ALTER TABLE test_runs ADD COLUMN artifact_revision INTEGER DEFAULT 0;
+                END IF;
+                IF NOT EXISTS (
+                  SELECT 1 FROM information_schema.columns
+                  WHERE table_schema = 'public'
+                    AND table_name = 'test_runs'
+                    AND column_name = 'stdout_path'
+                ) THEN
+                  ALTER TABLE test_runs ADD COLUMN stdout_path TEXT;
+                END IF;
+                IF NOT EXISTS (
+                  SELECT 1 FROM information_schema.columns
+                  WHERE table_schema = 'public'
+                    AND table_name = 'test_runs'
+                    AND column_name = 'stderr_path'
+                ) THEN
+                  ALTER TABLE test_runs ADD COLUMN stderr_path TEXT;
+                END IF;
+                IF NOT EXISTS (
+                  SELECT 1 FROM information_schema.columns
+                  WHERE table_schema = 'public'
+                    AND table_name = 'test_runs'
+                    AND column_name = 'exit_code'
+                ) THEN
+                  ALTER TABLE test_runs ADD COLUMN exit_code INTEGER;
+                END IF;
+                IF NOT EXISTS (
+                  SELECT 1 FROM information_schema.columns
+                  WHERE table_schema = 'public'
+                    AND table_name = 'test_runs'
+                    AND column_name = 'trace_id'
+                ) THEN
+                  ALTER TABLE test_runs ADD COLUMN trace_id TEXT;
+                END IF;
+
+                UPDATE test_runs
+                SET artifact_revision = 0
+                WHERE artifact_revision IS NULL;
+
+                ALTER TABLE test_runs
+                  ALTER COLUMN artifact_revision SET DEFAULT 0;
+                ALTER TABLE test_runs
+                  ALTER COLUMN artifact_revision SET NOT NULL;
+              END IF;
+            END $$;
+            """
+        )
+    )
+    await conn.execute(
+        text(
+            """
+            CREATE INDEX IF NOT EXISTS ix_test_runs_pipeline_run_id
+            ON test_runs (pipeline_run_id);
+            """
+        )
+    )
+    await conn.execute(
+        text(
+            """
+            CREATE INDEX IF NOT EXISTS ix_test_runs_pipeline_task_id
+            ON test_runs (pipeline_task_id);
+            """
+        )
+    )
+
+
+async def _migrate_deployments_runtime_fields(conn) -> None:
+    await conn.execute(
+        text(
+            """
+            DO $$
+            BEGIN
+              IF EXISTS (
+                SELECT 1 FROM information_schema.tables
+                WHERE table_schema = 'public' AND table_name = 'deployments'
+              ) THEN
+                IF NOT EXISTS (
+                  SELECT 1 FROM information_schema.columns
+                  WHERE table_schema = 'public'
+                    AND table_name = 'deployments'
+                    AND column_name = 'pipeline_run_id'
+                ) THEN
+                  ALTER TABLE deployments ADD COLUMN pipeline_run_id UUID;
+                END IF;
+                IF NOT EXISTS (
+                  SELECT 1 FROM information_schema.columns
+                  WHERE table_schema = 'public'
+                    AND table_name = 'deployments'
+                    AND column_name = 'pipeline_task_id'
+                ) THEN
+                  ALTER TABLE deployments ADD COLUMN pipeline_task_id UUID;
+                END IF;
+                IF NOT EXISTS (
+                  SELECT 1 FROM information_schema.columns
+                  WHERE table_schema = 'public'
+                    AND table_name = 'deployments'
+                    AND column_name = 'artifact_revision'
+                ) THEN
+                  ALTER TABLE deployments ADD COLUMN artifact_revision INTEGER DEFAULT 0;
+                END IF;
+                IF NOT EXISTS (
+                  SELECT 1 FROM information_schema.columns
+                  WHERE table_schema = 'public'
+                    AND table_name = 'deployments'
+                    AND column_name = 'stdout_path'
+                ) THEN
+                  ALTER TABLE deployments ADD COLUMN stdout_path TEXT;
+                END IF;
+                IF NOT EXISTS (
+                  SELECT 1 FROM information_schema.columns
+                  WHERE table_schema = 'public'
+                    AND table_name = 'deployments'
+                    AND column_name = 'stderr_path'
+                ) THEN
+                  ALTER TABLE deployments ADD COLUMN stderr_path TEXT;
+                END IF;
+                IF NOT EXISTS (
+                  SELECT 1 FROM information_schema.columns
+                  WHERE table_schema = 'public'
+                    AND table_name = 'deployments'
+                    AND column_name = 'exit_code'
+                ) THEN
+                  ALTER TABLE deployments ADD COLUMN exit_code INTEGER;
+                END IF;
+                IF NOT EXISTS (
+                  SELECT 1 FROM information_schema.columns
+                  WHERE table_schema = 'public'
+                    AND table_name = 'deployments'
+                    AND column_name = 'trace_id'
+                ) THEN
+                  ALTER TABLE deployments ADD COLUMN trace_id TEXT;
+                END IF;
+
+                UPDATE deployments
+                SET artifact_revision = 0
+                WHERE artifact_revision IS NULL;
+
+                ALTER TABLE deployments
+                  ALTER COLUMN artifact_revision SET DEFAULT 0;
+                ALTER TABLE deployments
+                  ALTER COLUMN artifact_revision SET NOT NULL;
+              END IF;
+            END $$;
+            """
+        )
+    )
+    await conn.execute(
+        text(
+            """
+            CREATE INDEX IF NOT EXISTS ix_deployments_pipeline_run_id
+            ON deployments (pipeline_run_id);
+            """
+        )
+    )
+    await conn.execute(
+        text(
+            """
+            CREATE INDEX IF NOT EXISTS ix_deployments_pipeline_task_id
+            ON deployments (pipeline_task_id);
+            """
+        )
+    )
+
+
+async def _migrate_plans_add_default_deployment_target(conn) -> None:
+    await conn.execute(
+        text(
+            """
+            UPDATE plans
+            SET plan_data = jsonb_set(
+              COALESCE(plan_data::jsonb, '{}'::jsonb),
+              '{deployment_target}',
+              jsonb_build_object(
+                'network', 'avalanche_fuji',
+                'name', 'Avalanche Fuji',
+                'description', 'Default Avalanche Fuji deployment target.',
+                'chain_id', 43113,
+                'rpc_url_env_var', 'FUJI_RPC_URL',
+                'private_key_env_var', 'FUJI_PRIVATE_KEY'
+              ),
+              true
+            )::json
+            WHERE plan_data IS NOT NULL
+              AND NOT ((plan_data::jsonb) ? 'deployment_target');
+            """
+        )
+    )
+
+
 async def create_tables() -> None:
     """Create all tables. Call on app startup or migrations."""
     if not os.getenv("DATABASE_URL"):
@@ -245,6 +543,10 @@ async def create_tables() -> None:
         await _migrate_users_email_to_wallet(conn)
         await _migrate_projects_add_screenshot_base64(conn)
         await _migrate_pipeline_tasks_add_hierarchy(conn)
+        await _migrate_pipeline_tasks_add_runtime_fields(conn)
+        await _migrate_test_runs_runtime_fields(conn)
+        await _migrate_deployments_runtime_fields(conn)
+        await _migrate_plans_add_default_deployment_target(conn)
 
 
 async def drop_tables() -> None:

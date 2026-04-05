@@ -8,30 +8,27 @@ class FakeMemoryManager:
         self.user_id = user_id
         self.project_id = project_id
 
-    def get_agent_state(self, agent_name: str) -> dict:
-        if agent_name == "deployment":
-            return {
-                "last_deploy_results": [
-                    {
-                        "pipeline_run_id": "run-123",
-                        "pipeline_task_id": "task-456",
-                        "exit_code": 1,
-                        "stdout": "large stdout",
-                    }
-                ]
+    def list_deployments(self, limit: int = 20) -> list[dict]:
+        return [
+            {
+                "pipeline_run_id": "run-123",
+                "pipeline_task_id": "task-456",
+                "exit_code": 1,
+                "stdout": "large stdout",
+                "trace_id": "trace-123",
             }
-        if agent_name == "testing":
-            return {
-                "last_test_results": [
-                    {
-                        "pipeline_run_id": "run-123",
-                        "pipeline_task_id": "task-789",
-                        "exit_code": 0,
-                        "stderr": "large stderr",
-                    }
-                ]
+        ]
+
+    def list_test_runs(self, limit: int = 20) -> list[dict]:
+        return [
+            {
+                "pipeline_run_id": "run-123",
+                "pipeline_task_id": "task-789",
+                "exit_code": 0,
+                "stderr": "large stderr",
+                "trace_id": "trace-456",
             }
-        return {}
+        ]
 
 
 async def _noop_ensure_project_context(project_id, user_id, session):
@@ -54,6 +51,7 @@ def test_pipeline_status_returns_new_metadata(monkeypatch):
             "project_id": project_id,
             "status": "failed",
             "failure_reason": "Forge deploy failed.",
+            "run": {"id": pipeline_run_id, "status": "failed"},
             "total_tasks": 1,
             "tasks": [
                 {
@@ -71,6 +69,8 @@ def test_pipeline_status_returns_new_metadata(monkeypatch):
                     "completed_at": None,
                 }
             ],
+            "gates": [],
+            "evaluations": [],
         }
 
     monkeypatch.setattr(api, "ensure_project_context", _noop_ensure_project_context)
@@ -92,6 +92,7 @@ def test_pipeline_status_returns_new_metadata(monkeypatch):
     }
     assert result["status"] == "failed"
     assert result["failure_reason"] == "Forge deploy failed."
+    assert result["run"]["id"] == "run-123"
     assert result["tasks"][0]["task_type"] == "deployment.execute_deploy"
     assert result["tasks"][0]["parent_task_id"] == "task-0"
     assert result["tasks"][0]["sequence_index"] == 0
@@ -112,6 +113,7 @@ def test_get_current_deployment_includes_pipeline_tags(monkeypatch):
 
     assert response.last_deploy_results[0]["pipeline_run_id"] == "run-123"
     assert response.last_deploy_results[0]["pipeline_task_id"] == "task-456"
+    assert response.last_deploy_results[0]["trace_id"] == "trace-123"
     assert "stdout" not in response.last_deploy_results[0]
 
 
@@ -130,4 +132,5 @@ def test_get_current_test_results_includes_pipeline_tags(monkeypatch):
 
     assert response.last_test_results[0]["pipeline_run_id"] == "run-123"
     assert response.last_test_results[0]["pipeline_task_id"] == "task-789"
+    assert response.last_test_results[0]["trace_id"] == "trace-456"
     assert "stderr" not in response.last_test_results[0]

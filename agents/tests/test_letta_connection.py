@@ -12,7 +12,7 @@ load_dotenv()
 def test_letta_connection():
     client = Letta(api_key=os.getenv("LETTA_API_KEY"))
 
-    agents = client.agents.list()
+    agents = list(client.agents.list())
 
     print("Letta connection successful!")
     print(f"Existing agents: {len(agents)}")

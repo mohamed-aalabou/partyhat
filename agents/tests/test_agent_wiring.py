@@ -33,8 +33,9 @@ def test_deployment_tools_include_fuji_workflow():
 
 def test_registry_contains_expected_agents():
     for intent in ["planning", "coding", "testing", "deployment", "audit"]:
+        agent = get_agent_for_intent(intent)
         assert intent in AGENTS
-        assert AGENTS[intent] is not None
+        assert AGENTS[intent] is agent
 
 
 def test_get_agent_for_intent_round_trip():

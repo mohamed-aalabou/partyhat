@@ -20,6 +20,7 @@ from agents.modal_runtime import (
     get_modal_app,
     get_modal_volume,
 )
+from agents.tracing import start_span
 
 
 def _get_memory_manager():
@@ -57,7 +58,18 @@ def generate_solidity_code_direct(request: CodeGenerationRequest) -> dict:
     llm = ChatOpenAI(model=model_name, temperature=0.1)
 
     try:
-        response = llm.invoke([HumanMessage(content=prompt)])
+        with start_span(
+            "model.call",
+            {
+                "task_type": "coding.generate_contracts",
+                "model": model_name,
+            },
+        ) as span:
+            response = llm.invoke([HumanMessage(content=prompt)])
+            usage = getattr(response, "usage_metadata", None) or {}
+            total_tokens = usage.get("total_tokens")
+            if total_tokens is not None:
+                span.set_attribute("token_count", int(total_tokens))
         generated_text = response.content or ""
     except Exception as e:
         return {"error": f"Failed to call Solidity generation model: {str(e)}"}
@@ -143,7 +155,14 @@ def save_code_artifact(artifact: CodeArtifact) -> dict:
         code = raw.pop("code", None)
 
         if code:
-            stored_path = storage.save_code(artifact, code)
+            with start_span(
+                "artifact.write",
+                {
+                    "artifact.path": artifact.path,
+                    "artifact.language": artifact.language,
+                },
+            ):
+                stored_path = storage.save_code(artifact, code)
             raw["path"] = stored_path
 
         artifacts: List[Dict[str, Any]] = coding_state.get("artifacts", [])

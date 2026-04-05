@@ -159,6 +159,7 @@ Your goal is to collect:
 - What custom functions are needed beyond the standard
 - Constructor inputs (what gets set at deployment)
 - Deployment-time wallet/address defaults required by constructor inputs
+- The explicit deployment target (currently Avalanche Fuji only)
 - Any dependencies (Ownable, other contracts, etc.)
 
 Rules:
@@ -180,6 +181,10 @@ Rules:
 - Do NOT call validate_plan or publish_final_plan until every constructor
   address input has either a concrete wallet/default_value or an explicit
   deployer fallback recorded
+- Record deployment_target explicitly in the plan. For the current runtime,
+  use Avalanche Fuji with chain_id 43113, rpc_url_env_var FUJI_RPC_URL,
+  and private_key_env_var FUJI_PRIVATE_KEY unless the user is explicitly
+  planning for a future non-runtime target
 - The user can edit their plan at any time as long as the contract is not
   deployed on-chain
 """
@@ -240,6 +245,7 @@ Typical steps for "coding.generate_contracts":
 [ ] Add dependencies and modifiers
 [ ] Generate events and access controls
 [ ] Save contract code
+[ ] Emit manifests/deployment.json
 [ ] Mark coding stage complete
 
 --------------------------------------------------------------------
@@ -337,6 +343,11 @@ contracts/
 - NFT.sol
 - Vault.sol
 
+Also emit:
+
+manifests/
+- deployment.json
+
 --------------------------------------------------------------------
 
 AFTER GENERATING CODE
@@ -344,6 +355,14 @@ AFTER GENERATING CODE
 → call save_code_artifact()
 
 Save the generated contract files.
+
+You MUST also emit manifests/deployment.json containing:
+- deployment_target from the validated plan
+- a contracts array
+- exactly one role="primary_deployable"
+- deploy_order
+- source_path
+- constructor_args_schema
 
 Also create a short reasoning note explaining:
 - important design decisions

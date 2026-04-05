@@ -14,8 +14,10 @@ from agents.db.crud import pending_task_sort_key
 def test_normalize_next_tasks_defaults_parent_and_sequence():
     current_task_id = str(uuid.uuid4())
     explicit_parent = str(uuid.uuid4())
+    pipeline_run_id = str(uuid.uuid4())
     current_task = SimpleNamespace(
         id=uuid.UUID(current_task_id),
+        pipeline_run_id=uuid.UUID(pipeline_run_id),
         task_type="coding.generate_contracts",
         assigned_to="coding",
         artifact_revision=0,
@@ -47,6 +49,9 @@ def test_normalize_next_tasks_defaults_parent_and_sequence():
         "testing": [],
         "deployment": [],
     }
+    task_tools._get_next_retry_attempt_sync = (
+        lambda pipeline_run_id, retry_budget_key: 0
+    )
     task_tools._get_plan_summary = lambda project_id, user_id: {"project_name": "PartyToken"}
     task_tools._update_revision_pointer = lambda project_id, user_id, revision: None
 
@@ -62,9 +67,13 @@ def test_normalize_next_tasks_defaults_parent_and_sequence():
     assert normalized[0]["parent_task_id"] == current_task_id
     assert normalized[0]["sequence_index"] == 0
     assert normalized[0]["artifact_revision"] == 1
+    assert normalized[0]["retry_budget_key"] == "testing.generate"
+    assert normalized[0]["retry_attempt"] == 0
     assert normalized[0]["context"]["plan_summary"]["project_name"] == "PartyToken"
     assert normalized[1]["parent_task_id"] == explicit_parent
     assert normalized[1]["sequence_index"] == 7
+    assert normalized[1]["retry_budget_key"] == "deployment.execute"
+    assert normalized[1]["retry_attempt"] == 0
 
 
 def test_complete_task_rejects_non_terminal_empty_completion(monkeypatch):
@@ -100,6 +109,7 @@ def test_complete_task_rejects_non_terminal_empty_completion(monkeypatch):
 
 def test_complete_task_passes_failed_status_and_normalized_subtasks(monkeypatch):
     current_task_id = uuid.uuid4()
+    pipeline_run_id = str(uuid.uuid4())
     captured = {}
 
     monkeypatch.setattr(
@@ -108,12 +118,13 @@ def test_complete_task_passes_failed_status_and_normalized_subtasks(monkeypatch)
     )
     monkeypatch.setattr(
         "agents.task_tools._get_context",
-        lambda: ("project-id", "user-id", "pipeline-run-id", str(current_task_id)),
+        lambda: ("project-id", "user-id", pipeline_run_id, str(current_task_id)),
     )
     monkeypatch.setattr(
         "agents.task_tools._get_current_task_sync",
         lambda pipeline_run_id, pipeline_task_id=None: SimpleNamespace(
             id=current_task_id,
+            pipeline_run_id=uuid.UUID(pipeline_run_id),
             task_type="deployment.execute_deploy",
             assigned_to="deployment",
             artifact_revision=1,
@@ -135,6 +146,10 @@ def test_complete_task_passes_failed_status_and_normalized_subtasks(monkeypatch)
     monkeypatch.setattr(
         "agents.task_tools._update_revision_pointer",
         lambda project_id, user_id, revision: None,
+    )
+    monkeypatch.setattr(
+        "agents.task_tools._get_next_retry_attempt_sync",
+        lambda pipeline_run_id, retry_budget_key: 2,
     )
 
     def fake_complete_and_create_sync(**kwargs):
@@ -174,6 +189,8 @@ def test_complete_task_passes_failed_status_and_normalized_subtasks(monkeypatch)
     assert captured["next_tasks"][0]["parent_task_id"] == str(current_task_id)
     assert captured["next_tasks"][0]["sequence_index"] == 0
     assert captured["next_tasks"][0]["artifact_revision"] == 1
+    assert captured["next_tasks"][0]["retry_budget_key"] == "coding"
+    assert captured["next_tasks"][0]["retry_attempt"] == 2
     assert captured["next_tasks"][0]["context"]["failure_context"]["task_id"] == str(current_task_id)
 
 

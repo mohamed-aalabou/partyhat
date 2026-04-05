@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, ForeignKey, Integer, Text, JSON, Index
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, Text, JSON, Index
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -95,6 +95,24 @@ class Project(Base):
         back_populates="project",
         cascade="all, delete-orphan",
         order_by="PipelineTask.created_at.desc()",
+    )
+    pipeline_runs: Mapped[list["PipelineRun"]] = relationship(
+        "PipelineRun",
+        back_populates="project",
+        cascade="all, delete-orphan",
+        order_by="PipelineRun.created_at.desc()",
+    )
+    pipeline_human_gates: Mapped[list["PipelineHumanGate"]] = relationship(
+        "PipelineHumanGate",
+        back_populates="project",
+        cascade="all, delete-orphan",
+        order_by="PipelineHumanGate.created_at.desc()",
+    )
+    pipeline_evaluations: Mapped[list["PipelineEvaluation"]] = relationship(
+        "PipelineEvaluation",
+        back_populates="project",
+        cascade="all, delete-orphan",
+        order_by="PipelineEvaluation.created_at.desc()",
     )
 
 
@@ -230,6 +248,21 @@ class TestRun(Base):
     tests_passed: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # The full Foundry output stored here, not in Letta
     output: Mapped[str | None] = mapped_column(Text, nullable=True)
+    pipeline_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        nullable=True,
+        index=True,
+    )
+    pipeline_task_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        nullable=True,
+        index=True,
+    )
+    artifact_revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    stdout_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    stderr_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    exit_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    trace_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),
@@ -265,6 +298,21 @@ class Deployment(Base):
     snowtrace_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     # "success" | "failed"
     status: Mapped[str] = mapped_column(Text, nullable=False, default="success")
+    pipeline_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        nullable=True,
+        index=True,
+    )
+    pipeline_task_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        nullable=True,
+        index=True,
+    )
+    artifact_revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    stdout_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    stderr_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    exit_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    trace_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),
@@ -302,6 +350,211 @@ class Message(Base):
     )
 
     project: Mapped["Project"] = relationship("Project", back_populates="messages")
+
+
+class PipelineRun(Base):
+    __tablename__ = "pipeline_runs"
+    __table_args__ = (
+        Index("ix_pipeline_runs_project_created", "project_id", "created_at"),
+        Index("ix_pipeline_runs_project_status", "project_id", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    plan_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("plans.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    status: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        default="created",
+        comment=(
+            "created | running | waiting_for_approval | cancellation_requested | "
+            "cancelled | completed | failed"
+        ),
+    )
+    current_stage: Mapped[str | None] = mapped_column(Text, nullable=True)
+    current_task_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        nullable=True,
+        index=True,
+    )
+    deployment_target: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    cancellation_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    cancellation_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    terminal_deployment_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        nullable=True,
+    )
+    failure_class: Mapped[str | None] = mapped_column(Text, nullable=True)
+    failure_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    trace_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+    )
+    started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    paused_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    resumed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    project: Mapped["Project"] = relationship("Project", back_populates="pipeline_runs")
+
+
+class PipelineHumanGate(Base):
+    __tablename__ = "pipeline_human_gates"
+    __table_args__ = (
+        Index("ix_pipeline_human_gates_run_created", "pipeline_run_id", "created_at"),
+        Index("ix_pipeline_human_gates_run_status", "pipeline_run_id", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    pipeline_run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("pipeline_runs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    pipeline_task_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        nullable=True,
+        index=True,
+    )
+    evaluation_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        nullable=True,
+        index=True,
+    )
+    gate_type: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        default="pending",
+        comment="pending | approved | rejected | overridden",
+    )
+    requested_payload: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    resolved_payload: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    requested_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    resolved_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    requested_by: Mapped[str | None] = mapped_column(Text, nullable=True)
+    resolved_by: Mapped[str | None] = mapped_column(Text, nullable=True)
+    trace_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+    )
+    resolved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    project: Mapped["Project"] = relationship(
+        "Project", back_populates="pipeline_human_gates"
+    )
+
+
+class PipelineEvaluation(Base):
+    __tablename__ = "pipeline_evaluations"
+    __table_args__ = (
+        Index(
+            "ix_pipeline_evaluations_run_stage_created",
+            "pipeline_run_id",
+            "stage",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    pipeline_run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("pipeline_runs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    pipeline_task_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        nullable=True,
+        index=True,
+    )
+    stage: Mapped[str] = mapped_column(Text, nullable=False)
+    evaluation_type: Mapped[str] = mapped_column(Text, nullable=False)
+    blocking: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    status: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        default="passed",
+        comment="passed | failed | advisory",
+    )
+    summary: Mapped[str] = mapped_column(Text, nullable=False)
+    details_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    artifact_revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    trace_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    project: Mapped["Project"] = relationship(
+        "Project", back_populates="pipeline_evaluations"
+    )
 
 
 class PipelineTask(Base):
@@ -402,7 +655,30 @@ class PipelineTask(Base):
         Text,
         nullable=False,
         default="pending",
-        comment="pending | in_progress | completed | failed",
+        comment="pending | in_progress | waiting_for_approval | completed | failed | cancelled",
+    )
+    retry_budget_key: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        index=True,
+        comment="Retry policy key for this task.",
+    )
+    retry_attempt: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        comment="Monotonic retry attempt for the retry policy key on this run.",
+    )
+    failure_class: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        comment="Canonical failure classification for retries and gates.",
+    )
+    gate_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        nullable=True,
+        index=True,
+        comment="Optional human gate associated with this task.",
     )
     context: Mapped[dict | None] = mapped_column(
         JSON,

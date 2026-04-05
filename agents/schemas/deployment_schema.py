@@ -19,6 +19,26 @@ class DeploymentTarget(BaseModel):
     private_key_env_var: Optional[str] = None
 
 
+class ConstructorArgSchema(BaseModel):
+    name: str
+    type: str
+    source: str
+    default_value: Optional[str] = None
+
+
+class DeploymentManifestContract(BaseModel):
+    name: str
+    role: str
+    deploy_order: int
+    source_path: str
+    constructor_args_schema: List[ConstructorArgSchema] = Field(default_factory=list)
+
+
+class DeploymentManifest(BaseModel):
+    deployment_target: DeploymentTarget
+    contracts: List[DeploymentManifestContract]
+
+
 class DeploymentRecord(BaseModel):
     target: DeploymentTarget
     tx_hash: Optional[str] = None

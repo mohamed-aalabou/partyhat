@@ -11,6 +11,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from dotenv import load_dotenv
 from letta_client import Letta
+from agents.pipeline_specs import default_deployment_target_payload
 from agents.pipeline_context import extract_plan_summary
 
 try:
@@ -320,6 +321,7 @@ class MemoryManager:
           - a copy of the current plan JSON
           - a copy of the previous plan JSON (one-step history only)
         """
+        plan = self._normalize_plan_payload(plan)
         project_uuid = self._project_uuid()
         status = plan.get("status", "draft")
 
@@ -360,12 +362,13 @@ class MemoryManager:
 
             plan_row = self._db_call(lambda session: db_get_plan(session, project_uuid))
             if plan_row:
-                return plan_row.plan_data
+                return self._normalize_plan_payload(plan_row.plan_data)
 
         # Fallback: read from Letta planning slice (current_plan).
         data, _ = self._read_user_block()
         planning = self._get_agent_slice(data, "planning")
-        return planning.get("current_plan") or None
+        plan = planning.get("current_plan") or None
+        return self._normalize_plan_payload(plan) if isinstance(plan, dict) else plan
 
     def get_plan_history(self) -> list:
         """Plan history is no longer stored; return empty list."""
@@ -539,6 +542,13 @@ class MemoryManager:
         tests_run: int | None = None,
         tests_passed: int | None = None,
         output: str | None = None,
+        pipeline_run_id: str | None = None,
+        pipeline_task_id: str | None = None,
+        artifact_revision: int = 0,
+        stdout_path: str | None = None,
+        stderr_path: str | None = None,
+        exit_code: int | None = None,
+        trace_id: str | None = None,
     ) -> None:
         """
         Save a test run result.
@@ -552,7 +562,23 @@ class MemoryManager:
 
             run = self._db_call(
                 lambda session: db_save_run(
-                    session, project_uuid, status, tests_run, tests_passed, output
+                    session,
+                    project_uuid,
+                    status,
+                    tests_run,
+                    tests_passed,
+                    output,
+                    pipeline_run_id=uuid.UUID(pipeline_run_id)
+                    if pipeline_run_id
+                    else None,
+                    pipeline_task_id=uuid.UUID(pipeline_task_id)
+                    if pipeline_task_id
+                    else None,
+                    artifact_revision=artifact_revision,
+                    stdout_path=stdout_path,
+                    stderr_path=stderr_path,
+                    exit_code=exit_code,
+                    trace_id=trace_id,
                 )
             )
             # Updating Letta pointer
@@ -585,6 +611,15 @@ class MemoryManager:
             "tests_run": run.tests_run,
             "tests_passed": run.tests_passed,
             "output": run.output,
+            "pipeline_run_id": str(run.pipeline_run_id) if run.pipeline_run_id else None,
+            "pipeline_task_id": str(run.pipeline_task_id)
+            if run.pipeline_task_id
+            else None,
+            "artifact_revision": run.artifact_revision,
+            "stdout_path": run.stdout_path,
+            "stderr_path": run.stderr_path,
+            "exit_code": run.exit_code,
+            "trace_id": run.trace_id,
             "created_at": run.created_at.isoformat(),
         }
 
@@ -596,6 +631,13 @@ class MemoryManager:
         tx_hash: str | None = None,
         snowtrace_url: str | None = None,
         network: str = "avalanche_fuji",
+        pipeline_run_id: str | None = None,
+        pipeline_task_id: str | None = None,
+        artifact_revision: int = 0,
+        stdout_path: str | None = None,
+        stderr_path: str | None = None,
+        exit_code: int | None = None,
+        trace_id: str | None = None,
     ) -> None:
         """
         Save a deployment record.
@@ -617,6 +659,17 @@ class MemoryManager:
                     tx_hash=tx_hash,
                     snowtrace_url=snowtrace_url,
                     network=network,
+                    pipeline_run_id=uuid.UUID(pipeline_run_id)
+                    if pipeline_run_id
+                    else None,
+                    pipeline_task_id=uuid.UUID(pipeline_task_id)
+                    if pipeline_task_id
+                    else None,
+                    artifact_revision=artifact_revision,
+                    stdout_path=stdout_path,
+                    stderr_path=stderr_path,
+                    exit_code=exit_code,
+                    trace_id=trace_id,
                 )
             )
 
@@ -658,8 +711,83 @@ class MemoryManager:
             "tx_hash": dep.tx_hash,
             "snowtrace_url": dep.snowtrace_url,
             "network": dep.network,
+            "pipeline_run_id": str(dep.pipeline_run_id) if dep.pipeline_run_id else None,
+            "pipeline_task_id": str(dep.pipeline_task_id)
+            if dep.pipeline_task_id
+            else None,
+            "artifact_revision": dep.artifact_revision,
+            "stdout_path": dep.stdout_path,
+            "stderr_path": dep.stderr_path,
+            "exit_code": dep.exit_code,
+            "trace_id": dep.trace_id,
             "created_at": dep.created_at.isoformat(),
         }
+
+    def list_test_runs(self, limit: int = 20) -> list[dict]:
+        project_uuid = self._project_uuid()
+        if not project_uuid or not self._db_available:
+            return []
+
+        from agents.db.crud import list_test_runs as db_list_test_runs
+
+        rows = self._db_call(
+            lambda session: db_list_test_runs(session, project_uuid, limit=limit)
+        )
+        return [
+            {
+                "status": row.status,
+                "tests_run": row.tests_run,
+                "tests_passed": row.tests_passed,
+                "output": row.output,
+                "pipeline_run_id": str(row.pipeline_run_id)
+                if row.pipeline_run_id
+                else None,
+                "pipeline_task_id": str(row.pipeline_task_id)
+                if row.pipeline_task_id
+                else None,
+                "artifact_revision": row.artifact_revision,
+                "stdout_path": row.stdout_path,
+                "stderr_path": row.stderr_path,
+                "exit_code": row.exit_code,
+                "trace_id": row.trace_id,
+                "created_at": row.created_at.isoformat(),
+            }
+            for row in rows or []
+        ]
+
+    def list_deployments(self, limit: int = 20) -> list[dict]:
+        project_uuid = self._project_uuid()
+        if not project_uuid or not self._db_available:
+            return []
+
+        from agents.db.crud import list_deployments as db_list_deployments
+
+        rows = self._db_call(
+            lambda session: db_list_deployments(session, project_uuid, limit=limit)
+        )
+        return [
+            {
+                "status": row.status,
+                "contract_name": row.contract_name,
+                "deployed_address": row.deployed_address,
+                "tx_hash": row.tx_hash,
+                "snowtrace_url": row.snowtrace_url,
+                "network": row.network,
+                "pipeline_run_id": str(row.pipeline_run_id)
+                if row.pipeline_run_id
+                else None,
+                "pipeline_task_id": str(row.pipeline_task_id)
+                if row.pipeline_task_id
+                else None,
+                "artifact_revision": row.artifact_revision,
+                "stdout_path": row.stdout_path,
+                "stderr_path": row.stderr_path,
+                "exit_code": row.exit_code,
+                "trace_id": row.trace_id,
+                "created_at": row.created_at.isoformat(),
+            }
+            for row in rows or []
+        ]
 
     def save_user_profile(
         self,
@@ -744,6 +872,13 @@ class MemoryManager:
         self._ensure_agents_structure(data)
         data.setdefault("agents", {})[agent_name] = state
         self._write_user_block(data, block)
+
+    def _normalize_plan_payload(self, plan: dict | None) -> dict | None:
+        if not isinstance(plan, dict):
+            return plan
+        normalized = dict(plan)
+        normalized.setdefault("deployment_target", default_deployment_target_payload())
+        return normalized
 
 
 if __name__ == "__main__":
