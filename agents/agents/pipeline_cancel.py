@@ -14,7 +14,8 @@ from datetime import datetime, timezone
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from agents.db.models import PipelineRun
+from agents.db.models import PipelineRun, PipelineRunSnapshot
+from agents.pipeline_status import serialize_run
 
 
 def _get_sync_url() -> str:
@@ -68,6 +69,21 @@ def cancel_pipeline_run(pipeline_run_id: str, reason: str | None = None) -> bool
         if run.status not in {"completed", "failed", "cancelled"}:
             run.status = "cancellation_requested"
         run.updated_at = datetime.now(timezone.utc)
+        snapshot = session.execute(
+            select(PipelineRunSnapshot).where(
+                PipelineRunSnapshot.pipeline_run_id == run.id
+            )
+        ).scalar_one_or_none()
+        if snapshot is not None:
+            payload = dict(snapshot.snapshot_json or {})
+            payload["status"] = run.status
+            payload["failure_reason"] = payload.get("failure_reason")
+            payload["run"] = serialize_run(run)
+            snapshot.status = run.status
+            snapshot.failure_reason = payload.get("failure_reason")
+            snapshot.snapshot_json = payload
+            snapshot.version = int(snapshot.version or 0) + 1
+            snapshot.updated_at = run.updated_at
         session.commit()
         return True
     except Exception:

@@ -37,9 +37,18 @@ def default_foundry_remappings() -> list[str]:
 
 def build_foundry_bootstrap_cmd(root: str, command: str) -> str:
     quoted_root = shlex.quote(root)
+    bootstrap_guard = (
+        "if [ ! -f .partyhat-foundry-ready ] "
+        "|| [ ! -d lib/forge-std ] "
+        "|| [ ! -d lib/openzeppelin-contracts ] "
+        "|| [ ! -d lib/openzeppelin-contracts-upgradeable ] "
+        "|| [ ! -f lib/chainlink-evm/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol ] "
+        "|| [ ! -f remappings.txt ]; then "
+    )
     return (
         "set -e; "
         + f"cd {quoted_root}; "
+        + bootstrap_guard
         + "mkdir -p lib; "
         + "if [ ! -d lib/forge-std ]; then "
         + "  if [ -d /opt/foundry-deps/forge-std ]; then cp -R /opt/foundry-deps/forge-std lib/forge-std; "
@@ -79,5 +88,7 @@ def build_foundry_bootstrap_cmd(root: str, command: str) -> str:
         + "|| echo '@chainlink/contracts/=lib/chainlink-evm/contracts/' >> remappings.txt; "
         + "grep -qxF '@chainlink/contracts/src/v0.8/interfaces/=lib/chainlink-evm/contracts/src/v0.8/shared/interfaces/' remappings.txt "
         + "|| echo '@chainlink/contracts/src/v0.8/interfaces/=lib/chainlink-evm/contracts/src/v0.8/shared/interfaces/' >> remappings.txt; "
+        + "touch .partyhat-foundry-ready; "
+        + "fi; "
         + command
     )

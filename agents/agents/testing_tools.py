@@ -15,6 +15,7 @@ from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
 from pydantic import BaseModel, Field
 
+from agents.contract_identity import validate_artifact_for_save
 from schemas.coding_schema import CodeArtifact
 from agents.code_storage import get_code_storage, save_execution_logs
 from agents.planning_tools import get_current_plan as planning_get_current_plan
@@ -67,9 +68,7 @@ def _record_test_result(
     )
 
     mm = _get_memory_manager()
-    data, block = mm._read_user_block()  # type: ignore[attr-defined]
-    mm._ensure_agents_structure(data)  # type: ignore[attr-defined]
-    testing_state = data["agents"]["testing"]
+    testing_state = mm.get_agent_state("testing")
 
     history: List[Dict[str, Any]] = testing_state.get("last_test_results", [])
     entry = {
@@ -88,11 +87,7 @@ def _record_test_result(
     history.append(entry)
     testing_state["last_test_results"] = history
     testing_state["last_test_status"] = "passed" if exit_code == 0 else "failed"
-
-    mm.client.blocks.update(  # type: ignore[attr-defined]
-        block.id,
-        value=mm._serialize(data),  # type: ignore[attr-defined]
-    )
+    mm.set_agent_state("testing", testing_state)
     return entry
 
 
@@ -307,14 +302,16 @@ def save_test_artifact(artifact: CodeArtifact) -> Dict[str, Any]:
     """
     try:
         mm = _get_memory_manager()
-        data, block = mm._read_user_block()  # type: ignore[attr-defined]
-        mm._ensure_agents_structure(data)  # type: ignore[attr-defined]
-        testing_state = data["agents"]["testing"]
+        testing_state = mm.get_agent_state("testing")
+        plan = mm.get_plan()
 
         storage = get_code_storage()
 
         raw = artifact.model_dump()
         code = raw.pop("code", None)
+        raw, issues = validate_artifact_for_save(plan, raw)
+        if issues:
+            return {"error": "; ".join(issues)}
 
         if code:
             with start_span(
@@ -330,11 +327,7 @@ def save_test_artifact(artifact: CodeArtifact) -> Dict[str, Any]:
         artifacts: List[Dict[str, Any]] = testing_state.get("artifacts", [])
         artifacts.append(raw)
         testing_state["artifacts"] = artifacts
-
-        mm.client.blocks.update(  # type: ignore[attr-defined]
-            block.id,
-            value=mm._serialize(data),  # type: ignore[attr-defined]
-        )
+        mm.set_agent_state("testing", testing_state)
 
         mm.log_agent_action(
             agent_name="testing",
@@ -485,7 +478,7 @@ def run_foundry_tests(
                 ),
                 tests_run=None,
                 tests_passed=None,
-                output=f"stdout:\n{stdout}\n\nstderr:\n{stderr}",
+                output=compact_execution_summary(exit_code or 0, stdout, stderr),
                 pipeline_run_id=pipeline_run_id,
                 pipeline_task_id=pipeline_task_id,
                 stdout_path=stdout_path,
@@ -554,7 +547,7 @@ def run_foundry_tests(
                     status="failed",
                     tests_run=None,
                     tests_passed=None,
-                    output=f"stdout:\n\n\nstderr:\n{str(e)}",
+                    output=compact_execution_summary(1, "", str(e)),
                     pipeline_run_id=pipeline_run_id,
                     pipeline_task_id=pipeline_task_id,
                     stdout_path=entry["stdout_path"],
@@ -590,9 +583,7 @@ def save_testing_note(note: str) -> Dict[str, Any]:
     """
     try:
         mm = _get_memory_manager()
-        data, block = mm._read_user_block()  # type: ignore[attr-defined]
-        mm._ensure_agents_structure(data)  # type: ignore[attr-defined]
-        testing_state = data["agents"]["testing"]
+        testing_state = mm.get_agent_state("testing")
 
         notes: List[Dict[str, Any]] = testing_state.get("notes", [])
         notes.append(
@@ -602,11 +593,7 @@ def save_testing_note(note: str) -> Dict[str, Any]:
             }
         )
         testing_state["notes"] = notes
-
-        mm.client.blocks.update(  # type: ignore[attr-defined]
-            block.id,
-            value=mm._serialize(data),  # type: ignore[attr-defined]
-        )
+        mm.set_agent_state("testing", testing_state)
 
         mm.log_agent_action(
             agent_name="testing",

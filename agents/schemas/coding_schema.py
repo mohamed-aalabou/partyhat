@@ -32,6 +32,10 @@ class CodeArtifact(BaseModel):
         default_factory=list,
         description="Names of contracts or primary units defined in this artifact.",
     )
+    plan_contract_ids: List[str] = Field(
+        default_factory=list,
+        description="Stable planned contract identifiers linked to this artifact.",
+    )
     related_plan_id: Optional[str] = Field(
         default=None,
         description="Identifier or version/hash of the planning artifact this code was generated from.",
@@ -56,4 +60,3 @@ class CodeReviewComment(BaseModel):
     file_path: str
     line: Optional[int] = None
     comment: str
-

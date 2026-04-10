@@ -1,85 +1,131 @@
-# PartyHat API — Endpoints & Frontend Integration
+# PartyHat API — Pipeline UX & Frontend Integration
 
-This document describes the PartyHat API endpoints, how to call them, and how to integrate them into a frontend.
+This document describes the PartyHat API endpoints, how to call them, and how to integrate them into a frontend built around the detached planning + pipeline UX.
 
 **Base URL (local):** `http://localhost:8000`  
-**CORS:** Allowed origins are `http://localhost:3000` and `http://localhost:3001`.
+**CORS:** Allowed origins currently include `http://localhost:3000`, `http://localhost:3001`, `https://partyhat-app.vercel.app`, and `https://partyhat-backend.onrender.com`.
 
 ---
 
 ## Pushing the schema to the database
 
-The app uses SQLAlchemy with `create_all`: it **creates** missing tables but does **not** alter existing ones.
+The app uses SQLAlchemy with `create_all`: it creates missing tables but does not alter existing ones.
 
-**Option 1 — Start the API (creates tables on startup)**  
+**Option 1 - Start the API (creates tables on startup)**
+
 If `DATABASE_URL` is set, tables are created when the server starts:
 
 ```bash
 cd agents && uv run uvicorn api:app --reload --port 8000
 ```
 
-**Option 2 — Run the sync script (no server)**  
+**Option 2 - Run the sync script (no server)**
+
 From the repo root, with `DATABASE_URL` in `agents/.env`:
 
 ```bash
 cd agents && uv run python sync_schema.py
 ```
 
-**Existing database with the old `email` column?**  
-`create_all` will not rename `email` → `wallet`. Either:
+**Existing database with the old `email` column?**
 
-- **Reset (data loss):** use a one-off script that calls `drop_tables()` then `create_tables()` from `agents.db`, or
-- **Migrate:** run SQL on your Postgres instance:
-  ```sql
-  ALTER TABLE users RENAME COLUMN email TO wallet;
-  ```
+`create_all` will not rename `email` to `wallet`. Either:
+
+- Reset with data loss: use a one-off script that calls `drop_tables()` then `create_tables()` from `agents.db`
+- Migrate in Postgres:
+
+```sql
+ALTER TABLE users RENAME COLUMN email TO wallet;
+```
 
 ---
 
-## Request context (project & user)
+## Request context
 
-Many endpoints are **project- and user-scoped**. You can pass context in two ways:
+Many endpoints are project- and user-scoped. You can pass context in two ways:
 
-1. **Headers (recommended)**
+1. Headers (recommended)
    - `X-Project-Id`: project UUID or `"default"`
    - `X-User-Id`: user UUID or `"default"`
+2. Body or query
+   - Some endpoints accept `project_id` and `user_id` in the request body or query for backward compatibility
 
-2. **Body or query**
-   - Some endpoints accept `project_id` and `user_id` in the request body or as query parameters for backward compatibility.
+If you omit both, `project_id` and `user_id` default to `"default"`. For project-scoped memory, persisted chat, pipeline state, and artifact storage, use real project and user IDs and ensure `DATABASE_URL` is set.
 
-If you omit both, `project_id` and `user_id` default to `"default"`. For project-scoped memory and sandbox, use real project/user IDs and ensure `DATABASE_URL` is set.
+Pipeline execution endpoints require real project and user IDs. Do not rely on `"default"` there.
+
+---
+
+## Recommended frontend flow
+
+The recommended frontend flow is:
+
+1. Resolve or create the user with `POST /users`
+2. Create or select a project with `POST /projects` or `GET /projects`
+3. Generate a planning `session_id` in the frontend, for example with `crypto.randomUUID()`
+4. Open `GET /state/stream` early and keep it open while the project is active
+5. Start and continue planning through `POST /agent/message/stream` with `intent: "planning"`
+6. Read durable plan state from `GET /state/stream` or `GET /plan/current`
+7. If needed, explicitly mark the current plan ready with `POST /plan/approve`
+8. Start detached execution with `POST /pipeline/run`
+9. Open `GET /pipeline/events` for the replayable timeline and use `GET /pipeline/status` for durable run state and recovery
+10. Resolve any human gate with a gate decision endpoint, then call `POST /pipeline/resume`
+11. Read generated outputs from `GET /coding/current`, `GET /testing/current`, `GET /deployment/current`, `GET /artifacts/tree`, and `GET /artifacts/file`
+
+Treat the backend as three complementary channels:
+
+- `GET /state/stream` is the best way to stay up to date on the latest saved plan, code artifact metadata, and deployment metadata
+- `GET /pipeline/events` is the replayable pipeline timeline for progress rendering and run logs
+- `GET /pipeline/status` is the authoritative durable state for the current or latest pipeline run
+
+Persist at least:
+
+- `user_id`
+- `project_id`
+- `session_id`
+- `pipeline_run_id`
+- `last_pipeline_event_seq`
+- `pending_gate_id` when a gate is open
 
 ---
 
 ## Endpoints overview
 
-| Method | Path                     | Description                                        |
-| ------ | ------------------------ | -------------------------------------------------- |
-| GET    | `/health`                | Health check                                       |
-| POST   | `/users`                 | Create or resolve user by wallet (wallet required) |
-| POST   | `/projects`              | Create project                                     |
-| GET    | `/projects`              | List projects for a user                           |
-| GET    | `/users/{user_id}/projects` | List projects for a user (alias route)          |
-| GET    | `/projects/{project_id}` | Get one project                                    |
-| PATCH  | `/projects/{project_id}` | Partially update project fields                    |
-| GET    | `/messages`              | List persisted chat messages for a project         |
-| POST   | `/plan/start`            | Start planning session                             |
-| POST   | `/plan/message`          | Send message to planning agent                     |
-| GET    | `/plan/current`          | Get current plan                                   |
-| POST   | `/plan/approve`          | Approve plan (ready for code gen)                  |
-| GET    | `/coding/current`        | Get current code artifacts                         |
-| POST   | `/coding/generate`       | Generate Solidity from goal                        |
-| GET    | `/deployment/current`    | Get last deploy results                            |
-| GET    | `/testing/current`      | Get last test results                              |
-| GET    | `/artifacts/tree`        | Artifact directory tree                            |
-| GET    | `/artifacts/file`        | Get artifact file content                          |
-| GET    | `/memory/full`           | Full memory snapshot (debug)                       |
-| POST   | `/agent/message`         | Routed message by intent                           |
-| POST   | `/agent/message/stream`  | Streamed routed message (SSE)                      |
+| Method | Path | Description |
+| ------ | ---- | ----------- |
+| GET | `/health` | Health check |
+| POST | `/users` | Create or resolve a user by wallet |
+| POST | `/projects` | Create a project |
+| GET | `/projects` | List projects for a user |
+| GET | `/users/{user_id}/projects` | List projects for a user (alias route) |
+| GET | `/projects/{project_id}` | Get one project |
+| PATCH | `/projects/{project_id}` | Partially update project fields |
+| GET | `/messages` | List persisted chat messages for a project or session |
+| POST | `/agent/message/stream` | Primary streamed routed chat endpoint for planning and agent interactions |
+| GET | `/plan/current` | Get the current saved plan |
+| GET | `/state/stream` | Best live feed for saved plan, code artifact metadata, and deployment metadata |
+| POST | `/plan/approve` | Explicitly mark the current plan ready |
+| POST | `/pipeline/run` | Start a detached pipeline run |
+| GET | `/pipeline/events` | Replayable SSE timeline for a pipeline run |
+| GET | `/pipeline/status` | Authoritative durable pipeline status, tasks, gates, and evaluations |
+| POST | `/pipeline/resume` | Resume a paused or gate-resolved pipeline run |
+| POST | `/pipeline/cancel` | Request pipeline cancellation |
+| POST | `/pipeline/gates/{gate_id}/approve` | Approve a pending `pre_deploy` gate |
+| POST | `/pipeline/gates/{gate_id}/reject` | Reject a pending gate |
+| POST | `/pipeline/gates/{gate_id}/override` | Override a pending `override` gate |
+| GET | `/coding/current` | Get current code artifact metadata |
+| POST | `/coding/generate` | One-shot Solidity generation helper |
+| GET | `/testing/current` | Get the latest compact test result history |
+| GET | `/deployment/current` | Get the latest compact deployment result history |
+| GET | `/artifacts/tree` | Artifact directory tree |
+| GET | `/artifacts/file` | Artifact file content |
+| POST | `/plan/message` | Legacy non-stream planning fallback |
+| POST | `/agent/message` | Legacy non-stream routed chat. Do not use for new frontend work |
+| GET | `/memory/full` | Full memory snapshot for debugging |
 
 ---
 
-## Health & status
+## Health
 
 ### `GET /health`
 
@@ -87,32 +133,34 @@ If you omit both, `project_id` and `user_id` default to `"default"`. For project
 
 ```json
 {
-	"status": "ok",
-	"service": "partyhat-agents"
+  "status": "ok",
+  "service": "partyhat-agents"
 }
 ```
 
-**Frontend:** Use for readiness checks and “API connected” indicators.
+**Frontend:** Use for readiness checks and API connectivity indicators.
 
 ---
 
-## Users & projects
+## Users and projects
 
 ### `POST /users`
 
-Create or resolve a user by wallet. Requires `wallet`. If the wallet is already linked to a user, returns that user's `user_id`; otherwise creates a new user, links the wallet, and returns the new `user_id`.
+Create or resolve a user by wallet. If the wallet is already linked to a user, this returns the existing `user_id`. Otherwise it creates a new user and links the wallet.
 
-**Query (required):** `wallet` (string) — e.g. Ethereum address
+**Query**
+
+- `wallet` (required): wallet address string
 
 **Response:** `200 OK`
 
 ```json
 {
-	"user_id": "550e8400-e29b-41d4-a716-446655440000"
+  "user_id": "550e8400-e29b-41d4-a716-446655440000"
 }
 ```
 
-**Errors:** `503` if `DATABASE_URL` is not configured. `422` if `wallet` is missing.
+**Errors:** `503` when `DATABASE_URL` is not configured, `422` when `wallet` is missing.
 
 ---
 
@@ -120,23 +168,25 @@ Create or resolve a user by wallet. Requires `wallet`. If the wallet is already 
 
 Create a new project for a user.
 
-**Body:**
+**Body**
 
 ```json
 {
-	"user_id": "550e8400-e29b-41d4-a716-446655440000",
-	"name": "My Token Project"
+  "user_id": "550e8400-e29b-41d4-a716-446655440000",
+  "name": "My Token Project",
+  "screenshot_base64": null
 }
 ```
 
-- `user_id` (string, required): UUID of the user.
-- `name` (string, optional): Project name.
+- `user_id` is required
+- `name` is optional
+- `screenshot_base64` is optional
 
 **Response:** `200 OK`
 
 ```json
 {
-	"project_id": "660e8400-e29b-41d4-a716-446655440001"
+  "project_id": "660e8400-e29b-41d4-a716-446655440001"
 }
 ```
 
@@ -148,18 +198,21 @@ Create a new project for a user.
 
 List all projects for a user.
 
-**Query:** `user_id` (string, required) — user UUID.
+**Query**
+
+- `user_id` (required)
 
 **Response:** `200 OK`
 
 ```json
 [
-	{
-		"id": "660e8400-e29b-41d4-a716-446655440001",
-		"user_id": "550e8400-e29b-41d4-a716-446655440000",
-		"name": "My Token Project",
-		"created_at": "2025-03-07T12:00:00"
-	}
+  {
+    "id": "660e8400-e29b-41d4-a716-446655440001",
+    "user_id": "550e8400-e29b-41d4-a716-446655440000",
+    "name": "My Token Project",
+    "screenshot_base64": null,
+    "created_at": "2025-03-07T12:00:00"
+  }
 ]
 ```
 
@@ -169,20 +222,23 @@ List all projects for a user.
 
 ### `GET /users/{user_id}/projects`
 
-Alias route for `GET /projects` that accepts `user_id` in the path instead of query.
+Alias route for `GET /projects`.
 
-**Path:** `user_id` (string, required) - user UUID.
+**Path**
 
-**Response:** `200 OK` (same shape as `GET /projects`)
+- `user_id` (required)
+
+**Response:** `200 OK`
 
 ```json
 [
-	{
-		"id": "660e8400-e29b-41d4-a716-446655440001",
-		"user_id": "550e8400-e29b-41d4-a716-446655440000",
-		"name": "My Token Project",
-		"created_at": "2025-03-07T12:00:00"
-	}
+  {
+    "id": "660e8400-e29b-41d4-a716-446655440001",
+    "user_id": "550e8400-e29b-41d4-a716-446655440000",
+    "name": "My Token Project",
+    "screenshot_base64": null,
+    "created_at": "2025-03-07T12:00:00"
+  }
 ]
 ```
 
@@ -194,17 +250,23 @@ Alias route for `GET /projects` that accepts `user_id` in the path instead of qu
 
 Get a single project. Ownership is validated when `user_id` is provided.
 
-**Path:** `project_id` (UUID).  
-**Query:** `user_id` (string, required) — user UUID.
+**Path**
+
+- `project_id` (required UUID)
+
+**Query**
+
+- `user_id` (required UUID)
 
 **Response:** `200 OK`
 
 ```json
 {
-	"id": "660e8400-e29b-41d4-a716-446655440001",
-	"user_id": "550e8400-e29b-41d4-a716-446655440000",
-	"name": "My Token Project",
-	"created_at": "2025-03-07T12:00:00"
+  "id": "660e8400-e29b-41d4-a716-446655440001",
+  "user_id": "550e8400-e29b-41d4-a716-446655440000",
+  "name": "My Token Project",
+  "screenshot_base64": null,
+  "created_at": "2025-03-07T12:00:00"
 }
 ```
 
@@ -214,36 +276,33 @@ Get a single project. Ownership is validated when `user_id` is provided.
 
 ### `PATCH /projects/{project_id}`
 
-Partially update a project by id. Only fields that are explicitly included in the JSON body are updated.
+Partially update a project. Only fields included in the JSON body are changed.
 
-**Path:** `project_id` (UUID).
+**Path**
 
-**Body (all optional):**
+- `project_id` (required UUID)
+
+**Body**
 
 ```json
 {
-	"name": "My Updated Project Name",
-	"screenshot_base64": "data:image/png;base64,iVBORw0KGgoAAA..."
+  "name": "My Updated Project Name",
+  "screenshot_base64": "data:image/png;base64,iVBORw0KGgoAAA..."
 }
 ```
 
-- `name` (string or `null`, optional): Project name.
-- `screenshot_base64` (string or `null`, optional): Base64 PNG screenshot string.
-
-Behavior notes:
-
-- Uses partial update semantics (`exclude_unset=True`), so omitted fields are left unchanged.
-- Sending `screenshot_base64: null` clears the stored screenshot.
+- Sending `screenshot_base64: null` clears the stored screenshot
+- Omitted fields are left unchanged
 
 **Response:** `200 OK`
 
 ```json
 {
-	"id": "660e8400-e29b-41d4-a716-446655440001",
-	"user_id": "550e8400-e29b-41d4-a716-446655440000",
-	"name": "My Updated Project Name",
-	"screenshot_base64": "data:image/png;base64,iVBORw0KGgoAAA...",
-	"created_at": "2025-03-07T12:00:00"
+  "id": "660e8400-e29b-41d4-a716-446655440001",
+  "user_id": "550e8400-e29b-41d4-a716-446655440000",
+  "name": "My Updated Project Name",
+  "screenshot_base64": "data:image/png;base64,iVBORw0KGgoAAA...",
+  "created_at": "2025-03-07T12:00:00"
 }
 ```
 
@@ -255,153 +314,297 @@ Behavior notes:
 
 ### `GET /messages`
 
-List persisted chat messages for a project. Supports optional filtering by `session_id`.
+List persisted chat messages for a project. This includes stored user and agent messages for planning and routed agent sessions when project-scoped persistence is available. You can filter to a single `session_id`.
 
-**Query:**
+**Query**
 
-- `session_id` (string, optional): Restrict to one chat session.
-- `limit` (int, optional, default `200`): Max messages returned.
-- `project_id` (optional, default `"default"`): Use explicit query value or `X-Project-Id` header.
-- `user_id` (optional, default `"default"`): Use explicit query value or `X-User-Id` header.
+- `session_id` (optional)
+- `limit` (optional, default `200`)
+- `project_id` (optional, default `"default"`)
+- `user_id` (optional, default `"default"`)
 
 **Response:** `200 OK`
 
 ```json
 {
-	"messages": [
-		{
-			"id": "6f2c3e7c-6fa1-4cb5-9e52-9ad1132c67d4",
-			"project_id": "660e8400-e29b-41d4-a716-446655440001",
-			"session_id": "770e8400-e29b-41d4-a716-446655440002",
-			"sender": "user",
-			"content": "I want an ERC-20 token with mint and burn.",
-			"created_at": "2025-03-07T12:00:00.000000"
-		}
-	]
+  "messages": [
+    {
+      "id": "6f2c3e7c-6fa1-4cb5-9e52-9ad1132c67d4",
+      "project_id": "660e8400-e29b-41d4-a716-446655440001",
+      "session_id": "770e8400-e29b-41d4-a716-446655440002",
+      "sender": "user",
+      "content": "I want an ERC-20 token with mint and burn.",
+      "created_at": "2025-03-07T12:00:00.000000"
+    }
+  ]
 }
 ```
 
-**Errors:** `400` missing/invalid `project_id`, `503` no database.
+**Errors:** `400` missing or invalid `project_id`, `503` no database.
 
-**Frontend:** Load chat history on page refresh or when reopening a project/session.
+**Frontend:** Use for refresh or restore flows when reopening a project or session.
 
 ---
 
-## Planning flow
+## Planning and routed chat
 
-The planning flow is: **start session → send messages → read current plan → approve plan** (then use coding endpoints).
+### `POST /agent/message/stream`
 
-### `POST /plan/start`
+This is the primary chat endpoint for new frontend work.
 
-Creates a new session and returns the agent’s opening message. The frontend should store `session_id` and use it for all subsequent planning (and optionally agent) calls.
+Use it to start planning, continue planning, and finalize planning by sending routed messages with `intent: "planning"`. The same endpoint also supports other routed agent intents for non-planning workflows.
 
-**Body (optional):**
+**Supported intents**
+
+- `planning`
+- `coding`
+- `testing`
+- `deployment`
+- `audit`
+
+**Important frontend rule**
+
+Generate `session_id` in the frontend and persist it per project. The recommended planning UX does not depend on a server-created session bootstrap.
+
+**Body**
 
 ```json
 {
-	"project_id": "660e8400-e29b-41d4-a716-446655440001",
-	"user_id": "550e8400-e29b-41d4-a716-446655440000"
+  "session_id": "plan-session-id",
+  "intent": "planning",
+  "message": "Build me an ERC-20 with owner-only minting and a treasury wallet.",
+  "project_id": "660e8400-e29b-41d4-a716-446655440001",
+  "user_id": "550e8400-e29b-41d4-a716-446655440000"
 }
 ```
 
-Or rely on `X-Project-Id` / `X-User-Id` headers.
+**Response:** `200 OK`, `Content-Type: text/event-stream`
 
-**Response:** `200 OK`
+Each SSE frame contains JSON after `data:`.
+
+**Step event**
+
+`step` events are transient progress updates. `tool_calls` here is optional structured metadata and should be treated as display or debug information, not as business logic.
 
 ```json
 {
-	"session_id": "770e8400-e29b-41d4-a716-446655440002",
-	"message": "Hello! I'm here to help you plan your smart contract...",
-	"answer_recommendations": [
-		{ "text": "Create an ERC-20 token", "recommended": true },
-		{ "text": "Create an ERC-721 NFT collection" },
-		{ "text": "Create an ERC-1155 multi-token contract" }
-	],
-	"pending_questions": [
-		{
-			"question": "What type of contract do you want to build?",
-			"answer_recommendations": [
-				{ "text": "ERC-20 token", "recommended": true },
-				{ "text": "ERC-721 NFT collection" },
-				{ "text": "ERC-1155 multi-token contract" }
-			]
-		}
-	]
+  "type": "step",
+  "content": "I need a few more details before I can finalize the plan.",
+  "tool_calls": [
+    {
+      "name": "get_current_plan",
+      "args": "{}"
+    }
+  ]
 }
 ```
 
-**Frontend:** After calling this, save `session_id` and show `message` as the first bot message. If `pending_questions` is present, render the questions directly; `answer_recommendations` remains as a backward-compatible shortcut for the first question.
+**Done event**
+
+For `intent: "planning"`, the final `done` event includes the assistant response plus structured planning UI data such as `approval_request`, `answer_recommendations`, and `pending_questions`.
+
+```json
+{
+  "type": "done",
+  "session_id": "plan-session-id",
+  "response": "Understood. I still need token decimals and the treasury wallet behavior.",
+  "tool_calls": [
+    "get_current_plan",
+    "send_question_batch",
+    "save_plan_draft"
+  ],
+  "approval_request": null,
+  "answer_recommendations": [
+    {
+      "text": "Use 18 decimals",
+      "recommended": true
+    }
+  ],
+  "pending_questions": [
+    {
+      "question": "How many decimals should the token use?",
+      "answer_recommendations": [
+        {
+          "text": "18",
+          "recommended": true
+        },
+        {
+          "text": "6"
+        }
+      ]
+    }
+  ]
+}
+```
+
+`approval_request` is `{"type":"plan_verification","required":true}` when the planning agent wants the frontend to show a verify or approve affordance. Otherwise it is `null`.
+
+**Error event**
+
+```json
+{
+  "type": "error",
+  "detail": "Unknown intent: planningg"
+}
+```
+
+**Frontend**
+
+- Use `fetch()` plus a streamed response, not browser `EventSource`, because this endpoint is POST-based
+- Render `step.content` incrementally while the request is active
+- Replace transient streamed text with the `done.response` payload when the turn finishes
+- Use `approval_request`, `pending_questions`, and `answer_recommendations` from the final event for planning UI controls
+- Do not treat streamed chat text as the durable source of truth for plan state; use `GET /state/stream` or `GET /plan/current` for saved plan data
+
+**Example JavaScript**
+
+```javascript
+async function streamAgentMessage(body, projectId, userId) {
+  const res = await fetch("http://localhost:8000/agent/message/stream", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Project-Id": projectId,
+      "X-User-Id": userId
+    },
+    body: JSON.stringify(body)
+  });
+
+  if (!res.ok || !res.body) {
+    const text = await res.text();
+    throw new Error(text || `Request failed: ${res.status}`);
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const chunks = buffer.split("\n\n");
+    buffer = chunks.pop() || "";
+
+    for (const chunk of chunks) {
+      for (const line of chunk.split("\n")) {
+        if (!line.startsWith("data: ")) continue;
+        const event = JSON.parse(line.slice(6));
+        if (event.type === "step") {
+          appendTransientText(event.content || "");
+        } else if (event.type === "done") {
+          finalizeAssistantTurn(event);
+        } else if (event.type === "error") {
+          showError(event.detail);
+        }
+      }
+    }
+  }
+}
+```
 
 ---
 
-### `POST /plan/message`
+### `GET /state/stream`
 
-Send a user message to the planning agent.
+This is the best way to stay up to date on saved project state.
 
-**Body:**
+Use it for the latest:
+
+- plan state
+- code artifact metadata
+- deployment metadata
+
+Do not use it for replayable pipeline history. It is a current-state stream, not a run timeline.
+
+**Query**
+
+- `project_id` (optional, default `"default"`)
+- `user_id` (optional, default `"default"`)
+
+Headers are still recommended.
+
+**Response:** `200 OK`, `Content-Type: text/event-stream`
+
+This stream always starts with a fresh snapshot, then emits updates only when the saved state changes. Each update event now carries the full current `plan`, `code`, and `deployment` branches so clients can replace entire local state without merging partial payloads.
+
+**Event types**
+
+- `state_snapshot`
+- `plan_updated`
+- `code_updated`
+- `deployment_updated`
+- `error`
+
+**Initial snapshot example**
 
 ```json
 {
-	"session_id": "770e8400-e29b-41d4-a716-446655440002",
-	"message": "I want an ERC-20 token with mint and burn.",
-	"project_id": "660e8400-e29b-41d4-a716-446655440001",
-	"user_id": "550e8400-e29b-41d4-a716-446655440000"
+  "project_id": "660e8400-e29b-41d4-a716-446655440001",
+  "plan": {
+    "plan": {
+      "project_name": "My Token Project",
+      "status": "draft"
+    },
+    "status": "draft",
+    "version": "4b7f..."
+  },
+  "code": {
+    "artifacts": [],
+    "version": "1f4a..."
+  },
+  "deployment": {
+    "last_deploy_results": [],
+    "version": "8b9c..."
+  },
+  "emitted_at": "2026-04-06T09:00:00+00:00"
 }
 ```
 
-- `session_id` (string, required): From `/plan/start`.
-- `message` (string, required): User message.
-- `project_id` / `user_id` (optional): Override headers if needed.
-
-**Response:** `200 OK`
+**Incremental plan update example**
 
 ```json
 {
-	"session_id": "770e8400-e29b-41d4-a716-446655440002",
-	"response": "I have enough to start. Please answer these three questions in one reply: 1. Should supply be fixed or mintable? 2. Who can mint? 3. Do you want a cap?",
-	"tool_calls": ["send_question_batch", "save_plan_draft"],
-	"answer_recommendations": [
-		{ "text": "Fixed initial supply (e.g. 1,000,000)", "recommended": true },
-		{ "text": "Mintable supply controlled by owner" },
-		{ "text": "No cap for now; decide later" }
-	],
-	"pending_questions": [
-		{
-			"question": "Should the token supply be fixed or mintable after deployment?",
-			"answer_recommendations": [
-				{ "text": "Fixed initial supply (e.g. 1,000,000)", "recommended": true },
-				{ "text": "Mintable supply controlled by owner" }
-			]
-		},
-		{
-			"question": "Who should be allowed to mint new tokens?",
-			"answer_recommendations": [
-				{ "text": "Only the owner", "recommended": true },
-				{ "text": "Addresses with a MINTER_ROLE" }
-			]
-		},
-		{
-			"question": "Do you want a maximum token cap?",
-			"answer_recommendations": [
-				{ "text": "No cap for now; decide later", "recommended": true },
-				{ "text": "Yes, set a fixed cap" }
-			]
-		}
-	]
+  "project_id": "660e8400-e29b-41d4-a716-446655440001",
+  "plan": {
+    "plan": {
+      "project_name": "My Token Project",
+      "status": "ready"
+    },
+    "status": "ready",
+    "version": "8123..."
+  },
+  "code": {
+    "artifacts": [],
+    "version": "1f4a..."
+  },
+  "deployment": {
+    "last_deploy_results": [],
+    "version": "8b9c..."
+  },
+  "emitted_at": "2026-04-06T09:01:00+00:00"
 }
 ```
 
-**Errors:** `400` empty message, `500` agent error.
+**Frontend**
 
-**Frontend:** Append the user message, then append `response` as the assistant message. Prefer `pending_questions` for rendering a multi-question batch UI. `answer_recommendations` is still returned for older clients and mirrors the first question's quick replies.
+- Keep this stream open for the active project whenever possible
+- On connect, replace local current-state cache with the full `state_snapshot`
+- On `plan_updated`, `code_updated`, or `deployment_updated`, replace the full current-state cache or the relevant branches from the full payload
+- Ignore keepalive comment lines
+- Reconnect by simply reopening the endpoint; the new `state_snapshot` is the recovery mechanism
+- Use `GET /artifacts/file` to fetch actual source text lazily
+
+Because frontends usually send `X-Project-Id` and `X-User-Id`, use `fetch()` with a streamed response here instead of native `EventSource`.
 
 ---
 
 ### `GET /plan/current`
 
-Get the current plan for the user/project context.
+Get the current saved plan for the project and user context.
 
-**Query:**
+**Query**
 
 - `project_id` (optional, default `"default"`)
 - `user_id` (optional, default `"default"`)
@@ -412,50 +615,50 @@ Get the current plan for the user/project context.
 {
   "plan": {
     "project_name": "PartyToken",
-    "description": "ERC-20 with mint and burn",
+    "description": "ERC-20 with owner-only minting",
     "status": "draft",
-    "contracts": [
-      {
-        "name": "PartyToken",
-        "description": "Main token contract",
-        "erc_template": "ERC-20",
-        "dependencies": ["Ownable"],
-        "constructor": { "inputs": [...], "description": "..." },
-        "functions": [
-          {
-            "name": "mint",
-            "description": "...",
-            "inputs": [...],
-            "outputs": [...],
-            "conditions": [...]
-          }
-        ]
-      }
-    ]
+    "deployment_target": {
+      "network": "avalanche_fuji",
+      "name": "Avalanche Fuji",
+      "chain_id": 43113,
+      "rpc_url_env_var": "FUJI_RPC_URL",
+      "private_key_env_var": "FUJI_PRIVATE_KEY"
+    },
+    "contracts": []
   },
   "status": "draft"
 }
 ```
 
-If there is no plan yet, `plan` and `status` can be `null`.
+If there is no saved plan yet, both `plan` and `status` may be `null`.
 
-**Plan statuses:** `draft` → `ready` → `generating` → `testing` → `deployed`. Only non-deployed plans can be edited.
+**Plan lifecycle statuses**
 
-**Frontend:** Call after messages or on “View plan” to show the structured plan; use `status` to drive UI (e.g. enable “Approve” when status is `draft`).
+- `draft`
+- `ready`
+- `generating`
+- `testing`
+- `deploying`
+- `deployed`
+- `failed`
+
+**Frontend:** Use this for page load recovery, explicit refresh, or situations where you need a one-shot plan read. For ongoing sync, prefer `GET /state/stream`.
 
 ---
 
 ### `POST /plan/approve`
 
-Mark the current plan as **ready** for code generation. Fails if there is no plan or if the plan is already `deployed`.
+Explicitly flip the current saved plan into the `ready` state.
 
-**Body:**
+This is useful when you already have a draft plan and want a deliberate UI action to mark it ready for the pipeline. It is not the primary transport for the planning chat itself.
+
+**Body**
 
 ```json
 {
-	"session_id": "770e8400-e29b-41d4-a716-446655440002",
-	"project_id": "660e8400-e29b-41d4-a716-446655440001",
-	"user_id": "550e8400-e29b-41d4-a716-446655440000"
+  "session_id": "plan-session-id",
+  "project_id": "660e8400-e29b-41d4-a716-446655440001",
+  "user_id": "550e8400-e29b-41d4-a716-446655440000"
 }
 ```
 
@@ -463,337 +666,652 @@ Mark the current plan as **ready** for code generation. Fails if there is no pla
 
 ```json
 {
-	"session_id": "770e8400-e29b-41d4-a716-446655440002",
-	"success": true,
-	"message": "Plan approved. Project 'PartyToken' is ready for code generation."
+  "session_id": "plan-session-id",
+  "success": true,
+  "message": "Plan approved. Project 'PartyToken' is ready for code generation."
 }
 ```
 
 **Errors:** `404` no plan, `400` plan already deployed, `500` server error.
 
-**Frontend:** After approval, switch to the “Code” or “Generate” step and use `/coding/generate` or `/agent/message` with intent `"coding"`.
+**Frontend:** Enable this only when a durable plan exists and the UI wants an explicit ready-state action.
 
 ---
 
-## Coding
+## Pipeline execution
+
+### `POST /pipeline/run`
+
+Start a detached autonomous pipeline run after planning is complete.
+
+The backend returns control metadata immediately. Use `GET /pipeline/events` for the replayable timeline and `GET /pipeline/status` for durable state.
+
+**Body**
+
+```json
+{
+  "project_id": "660e8400-e29b-41d4-a716-446655440001",
+  "user_id": "550e8400-e29b-41d4-a716-446655440000"
+}
+```
+
+**Response:** `202 Accepted`
+
+```json
+{
+  "pipeline_run_id": "run-id",
+  "status": "running",
+  "events_url": "/pipeline/events?project_id=660e8400-e29b-41d4-a716-446655440001&pipeline_run_id=run-id",
+  "status_url": "/pipeline/status?project_id=660e8400-e29b-41d4-a716-446655440001&pipeline_run_id=run-id"
+}
+```
+
+**Frontend**
+
+- Persist `pipeline_run_id` immediately
+- Set `last_pipeline_event_seq` to `0`
+- Open `GET /pipeline/events`
+- Keep `GET /pipeline/status` available for recovery and gate rendering
+
+---
+
+### `GET /pipeline/events`
+
+Replayable SSE stream for one pipeline run.
+
+This endpoint replays any missed events after `after_seq`, then tails new events until the run ends or the client disconnects.
+
+**Query**
+
+- `project_id` (required)
+- `pipeline_run_id` (required)
+- `after_seq` (optional, default `0`)
+
+**Response:** `200 OK`, `Content-Type: text/event-stream`
+
+Each event uses SSE `id`, `event`, and `data` fields. The JSON payload in `data` always includes the event body, and usually includes the same sequence in `seq`.
+
+**Common event types**
+
+- `pipeline_start`
+- `pipeline_resumed`
+- `stage_start`
+- `tool_call`
+- `agent_message`
+- `evaluation`
+- `stage_complete`
+- `pipeline_waiting_for_approval`
+- `pipeline_complete`
+- `pipeline_error`
+- `pipeline_cancelled`
+
+**Example early events**
+
+```json
+{
+  "type": "pipeline_start",
+  "seq": 1,
+  "pipeline_run_id": "run-id",
+  "project_id": "660e8400-e29b-41d4-a716-446655440001"
+}
+```
+
+```json
+{
+  "type": "stage_start",
+  "seq": 2,
+  "stage": "coding",
+  "task_id": "task-id",
+  "task_type": "coding.generate_contracts",
+  "description": "Generate Solidity contracts from the approved plan.",
+  "retry_budget_key": "coding",
+  "retry_attempt": 0
+}
+```
+
+**Frontend**
+
+- This stream may replay backlog first if `after_seq` is behind
+- The stream may emit keepalive comments; ignore lines that start with `:`
+- Use the SSE `id` or JSON `seq` as the replay cursor
+- Update `last_pipeline_event_seq` after each parsed event
+- When `pipeline_waiting_for_approval` arrives, immediately call `GET /pipeline/status`
+- When `pipeline_complete`, `pipeline_error`, or `pipeline_cancelled` arrives, still call `GET /pipeline/status` once to confirm final durable state
+- Because most frontends still send custom headers, use `fetch()` with a streamed GET response instead of native `EventSource`
+
+---
+
+### `GET /pipeline/status`
+
+Authoritative durable state for a pipeline run.
+
+Use this endpoint for:
+
+- page reload recovery
+- disconnected timeline recovery
+- rendering tasks, evaluations, and human gates
+- confirming final status after a terminal event
+
+If `pipeline_run_id` is omitted, the backend returns the latest run for the project. If no runs exist for the project, it returns:
+
+```json
+{
+  "error": "No pipeline runs found for this project"
+}
+```
+
+**Query**
+
+- `project_id` (required)
+- `pipeline_run_id` (optional)
+
+**Response shape**
+
+```json
+{
+  "pipeline_run_id": "run-id",
+  "project_id": "660e8400-e29b-41d4-a716-446655440001",
+  "status": "waiting_for_approval",
+  "failure_reason": "Deployment script is ready. Awaiting operator approval before on-chain deployment.",
+  "run": {
+    "id": "run-id",
+    "project_id": "660e8400-e29b-41d4-a716-446655440001",
+    "user_id": "550e8400-e29b-41d4-a716-446655440000",
+    "status": "waiting_for_approval",
+    "current_stage": "deployment",
+    "current_task_id": "task-id",
+    "deployment_target": {},
+    "failure_class": "human_gate",
+    "created_at": "2026-04-06T09:00:00+00:00",
+    "started_at": "2026-04-06T09:00:05+00:00",
+    "paused_at": "2026-04-06T09:04:00+00:00",
+    "resumed_at": null,
+    "completed_at": null,
+    "updated_at": "2026-04-06T09:04:00+00:00"
+  },
+  "total_tasks": 4,
+  "tasks": [],
+  "gates": [],
+  "evaluations": []
+}
+```
+
+**Top-level fields to rely on**
+
+- `status`: authoritative run state
+- `failure_reason`: top-level human-readable failure or waiting reason
+- `run`: full durable run record
+- `tasks`: serialized pipeline tasks
+- `gates`: pending and resolved human gates
+- `evaluations`: pipeline evaluations
+
+**Common run statuses**
+
+- `created`
+- `running`
+- `waiting_for_approval`
+- `cancellation_requested`
+- `cancelled`
+- `completed`
+- `failed`
+
+---
+
+### Human gates
+
+When a run pauses for human input, `GET /pipeline/events` emits `pipeline_waiting_for_approval`. The frontend should then read the durable pending gate from `GET /pipeline/status`.
+
+The frontend should render approval UI from `status.gates`, not from the event payload alone.
+
+**Gate types**
+
+- `pre_deploy`: deployment script is ready and needs explicit operator approval before on-chain execution
+- `override`: a blocking evaluation or retry-budget condition needs explicit override
+
+**Important**
+
+Gate decision endpoints do not resume execution by themselves. After `approve` or `override`, call `POST /pipeline/resume`.
+
+---
+
+### `POST /pipeline/gates/{gate_id}/approve`
+
+Approve a pending `pre_deploy` gate.
+
+**Body**
+
+```json
+{
+  "project_id": "660e8400-e29b-41d4-a716-446655440001",
+  "reason": "Approved to deploy to Avalanche Fuji"
+}
+```
+
+**Response:** `200 OK`
+
+```json
+{
+  "success": true,
+  "gate_id": "gate-id",
+  "action": "approve",
+  "pipeline_run_id": "run-id",
+  "reason": "Approved to deploy to Avalanche Fuji",
+  "run_status": "running"
+}
+```
+
+---
+
+### `POST /pipeline/gates/{gate_id}/reject`
+
+Reject a pending gate.
+
+**Body**
+
+```json
+{
+  "project_id": "660e8400-e29b-41d4-a716-446655440001",
+  "reason": "Rejected by operator"
+}
+```
+
+**Response:** `200 OK`
+
+```json
+{
+  "success": true,
+  "gate_id": "gate-id",
+  "action": "reject",
+  "pipeline_run_id": "run-id",
+  "reason": "Rejected by operator",
+  "run_status": "failed"
+}
+```
+
+---
+
+### `POST /pipeline/gates/{gate_id}/override`
+
+Override a pending `override` gate.
+
+**Body**
+
+```json
+{
+  "project_id": "660e8400-e29b-41d4-a716-446655440001",
+  "reason": "Grant one extra retry"
+}
+```
+
+**Response:** `200 OK`
+
+```json
+{
+  "success": true,
+  "gate_id": "gate-id",
+  "action": "override",
+  "pipeline_run_id": "run-id",
+  "reason": "Grant one extra retry",
+  "run_status": "running"
+}
+```
+
+**Frontend gate flow**
+
+1. Receive `pipeline_waiting_for_approval`
+2. Call `GET /pipeline/status`
+3. Read the pending gate from `gates`
+4. Submit `approve`, `reject`, or `override`
+5. If the result is approval or override, call `POST /pipeline/resume`
+6. Reopen `GET /pipeline/events` using the saved `last_pipeline_event_seq`
+
+---
+
+### `POST /pipeline/resume`
+
+Resume a paused or gate-resolved pipeline run.
+
+This returns detached control metadata immediately.
+
+**Body**
+
+```json
+{
+  "project_id": "660e8400-e29b-41d4-a716-446655440001",
+  "pipeline_run_id": "run-id"
+}
+```
+
+**Response:** `202 Accepted`
+
+```json
+{
+  "pipeline_run_id": "run-id",
+  "status": "running",
+  "events_url": "/pipeline/events?project_id=660e8400-e29b-41d4-a716-446655440001&pipeline_run_id=run-id",
+  "status_url": "/pipeline/status?project_id=660e8400-e29b-41d4-a716-446655440001&pipeline_run_id=run-id"
+}
+```
+
+**Notes**
+
+- This returns `400` if the run is already terminal
+- This returns `409` if a gate is still pending
+- The reopened timeline may begin with a `pipeline_resumed` event
+
+---
+
+### `POST /pipeline/cancel`
+
+Request cancellation for a running pipeline. Cancellation is best-effort and takes effect at the next safe point.
+
+**Body**
+
+```json
+{
+  "project_id": "660e8400-e29b-41d4-a716-446655440001",
+  "pipeline_run_id": "run-id",
+  "reason": "User cancelled from frontend"
+}
+```
+
+**Response:** `200 OK`
+
+```json
+{
+  "success": true,
+  "message": "Cancellation requested. The pipeline will stop at the next safe point.",
+  "pipeline_run_id": "run-id",
+  "reason": "User cancelled from frontend"
+}
+```
+
+**Frontend:** Keep showing progress until `GET /pipeline/events` or `GET /pipeline/status` reaches a terminal cancelled state.
+
+---
+
+## Outputs and artifacts
 
 ### `GET /coding/current`
 
-List current code artifacts for the project/user (from headers or query).
+Return current code artifact metadata for the project and user.
 
-**Query:** `session_id`, optional `project_id`, `user_id`.
+This is metadata only. For actual file contents, use `GET /artifacts/file`.
 
-**Response:** `200 OK`
+**Query**
 
-```json
-{
-	"artifacts": [
-		{
-			"path": "src/PartyToken.sol",
-			"language": "solidity",
-			"description": "ERC-20 token",
-			"contract_names": ["PartyToken"],
-			"related_plan_id": null,
-			"created_at": "2025-03-07T12:00:00"
-		}
-	]
-}
-```
-
-**Frontend:** Use to show “Generated files” and link to `/artifacts/file` for content.
-
----
-
-## Deployment
-
-### `GET /deployment/current`
-
-Return the last deploy results for this user/project (from `run_foundry_deploy`). Use to check if deployments are done and successful.
-
-**Query:** optional `project_id`, `user_id` — or use headers `X-Project-Id`, `X-User-Id`.
+- `project_id` (optional, default `"default"`)
+- `user_id` (optional, default `"default"`)
 
 **Response:** `200 OK`
 
 ```json
 {
-	"last_deploy_results": [
-		{
-			"timestamp": "2025-03-08T12:00:00.000000+00:00",
-			"project_root": "/path/to/project",
-			"sandbox_workdir": "/workspace",
-			"network": "avalanche_fuji",
-			"chain_id": 43113,
-			"script_path": "script/Deploy.s.sol",
-			"command": "forge script ...",
-			"exit_code": 0,
-			"stdout": "...",
-			"stderr": "",
-			"modal_app": "...",
-			"tx_hash": "0x...",
-			"deployed_address": "0x..."
-		}
-	]
+  "artifacts": [
+    {
+      "path": "contracts/PartyToken.sol",
+      "language": "solidity",
+      "description": "Main ERC-20 token contract",
+      "contract_names": [
+        "PartyToken"
+      ],
+      "plan_contract_ids": [
+        "pc_partytoken"
+      ],
+      "related_plan_id": null,
+      "created_at": "2025-03-07T12:00:00"
+    }
+  ]
 }
 ```
 
-**Frontend:** Poll or call after deploy; treat `success === true` as authoritative. Successful deploys require a clean forge exit plus either a deployment `tx_hash` or a confirmed deployed contract address.
+**Frontend:** Use this for results views or artifact lists. For live updates, prefer `GET /state/stream`.
 
 ---
-
-## Testing
-
-### `GET /testing/current`
-
-Return the last test results for this user/project (from `run_foundry_tests`). Use to check if tests have run and whether they passed.
-
-**Query:** optional `project_id`, `user_id` — or use headers `X-Project-Id`, `X-User-Id`.
-
-**Response:** `200 OK`
-
-```json
-{
-	"last_test_results": [
-		{
-			"timestamp": "2025-03-08T12:00:00.000000+00:00",
-			"project_root": "/path/to/project",
-			"sandbox_workdir": "/workspace",
-			"command": "forge test ...",
-			"exit_code": 0,
-			"stdout": "...",
-			"stderr": "",
-			"modal_app": "..."
-		}
-	]
-}
-```
-
-**Frontend:** Poll or call after test run; treat latest entry with `exit_code === 0` as success.
-
----
-
-## Coding
 
 ### `POST /coding/generate`
 
-Generate Solidity code from a short goal string (standalone, no chat). Good for “quick generate” from a single prompt.
+One-shot Solidity generation helper.
 
-**Body:**
+This remains supported, but it is a standalone utility endpoint rather than the primary path for the pipeline UX.
+
+**Body**
 
 ```json
 {
-	"goal": "ERC-20 token with mint and burn, 18 decimals, Ownable."
+  "goal": "ERC-20 token with mint and burn, 18 decimals, Ownable."
 }
 ```
 
-**Query (optional):** `project_id`, `user_id` — or use headers.
+**Query**
+
+- `project_id` (optional)
+- `user_id` (optional)
+
+Headers can also carry project and user context.
 
 **Response:** `200 OK`
 
 ```json
 {
-	"generated_code": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\n...",
-	"goal": "ERC-20 token with mint and burn, 18 decimals, Ownable."
+  "generated_code": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\n...",
+  "goal": "ERC-20 token with mint and burn, 18 decimals, Ownable."
 }
 ```
 
 **Errors:** `400` empty goal, `500` generation failure.
 
-**Frontend:** Single “Generate” button; show `generated_code` in an editor or diff view, then optionally persist via the coding agent or artifact endpoints.
-
 ---
 
-## Artifacts (generated files)
+### `GET /testing/current`
 
-### `GET /artifacts/tree`
+Return the latest compact test result history for the project and user.
 
-Directory tree of generated artifacts, scoped by project when `project_id` is not `"default"`.
+These entries intentionally omit large `stdout` and `stderr` blobs. They may include pipeline metadata such as `pipeline_run_id`, `pipeline_task_id`, and `trace_id`.
 
-**Query:** `project_id`, `user_id` (optional).
+**Query**
+
+- `project_id` (optional, default `"default"`)
+- `user_id` (optional, default `"default"`)
 
 **Response:** `200 OK`
 
 ```json
 {
-	"name": "artifacts",
-	"path": "artifacts",
-	"type": "directory",
-	"children": [
-		{
-			"name": "src",
-			"path": "artifacts/src",
-			"type": "directory",
-			"children": [
-				{
-					"name": "PartyToken.sol",
-					"path": "artifacts/src/PartyToken.sol",
-					"type": "file",
-					"children": null
-				}
-			]
-		}
-	]
+  "last_test_results": [
+    {
+      "timestamp": "2025-03-08T12:00:00.000000+00:00",
+      "command": "forge test ...",
+      "exit_code": 0,
+      "modal_app": "...",
+      "pipeline_run_id": "run-123",
+      "pipeline_task_id": "task-789",
+      "trace_id": "trace-456"
+    }
+  ]
 }
 ```
 
-**Frontend:** Render a tree (e.g. collapsible folders); use `path` for `/artifacts/file?relative_path=...`.
+**Frontend:** Use for results screens or explicit refresh. For live state changes, prefer `GET /state/stream`.
+
+---
+
+### `GET /deployment/current`
+
+Return the latest compact deployment result history for the project and user.
+
+These entries intentionally omit large `stdout` and `stderr` blobs. They may include pipeline metadata such as `pipeline_run_id`, `pipeline_task_id`, `plan_contract_id`, and `trace_id`.
+
+**Query**
+
+- `project_id` (optional, default `"default"`)
+- `user_id` (optional, default `"default"`)
+
+**Response:** `200 OK`
+
+```json
+{
+  "last_deploy_results": [
+    {
+      "timestamp": "2025-03-08T12:00:00.000000+00:00",
+      "network": "avalanche_fuji",
+      "chain_id": 43113,
+      "script_path": "script/DeployPartyToken.s.sol",
+      "command": "forge script ...",
+      "exit_code": 0,
+      "tx_hash": "0x...",
+      "deployed_address": "0x...",
+      "pipeline_run_id": "run-123",
+      "pipeline_task_id": "task-456",
+      "plan_contract_id": "pc_partytoken",
+      "trace_id": "trace-123"
+    }
+  ]
+}
+```
+
+**Frontend:** Use for results screens or explicit refresh. For live state changes, prefer `GET /state/stream`.
+
+---
+
+### `GET /artifacts/tree`
+
+Return the directory tree of generated artifacts for the project.
+
+**Query**
+
+- `project_id` (optional)
+- `user_id` (optional)
+
+**Response:** `200 OK`
+
+```json
+{
+  "name": "generated_contracts",
+  "path": "",
+  "type": "directory",
+  "children": [
+    {
+      "name": "contracts",
+      "path": "contracts",
+      "type": "directory",
+      "children": [
+        {
+          "name": "PartyToken.sol",
+          "path": "contracts/PartyToken.sol",
+          "type": "file",
+          "children": null
+        }
+      ]
+    }
+  ]
+}
+```
+
+**Frontend:** Render a file explorer and use the `path` value with `GET /artifacts/file`.
 
 ---
 
 ### `GET /artifacts/file`
 
-Raw content of one artifact file.
+Load the raw contents of one artifact file.
 
-**Query:**
+**Query**
 
-- `relative_path` (string, required): e.g. `src/PartyToken.sol`
-- `project_id`, `user_id` (optional)
+- `relative_path` (required), for example `contracts/PartyToken.sol`
+- `project_id` (optional)
+- `user_id` (optional)
 
 **Response:** `200 OK`
 
 ```json
 {
-	"path": "src/PartyToken.sol",
-	"content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\n..."
+  "path": "contracts/PartyToken.sol",
+  "content": "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.0;\n..."
 }
 ```
 
 **Errors:** `400` empty path, `404` file not found.
 
-**Frontend:** Use for “Open file” or inline code view; combine with `/artifacts/tree` for a file explorer.
-
 ---
 
-## Generic agent (routed by intent)
+## Legacy endpoints
 
-These endpoints route to different agents by **intent**. Use them when you want one API for planning, coding, and testing.
+### `POST /plan/message`
 
-**Intents:** `planning` | `coding` | `testing`
+Legacy non-stream planning fallback.
 
-### `POST /agent/message`
+This endpoint is still implemented, but new frontend work should prefer `POST /agent/message/stream` for planning because it supports the pipeline UX and streamed responses.
 
-Single request/response.
-
-**Body:**
+**Body**
 
 ```json
 {
-	"session_id": "770e8400-e29b-41d4-a716-446655440002",
-	"intent": "planning",
-	"message": "Add a pause function to the contract.",
-	"project_id": "660e8400-e29b-41d4-a716-446655440001",
-	"user_id": "550e8400-e29b-41d4-a716-446655440000"
+  "session_id": "plan-session-id",
+  "message": "I want an ERC-20 token with mint and burn.",
+  "project_id": "660e8400-e29b-41d4-a716-446655440001",
+  "user_id": "550e8400-e29b-41d4-a716-446655440000"
 }
 ```
 
-- `session_id` (required)
-- `intent` (required): `"planning"` | `"coding"` | `"testing"`
-- `message` (required)
-- `project_id` / `user_id` (optional)
-
-**Response:** Same shape as `/plan/message`:
+**Response:** `200 OK`
 
 ```json
 {
-	"session_id": "770e8400-e29b-41d4-a716-446655440002",
-	"response": "I've added a pause function...",
-	"tool_calls": ["save_coding_note"],
-	"answer_recommendations": [],
-	"pending_questions": []
+  "session_id": "plan-session-id",
+  "response": "I need a few more details before I can finalize the plan.",
+  "tool_calls": [
+    "send_question_batch",
+    "save_plan_draft"
+  ],
+  "answer_recommendations": [],
+  "pending_questions": []
+}
+```
+
+---
+
+### `POST /agent/message`
+
+Legacy non-stream routed chat.
+
+Do not use this endpoint for new frontend work. Use `POST /agent/message/stream` instead.
+
+It supports the same intent set as the stream endpoint:
+
+- `planning`
+- `coding`
+- `testing`
+- `deployment`
+- `audit`
+
+**Body**
+
+```json
+{
+  "session_id": "plan-session-id",
+  "intent": "coding",
+  "message": "Explain the current artifacts.",
+  "project_id": "660e8400-e29b-41d4-a716-446655440001",
+  "user_id": "550e8400-e29b-41d4-a716-446655440000"
+}
+```
+
+**Response:** `200 OK`
+
+```json
+{
+  "session_id": "plan-session-id",
+  "response": "Here is the current artifact summary...",
+  "tool_calls": [
+    "get_current_artifacts"
+  ],
+  "answer_recommendations": [],
+  "pending_questions": []
 }
 ```
 
 **Errors:** `400` empty message or unknown intent, `500` agent error.
-
-**Frontend:** One “Send” action per intent; e.g. tabs or mode selector for Planning / Coding / Testing, same `session_id` for the whole flow.
-
----
-
-### `POST /agent/message/stream`
-
-Same body as `/agent/message`, but the response is **Server-Sent Events (SSE)**.
-
-**Response:** `Content-Type: text/event-stream`
-
-Each event is a JSON line after `data: `:
-
-- **Step (while agent is working):**
-
-  ```json
-  { "type": "step", "content": "...", "tool_calls": ["..."] }
-  ```
-
-- **Done:**
-
-  ```json
-  {
-    "type": "done",
-    "session_id": "...",
-    "response": "...",
-    "tool_calls": [...],
-    "answer_recommendations": [
-      { "text": "Option A", "recommended": true },
-      { "text": "Option B" }
-    ],
-    "pending_questions": [
-      {
-        "question": "Which ERC standard do you want?",
-        "answer_recommendations": [
-          { "text": "ERC-20", "recommended": true },
-          { "text": "ERC-721" }
-        ]
-      }
-    ]
-  }
-  ```
-
-- **Error:**
-
-  ```json
-  { "type": "error", "detail": "Unknown intent: xyz" }
-  ```
-
-**Frontend (JavaScript):**
-
-```javascript
-const eventSource = new EventSource(
-	"/agent/message/stream?" +
-		new URLSearchParams({
-			/* not used; body is POST */
-		}),
-);
-// EventSource is GET-only; for POST + stream use fetch + ReadableStream:
-async function streamAgentMessage(body) {
-	const res = await fetch("http://localhost:8000/agent/message/stream", {
-		method: "POST",
-		headers: {
-			"Content-Type": "application/json",
-			"X-Project-Id": projectId,
-			"X-User-Id": userId,
-		},
-		body: JSON.stringify(body),
-	});
-	const reader = res.body.getReader();
-	const decoder = new TextDecoder();
-	let buffer = "";
-	while (true) {
-		const { value, done } = await reader.read();
-		if (done) break;
-		buffer += decoder.decode(value, { stream: true });
-		const lines = buffer.split("\n\n");
-		buffer = lines.pop() || "";
-		for (const line of lines) {
-			if (line.startsWith("data: ")) {
-				const data = JSON.parse(line.slice(6));
-				if (data.type === "step") appendToUI(data.content);
-				else if (data.type === "done") setFinalResponse(data.response);
-				else if (data.type === "error") showError(data.detail);
-			}
-		}
-	}
-}
-```
-
-Use this for typing effect or progressive output while the agent runs.
 
 ---
 
@@ -801,65 +1319,61 @@ Use this for typing effect or progressive output while the agent runs.
 
 ### `GET /memory/full`
 
-Returns the full project-scoped user memory and global agent log (Letta blocks). For debugging/observability.
+Return the full project-scoped user memory block and global memory block for debugging or observability.
 
-**Query:** `project_id`, `user_id` (optional).
+**Query**
+
+- `project_id` (optional)
+- `user_id` (optional)
 
 **Response:** `200 OK`
 
 ```json
 {
   "user_block_label": "user:...",
-  "user_memory": { ... },
+  "user_memory": {},
   "global_block_label": "global:...",
-  "global_memory": { ... }
+  "global_memory": {}
 }
 ```
 
-**Frontend:** Optional “Debug” or “Memory” panel; avoid in production UX.
+**Frontend:** Keep this behind internal or debug tooling rather than normal product UX.
 
 ---
 
 ## Frontend integration checklist
 
-1. **Auth / user**
-   - Create or resolve user (e.g. `POST /users`), store `user_id`.
+1. Resolve or create the user with `POST /users`
+2. Create or select the project with `POST /projects`, `GET /projects`, or `GET /projects/{project_id}`
+3. Persist `project_id` and `user_id`, and send them on every request through `X-Project-Id` and `X-User-Id`
+4. Generate and persist a `session_id` in the frontend
+5. Open `GET /state/stream` for the active project
+6. Start planning with `POST /agent/message/stream` and `intent: "planning"`
+7. Render streamed assistant text during the active request
+8. Drive plan UI from durable state in `GET /state/stream` or `GET /plan/current`
+9. If needed, use `POST /plan/approve` to explicitly mark the plan ready
+10. Start execution with `POST /pipeline/run`
+11. Persist `pipeline_run_id` and open `GET /pipeline/events`
+12. Persist `last_pipeline_event_seq` as timeline events arrive
+13. On refresh or reconnect, call `GET /pipeline/status` first, then reconnect `GET /pipeline/events?after_seq=<last_seq>` if the run is non-terminal
+14. When a gate is pending, render it from `pipeline/status.gates`, submit the gate decision, then call `POST /pipeline/resume` if the decision was approval or override
+15. Use `GET /coding/current`, `GET /testing/current`, `GET /deployment/current`, `GET /artifacts/tree`, and `GET /artifacts/file` for results and outputs
 
-2. **Projects**
-   - `POST /projects` to create, `GET /projects?user_id=...` to list.
-   - Optional alias: `GET /users/{user_id}/projects`.
-   - Store current `project_id` and send it (and `user_id`) on every request via headers:  
-     `X-Project-Id`, `X-User-Id`.
+All error responses use JSON with a `detail` field when raised through FastAPI exceptions. For example:
 
-3. **Planning**
-   - `POST /plan/start` → store `session_id`, show first message.
-   - Chat: `POST /plan/message` with `session_id` + `message`.
-   - Optional history restore: `GET /messages?session_id=...`.
-   - Plan view: `GET /plan/current` (uses `project_id`/`user_id` via query or headers).
-   - When user is happy: `POST /plan/approve`.
-
-4. **Coding**
-   - Option A: `POST /coding/generate` with a `goal` for one-shot generation.
-   - Option B: Use `POST /agent/message` with `intent: "coding"` (and same `session_id`) for conversational code gen.
-   - List artifacts: `GET /coding/current`.
-   - File tree: `GET /artifacts/tree`; file content: `GET /artifacts/file?relative_path=...`.
-
-5. **Streaming**
-   - Use `POST /agent/message/stream` with `fetch` + `ReadableStream` (as above) for live typing or long-running replies.
-
-6. **CORS**
-   - Frontend must run on `http://localhost:3000` or `http://localhost:3001`, or you need to add your origin to the API’s CORS middleware in `api.py`.
-
-7. **Errors**
-   - All errors return JSON `{ "detail": "..." }`. Use `detail` for user-facing or toast messages.
+```json
+{
+  "detail": "Message cannot be empty"
+}
+```
 
 ---
 
-## OpenAPI / Swagger
+## OpenAPI and Swagger
 
 When the server is running, interactive docs are available at:
 
-- **Swagger UI:** `http://localhost:8000/docs`
-- **ReDoc:** `http://localhost:8000/redoc`
+- Swagger UI: `http://localhost:8000/docs`
+- ReDoc: `http://localhost:8000/redoc`
 
-Use them to try endpoints and see exact request/response schemas.
+Use them to inspect live schemas and try requests interactively.

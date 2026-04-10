@@ -3,7 +3,17 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, Text, JSON, Index
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Integer,
+    Text,
+    JSON,
+    Index,
+    UniqueConstraint,
+)
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -102,6 +112,12 @@ class Project(Base):
         cascade="all, delete-orphan",
         order_by="PipelineRun.created_at.desc()",
     )
+    pipeline_run_events: Mapped[list["PipelineRunEvent"]] = relationship(
+        "PipelineRunEvent",
+        back_populates="project",
+        cascade="all, delete-orphan",
+        order_by="PipelineRunEvent.seq.asc()",
+    )
     pipeline_human_gates: Mapped[list["PipelineHumanGate"]] = relationship(
         "PipelineHumanGate",
         back_populates="project",
@@ -114,6 +130,81 @@ class Project(Base):
         cascade="all, delete-orphan",
         order_by="PipelineEvaluation.created_at.desc()",
     )
+    runtime_states: Mapped[list["ProjectRuntimeState"]] = relationship(
+        "ProjectRuntimeState",
+        back_populates="project",
+        cascade="all, delete-orphan",
+        order_by="ProjectRuntimeState.scope.asc()",
+    )
+
+
+class TelegramUserLink(Base):
+    __tablename__ = "telegram_user_links"
+    __table_args__ = (
+        UniqueConstraint("user_id", name="uq_telegram_user_links_user_id"),
+        UniqueConstraint("chat_id", name="uq_telegram_user_links_chat_id"),
+        Index("ix_telegram_user_links_enabled", "enabled"),
+        Index("ix_telegram_user_links_updated", "updated_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    chat_type: Mapped[str] = mapped_column(Text, nullable=False, default="private")
+    telegram_user_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    chat_username: Mapped[str | None] = mapped_column(Text, nullable=True)
+    first_name: Mapped[str | None] = mapped_column(Text, nullable=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    linked_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+
+class TelegramLinkToken(Base):
+    __tablename__ = "telegram_link_tokens"
+    __table_args__ = (
+        UniqueConstraint("token_hash", name="uq_telegram_link_tokens_token_hash"),
+        Index("ix_telegram_link_tokens_user_created", "user_id", "created_at"),
+        Index("ix_telegram_link_tokens_expires", "expires_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    token_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+    )
 
 
 class Plan(Base):
@@ -124,6 +215,9 @@ class Plan(Base):
     """
 
     __tablename__ = "plans"
+    __table_args__ = (
+        Index("ix_plans_project_created", "project_id", "created_at"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
@@ -229,6 +323,9 @@ class TestRun(Base):
     """
 
     __tablename__ = "test_runs"
+    __table_args__ = (
+        Index("ix_test_runs_project_created", "project_id", "created_at"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
@@ -263,6 +360,8 @@ class TestRun(Base):
     stderr_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     exit_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
     trace_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    deployed_contracts: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    executed_calls: Mapped[list | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),
@@ -278,6 +377,9 @@ class Deployment(Base):
     """
 
     __tablename__ = "deployments"
+    __table_args__ = (
+        Index("ix_deployments_project_created", "project_id", "created_at"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
@@ -293,6 +395,7 @@ class Deployment(Base):
     # Avalanche Fuji
     network: Mapped[str] = mapped_column(Text, nullable=False, default="avalanche_fuji")
     contract_name: Mapped[str | None] = mapped_column(Text, nullable=True)
+    plan_contract_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     deployed_address: Mapped[str | None] = mapped_column(Text, nullable=True)
     tx_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
     snowtrace_url: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -328,6 +431,9 @@ class Message(Base):
     """
 
     __tablename__ = "messages"
+    __table_args__ = (
+        Index("ix_messages_project_session_created", "project_id", "session_id", "created_at"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
@@ -422,6 +528,20 @@ class PipelineRun(Base):
         DateTime(timezone=True),
         nullable=True,
     )
+    runner_token: Mapped[str | None] = mapped_column(Text, nullable=True)
+    runner_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    runner_heartbeat_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    next_event_seq: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=1,
+    )
     resumed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
         nullable=True,
@@ -437,6 +557,184 @@ class PipelineRun(Base):
     )
 
     project: Mapped["Project"] = relationship("Project", back_populates="pipeline_runs")
+
+
+class PipelineRunSnapshot(Base):
+    __tablename__ = "pipeline_run_snapshots"
+    __table_args__ = (
+        Index("ix_pipeline_run_snapshots_project_updated", "project_id", "updated_at"),
+    )
+
+    pipeline_run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("pipeline_runs.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="created")
+    failure_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    snapshot_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+
+class PipelineRunEvent(Base):
+    __tablename__ = "pipeline_run_events"
+    __table_args__ = (
+        UniqueConstraint(
+            "pipeline_run_id",
+            "seq",
+            name="uq_pipeline_run_events_run_seq",
+        ),
+        Index("ix_pipeline_run_events_run_seq", "pipeline_run_id", "seq"),
+        Index("ix_pipeline_run_events_project_created", "project_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    pipeline_run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("pipeline_runs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    pipeline_task_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        nullable=True,
+        index=True,
+    )
+    seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    event_type: Mapped[str] = mapped_column(Text, nullable=False)
+    stage: Mapped[str | None] = mapped_column(Text, nullable=True)
+    payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        index=True,
+    )
+
+    project: Mapped["Project"] = relationship(
+        "Project", back_populates="pipeline_run_events"
+    )
+
+
+class NotificationOutbox(Base):
+    __tablename__ = "notification_outbox"
+    __table_args__ = (
+        UniqueConstraint("dedupe_key", name="uq_notification_outbox_dedupe_key"),
+        Index(
+            "ix_notification_outbox_channel_status_created",
+            "channel",
+            "status",
+            "created_at",
+        ),
+        Index("ix_notification_outbox_pipeline_run_id", "pipeline_run_id"),
+        Index("ix_notification_outbox_claimed_at", "claimed_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    pipeline_run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("pipeline_runs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    channel: Mapped[str] = mapped_column(Text, nullable=False)
+    event_type: Mapped[str] = mapped_column(Text, nullable=False)
+    payload_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    dedupe_key: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="pending")
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+
+class ProjectRuntimeState(Base):
+    __tablename__ = "project_runtime_states"
+    __table_args__ = (
+        UniqueConstraint(
+            "project_id",
+            "scope",
+            name="uq_project_runtime_states_project_scope",
+        ),
+        Index(
+            "ix_project_runtime_states_project_scope",
+            "project_id",
+            "scope",
+        ),
+        Index(
+            "ix_project_runtime_states_project_updated",
+            "project_id",
+            "updated_at",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    scope: Mapped[str] = mapped_column(Text, nullable=False)
+    state_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    project: Mapped["Project"] = relationship(
+        "Project", back_populates="runtime_states"
+    )
 
 
 class PipelineHumanGate(Base):
@@ -509,6 +807,12 @@ class PipelineEvaluation(Base):
             "pipeline_run_id",
             "stage",
             "created_at",
+        ),
+        Index(
+            "ix_pipeline_evaluations_run_created",
+            "pipeline_run_id",
+            "created_at",
+            "id",
         ),
     )
 
@@ -585,6 +889,13 @@ class PipelineTask(Base):
             "pipeline_run_id",
             "status",
             "artifact_revision",
+            "created_at",
+            "sequence_index",
+            "id",
+        ),
+        Index(
+            "ix_pipeline_tasks_run_created",
+            "pipeline_run_id",
             "created_at",
             "sequence_index",
             "id",

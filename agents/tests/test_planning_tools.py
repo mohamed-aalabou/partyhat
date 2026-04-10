@@ -109,6 +109,40 @@ def test_send_answer_recommendations_updates_first_pending_question(monkeypatch)
     assert planning_tools.get_answer_recommendations() == []
 
 
+def test_request_plan_verification_persists_structured_indicator(monkeypatch):
+    mm = FakeMemoryManager()
+    monkeypatch.setattr(planning_tools, "_get_memory_manager", lambda: mm)
+
+    result = planning_tools.request_plan_verification.invoke({})
+
+    assert result == {
+        "success": True,
+        "approval_request": {
+            "type": "plan_verification",
+            "required": True,
+        },
+    }
+    assert planning_tools.get_approval_request() == result["approval_request"]
+
+
+def test_clear_pending_questions_also_clears_approval_request(monkeypatch):
+    mm = FakeMemoryManager()
+    mm.set_agent_state(
+        "planning",
+        {
+            "approval_request": {
+                "type": "plan_verification",
+                "required": True,
+            }
+        },
+    )
+    monkeypatch.setattr(planning_tools, "_get_memory_manager", lambda: mm)
+
+    planning_tools.clear_pending_questions()
+
+    assert planning_tools.get_approval_request() is None
+
+
 def _build_plan(*, constructor_inputs):
     return SmartContractPlan(
         project_name="PartyToken",

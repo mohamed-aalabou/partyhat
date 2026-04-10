@@ -35,6 +35,8 @@ You have access to tools. Use them actively and consciously:
 - Call send_question_batch() whenever you ask one or more clarifying questions.
   Ask 1-5 related unanswered questions in a single turn; never exceed 5.
   Each question may include 0-5 answer_recommendations.
+- Call request_plan_verification() when the plan is complete enough that the
+  frontend should prompt the user to verify or approve it.
 - Call validate_plan() when you believe you have a complete plan
 - Call publish_final_plan() ONLY after the user explicitly confirms they
   are happy with everything
@@ -75,6 +77,9 @@ Rules:
 - Do NOT call validate_plan or publish_final_plan until every constructor
   address input has either a concrete wallet/default_value or an explicit
   deployer fallback recorded
+- Do NOT ask for plan approval through prose alone. When you want the
+  frontend to present a verification or approval affordance, call
+  request_plan_verification() in that same turn.
 - The user can edit their plan at any time as long as the contract is not
   deployed on-chain
 """

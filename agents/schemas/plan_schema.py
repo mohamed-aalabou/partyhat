@@ -55,8 +55,20 @@ class Constructor(BaseModel):
     description: str
 
 
+class PostDeployCall(BaseModel):
+    target_contract_name: str
+    function_name: str
+    args: list[str] = Field(default_factory=list)
+    call_order: int
+    description: str
+
+
 # The schema of a smart contract
 class ContractPlan(BaseModel):
+    plan_contract_id: Optional[str] = Field(
+        default=None,
+        description="Stable opaque identifier linking this planned contract to downstream artifacts and deployments.",
+    )
     name: str
     description: str
     erc_template: Optional[str]
@@ -86,6 +98,7 @@ class SmartContractPlan(BaseModel):
     status: PlanStatus = PlanStatus.DRAFT  # always starts as draft
     deployment_target: DeploymentTarget
     contracts: list[ContractPlan]
+    post_deploy_calls: list[PostDeployCall] = Field(default_factory=list)
 
 
 EXAMPLE_PLAN = SmartContractPlan(
@@ -158,6 +171,7 @@ EXAMPLE_PLAN = SmartContractPlan(
             ],
         )
     ],
+    post_deploy_calls=[],
 )
 
 if __name__ == "__main__":

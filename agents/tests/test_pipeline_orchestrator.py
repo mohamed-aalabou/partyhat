@@ -4,11 +4,14 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
+from agents.deployment_manifest import load_deployment_manifest
 from agents import pipeline_orchestrator as orchestrator
 from agents.pipeline_specs import (
     default_deployment_target_payload,
     retry_budget_key_for_task,
 )
+
+PLAN_CONTRACT_ID = "pc_partytoken"
 
 
 @dataclass
@@ -30,6 +33,9 @@ class FakeRun:
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     started_at: datetime | None = None
     paused_at: datetime | None = None
+    runner_token: str | None = None
+    runner_started_at: datetime | None = None
+    runner_heartbeat_at: datetime | None = None
     resumed_at: datetime | None = None
     completed_at: datetime | None = None
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
@@ -123,6 +129,7 @@ class FakeMemoryManager:
         "deployment_target": default_deployment_target_payload(),
         "contracts": [
             {
+                "plan_contract_id": PLAN_CONTRACT_ID,
                 "name": "PartyToken",
                 "description": "Primary token contract",
                 "erc_template": "ERC-20",
@@ -161,6 +168,14 @@ def _build_context(
             "project_name": "PartyToken",
             "erc_standard": "ERC-20",
             "contract_names": ["PartyToken"],
+            "plan_contracts": [
+                {
+                    "plan_contract_id": PLAN_CONTRACT_ID,
+                    "name": "PartyToken",
+                    "deployment_role": "primary_deployable",
+                    "deploy_order": 1,
+                }
+            ],
             "key_constraints": ["dependency:Ownable"],
         },
         "input_artifacts": input_artifacts
@@ -213,11 +228,13 @@ def _build_harness(monkeypatch, *, drain_after_tests: bool = False):
     created_counter = 0
     state = {
         "run": None,
+        "snapshot": None,
         "tasks": [],
         "gates": [],
         "evaluations": [],
         "test_runs": {},
         "deployments": {},
+        "notifications": [],
         "status_updates": [],
         "thread_ids": [],
         "user_messages": [],
@@ -229,6 +246,14 @@ def _build_harness(monkeypatch, *, drain_after_tests: bool = False):
                 "project_name": "PartyToken",
                 "erc_standard": "ERC-20",
                 "contract_names": ["PartyToken"],
+                "plan_contracts": [
+                    {
+                        "plan_contract_id": PLAN_CONTRACT_ID,
+                        "name": "PartyToken",
+                        "deployment_role": "primary_deployable",
+                        "deploy_order": 1,
+                    }
+                ],
                 "key_constraints": ["dependency:Ownable"],
             }
         },
@@ -318,6 +343,49 @@ def _build_harness(monkeypatch, *, drain_after_tests: bool = False):
         if run is not None and run.id == pipeline_run_id:
             return run
         return None
+
+    async def fake_get_pipeline_run_snapshot(session, pipeline_run_id):
+        run = state["run"]
+        snapshot = state["snapshot"]
+        if run is None or run.id != pipeline_run_id or snapshot is None:
+            return None
+        return snapshot
+
+    async def fake_refresh_pipeline_run_snapshot(session, pipeline_run_id):
+        run = state["run"]
+        if run is None or run.id != pipeline_run_id:
+            return None
+        payload = orchestrator.build_pipeline_status_payload(
+            project_id=str(run.project_id),
+            pipeline_run_id=str(run.id),
+            run=run,
+            tasks=[
+                task
+                for task in state["tasks"]
+                if task.pipeline_run_id == pipeline_run_id
+            ],
+            gates=[
+                gate
+                for gate in state["gates"]
+                if gate.pipeline_run_id == pipeline_run_id
+            ],
+            evaluations=[
+                evaluation
+                for evaluation in state["evaluations"]
+                if evaluation.pipeline_run_id == pipeline_run_id
+            ],
+        )
+        snapshot = SimpleNamespace(
+            pipeline_run_id=pipeline_run_id,
+            project_id=run.project_id,
+            status=payload["status"],
+            failure_reason=payload["failure_reason"],
+            snapshot_json=payload,
+            version=(getattr(state["snapshot"], "version", 0) or 0) + 1,
+            updated_at=run.updated_at,
+        )
+        state["snapshot"] = snapshot
+        return snapshot
 
     async def fake_get_current_plan_row(session, project_id):
         return SimpleNamespace(id=uuid.uuid4(), plan_data=FakeMemoryManager.plan)
@@ -494,7 +562,11 @@ def _build_harness(monkeypatch, *, drain_after_tests: bool = False):
         if current_task.task_type == "coding.generate_contracts":
             FakeMemoryManager.agent_states["coding"]["latest_artifact_revision"] = 1
             FakeMemoryManager.agent_states["coding"]["artifacts"] = [
-                {"path": "contracts/PartyToken.sol", "contract_names": ["PartyToken"]}
+                {
+                    "path": "contracts/PartyToken.sol",
+                    "contract_names": ["PartyToken"],
+                    "plan_contract_ids": [PLAN_CONTRACT_ID],
+                }
             ]
             await fake_complete_pipeline_task_and_create_next(
                 None,
@@ -529,6 +601,7 @@ def _build_harness(monkeypatch, *, drain_after_tests: bool = False):
                 {
                     "path": "test/PartyTokenTest.t.sol",
                     "contract_names": ["PartyTokenTest"],
+                    "plan_contract_ids": [PLAN_CONTRACT_ID],
                 }
             ]
             await fake_complete_pipeline_task_and_create_next(
@@ -618,6 +691,7 @@ def _build_harness(monkeypatch, *, drain_after_tests: bool = False):
                 {
                     "path": "script/DeployPartyToken.s.sol",
                     "contract_names": ["DeployPartyToken"],
+                    "plan_contract_ids": [PLAN_CONTRACT_ID],
                 }
             ]
             gate = FakeGate(
@@ -629,6 +703,8 @@ def _build_harness(monkeypatch, *, drain_after_tests: bool = False):
                 requested_payload={
                     "script_path": "script/DeployPartyToken.s.sol",
                     "contract_name": "PartyToken",
+                    "plan_contract_id": PLAN_CONTRACT_ID,
+                    "plan_contract_ids": [PLAN_CONTRACT_ID],
                 },
                 requested_by="system",
             )
@@ -661,6 +737,8 @@ def _build_harness(monkeypatch, *, drain_after_tests: bool = False):
                             ),
                             "script_path": "script/DeployPartyToken.s.sol",
                             "contract_name": "PartyToken",
+                            "plan_contract_id": PLAN_CONTRACT_ID,
+                            "plan_contract_ids": [PLAN_CONTRACT_ID],
                         },
                         status="waiting_for_approval",
                         gate_id=gate.id,
@@ -745,10 +823,44 @@ def _build_harness(monkeypatch, *, drain_after_tests: bool = False):
     async def fake_postprocess_task(*, project_id, user_id, pipeline_run_id, task):
         return []
 
+    async def fake_finalize_pipeline_terminal_status(
+        *,
+        project_id,
+        user_id,
+        pipeline_run_id,
+        status,
+        terminal_deployment=None,
+        failure_class=None,
+        failure_reason=None,
+    ):
+        run = state["run"]
+        assert run is not None
+        assert str(run.id) == pipeline_run_id
+        run.status = status
+        run.completed_at = datetime.now(timezone.utc)
+        run.failure_class = failure_class
+        run.failure_reason = failure_reason
+        run.terminal_deployment_id = (
+            terminal_deployment.id if terminal_deployment is not None else None
+        )
+        state["notifications"].append(
+            {
+                "pipeline_run_id": pipeline_run_id,
+                "status": status,
+                "failure_reason": failure_reason,
+                "terminal_deployment_id": (
+                    str(terminal_deployment.id)
+                    if terminal_deployment is not None
+                    else None
+                ),
+            }
+        )
+
     monkeypatch.setattr(orchestrator, "async_session_factory", lambda: DummySessionManager())
     monkeypatch.setattr(orchestrator, "create_pipeline_run", fake_create_pipeline_run)
     monkeypatch.setattr(orchestrator, "update_pipeline_run", fake_update_pipeline_run)
     monkeypatch.setattr(orchestrator, "get_pipeline_run", fake_get_pipeline_run)
+    monkeypatch.setattr(orchestrator, "get_pipeline_run_snapshot", fake_get_pipeline_run_snapshot)
     monkeypatch.setattr(orchestrator, "get_current_plan_row", fake_get_current_plan_row)
     monkeypatch.setattr(orchestrator, "get_next_retry_attempt", fake_get_next_retry_attempt)
     monkeypatch.setattr(orchestrator, "create_pipeline_task", fake_create_pipeline_task)
@@ -765,6 +877,11 @@ def _build_harness(monkeypatch, *, drain_after_tests: bool = False):
     monkeypatch.setattr(orchestrator, "list_pipeline_evaluations", fake_list_pipeline_evaluations)
     monkeypatch.setattr(
         orchestrator,
+        "refresh_pipeline_run_snapshot",
+        fake_refresh_pipeline_run_snapshot,
+    )
+    monkeypatch.setattr(
+        orchestrator,
         "get_successful_terminal_deployment",
         fake_get_successful_terminal_deployment,
     )
@@ -772,6 +889,11 @@ def _build_harness(monkeypatch, *, drain_after_tests: bool = False):
     monkeypatch.setattr(orchestrator, "_execute_direct_task", fake_execute_direct_task)
     monkeypatch.setattr(orchestrator, "_validate_execution_result", fake_validate_execution_result)
     monkeypatch.setattr(orchestrator, "_postprocess_task", fake_postprocess_task)
+    monkeypatch.setattr(
+        orchestrator,
+        "_finalize_pipeline_terminal_status",
+        fake_finalize_pipeline_terminal_status,
+    )
     monkeypatch.setattr(orchestrator, "MemoryManager", FakeMemoryManager)
     monkeypatch.setattr(orchestrator, "is_pipeline_cancelled", lambda pipeline_run_id: False)
     monkeypatch.setattr(
@@ -809,11 +931,13 @@ def test_pipeline_pauses_for_pre_deploy_gate_after_prepare_script(monkeypatch):
     assert state["run"].status == "waiting_for_approval"
     assert len(state["gates"]) == 1
     assert state["gates"][0].gate_type == "pre_deploy"
+    assert state["gates"][0].requested_payload["plan_contract_id"] == PLAN_CONTRACT_ID
     waiting_task = next(
         task for task in state["tasks"] if task.task_type == "deployment.execute_deploy"
     )
     assert waiting_task.status == "waiting_for_approval"
     assert waiting_task.gate_id == state["gates"][0].id
+    assert waiting_task.context["plan_contract_id"] == PLAN_CONTRACT_ID
 
 
 def test_pipeline_resumes_after_gate_approval_and_completes(monkeypatch):
@@ -843,6 +967,7 @@ def test_pipeline_resumes_after_gate_approval_and_completes(monkeypatch):
     assert state["run"].status == "completed"
     assert state["run"].terminal_deployment_id is not None
     assert state["status_updates"][-1] == "deployed"
+    assert state["notifications"][-1]["status"] == "completed"
 
 
 def test_pipeline_fails_when_queue_drains_without_successful_terminal_deploy(monkeypatch):
@@ -856,6 +981,21 @@ def test_pipeline_fails_when_queue_drains_without_successful_terminal_deploy(mon
     assert not any(event["type"] == "pipeline_complete" for event in events)
     assert state["run"].status == "failed"
     assert state["status_updates"][-1] == "failed"
+    assert state["notifications"][-1]["status"] == "failed"
+
+
+def test_pipeline_cancellation_enqueues_terminal_notification(monkeypatch):
+    state = _build_harness(monkeypatch)
+    project_id = str(uuid.uuid4())
+    user_id = str(uuid.uuid4())
+
+    monkeypatch.setattr(orchestrator, "is_pipeline_cancelled", lambda pipeline_run_id: True)
+
+    events = _collect_events(project_id, user_id)
+
+    assert any(event["type"] == "pipeline_cancelled" for event in events)
+    assert state["run"].status == "cancelled"
+    assert state["notifications"][-1]["status"] == "cancelled"
 
 
 def test_pipeline_uses_per_task_thread_ids_and_context(monkeypatch):
@@ -920,6 +1060,7 @@ def test_pipeline_status_includes_run_gates_and_evaluations(monkeypatch):
     assert status["status"] == "waiting_for_approval"
     assert status["run"]["status"] == "waiting_for_approval"
     assert status["gates"][0]["gate_type"] == "pre_deploy"
+    assert status["gates"][0]["requested_payload"]["plan_contract_id"] == PLAN_CONTRACT_ID
     assert status["evaluations"][0]["evaluation_type"] == "deployment_prepare"
     assert first_task["context"]["plan_summary"]["project_name"] == "PartyToken"
     assert first_task["claimed_at"] is not None
@@ -929,6 +1070,93 @@ def test_pipeline_status_includes_run_gates_and_evaluations(monkeypatch):
         run_tests_task["context"]["input_artifacts"]["coding"][0]["path"]
         == "contracts/PartyToken.sol"
     )
+
+
+def test_pipeline_status_uses_snapshot_fast_path(monkeypatch):
+    state = _build_harness(monkeypatch)
+    project_id = str(uuid.uuid4())
+    user_id = str(uuid.uuid4())
+
+    events = _collect_events(project_id, user_id)
+    pipeline_run_id = next(
+        event for event in events if event["type"] == "pipeline_start"
+    )["pipeline_run_id"]
+    run = state["run"]
+    assert run is not None
+
+    snapshot_payload = orchestrator.build_pipeline_status_payload(
+        project_id=project_id,
+        pipeline_run_id=pipeline_run_id,
+        run=run,
+        tasks=[
+            task
+            for task in state["tasks"]
+            if task.pipeline_run_id == uuid.UUID(pipeline_run_id)
+        ],
+        gates=[
+            gate
+            for gate in state["gates"]
+            if gate.pipeline_run_id == uuid.UUID(pipeline_run_id)
+        ],
+        evaluations=[
+            evaluation
+            for evaluation in state["evaluations"]
+            if evaluation.pipeline_run_id == uuid.UUID(pipeline_run_id)
+        ],
+    )
+    state["snapshot"] = SimpleNamespace(
+        pipeline_run_id=uuid.UUID(pipeline_run_id),
+        project_id=run.project_id,
+        status=snapshot_payload["status"],
+        failure_reason=snapshot_payload["failure_reason"],
+        snapshot_json=snapshot_payload,
+        version=1,
+        updated_at=run.updated_at,
+    )
+
+    async def fail_get_pipeline_run_tasks(*_args, **_kwargs):
+        raise AssertionError("snapshot fast path should not load tasks")
+
+    monkeypatch.setattr(orchestrator, "get_pipeline_run_tasks", fail_get_pipeline_run_tasks)
+
+    status = asyncio.run(
+        orchestrator.get_pipeline_status(
+            project_id=project_id,
+            user_id=user_id,
+            pipeline_run_id=pipeline_run_id,
+        )
+    )
+
+    assert status["pipeline_run_id"] == pipeline_run_id
+    assert status["run"]["status"] == state["snapshot"].status
+    assert len(status["tasks"]) == len(snapshot_payload["tasks"])
+
+
+def test_pipeline_status_summary_only_omits_collections(monkeypatch):
+    state = _build_harness(monkeypatch)
+    project_id = str(uuid.uuid4())
+    user_id = str(uuid.uuid4())
+
+    events = _collect_events(project_id, user_id)
+    pipeline_run_id = next(
+        event for event in events if event["type"] == "pipeline_start"
+    )["pipeline_run_id"]
+
+    status = asyncio.run(
+        orchestrator.get_pipeline_status(
+            project_id=project_id,
+            user_id=user_id,
+            pipeline_run_id=pipeline_run_id,
+            include_tasks=False,
+            include_gates=False,
+            include_evaluations=False,
+        )
+    )
+
+    assert status["total_tasks"] == len(state["tasks"])
+    assert status["tasks"] == []
+    assert status["gates"] == []
+    assert status["evaluations"] == []
 
 
 def test_constructor_literals_use_explicit_defaults_and_deployer_fallback():
@@ -972,3 +1200,343 @@ def test_constructor_literals_use_explicit_defaults_and_deployer_fallback():
         and "0x1111111111111111111111111111111111111111" in constraint
         for constraint in constraints
     )
+
+
+def test_pipeline_run_canonicalizes_legacy_fuji_deployment_target(monkeypatch):
+    legacy_plan = {
+        **FakeMemoryManager.plan,
+        "deployment_target": {
+            "network": "avalanche",
+            "name": "fuji",
+            "description": "Avalanche Fuji testnet",
+            "chain_id": 43113,
+            "rpc_url_env_var": "FUJI_RPC_URL",
+            "private_key_env_var": "FUJI_PRIVATE_KEY",
+        },
+    }
+    monkeypatch.setattr(FakeMemoryManager, "plan", legacy_plan, raising=False)
+
+    state = _build_harness(monkeypatch)
+    project_id = str(uuid.uuid4())
+    user_id = str(uuid.uuid4())
+
+    _collect_events(project_id, user_id)
+
+    assert state["run"].deployment_target["network"] == default_deployment_target_payload()["network"]
+    assert state["run"].deployment_target["name"] == default_deployment_target_payload()["name"]
+    assert state["run"].deployment_target["chain_id"] == default_deployment_target_payload()["chain_id"]
+    assert (
+        state["run"].deployment_target["rpc_url_env_var"]
+        == default_deployment_target_payload()["rpc_url_env_var"]
+    )
+    assert (
+        state["run"].deployment_target["private_key_env_var"]
+        == default_deployment_target_payload()["private_key_env_var"]
+    )
+
+
+def _multi_contract_manifest():
+    return load_deployment_manifest(
+        {
+            "deployment_target": default_deployment_target_payload(),
+            "contracts": [
+                {
+                    "plan_contract_id": "pc_vesting",
+                    "name": "AvaVestVesting",
+                    "role": "primary_deployable",
+                    "deploy_order": 1,
+                    "source_path": "contracts/AvaVestVesting.sol",
+                    "constructor_args_schema": [],
+                },
+                {
+                    "plan_contract_id": "pc_token",
+                    "name": "AvaVestToken",
+                    "role": "supporting",
+                    "deploy_order": 2,
+                    "source_path": "contracts/AvaVestToken.sol",
+                    "constructor_args_schema": [
+                        {
+                            "name": "vesting",
+                            "type": "address",
+                            "source": "plan_default",
+                            "default_value": "<deployed:AvaVestVesting.address>",
+                        }
+                    ],
+                },
+            ],
+            "post_deploy_calls": [
+                {
+                    "target_contract_name": "AvaVestVesting",
+                    "target_plan_contract_id": "pc_vesting",
+                    "function_name": "setToken",
+                    "args": ["<deployed:AvaVestToken.address>"],
+                    "call_order": 1,
+                    "description": "Wire token",
+                }
+            ],
+        }
+    )
+
+
+def test_handle_prepare_script_passes_full_manifest_and_all_contract_ids(monkeypatch):
+    manifest = _multi_contract_manifest()
+    captured: dict[str, object] = {}
+
+    class MinimalMemoryManager:
+        def __init__(self, user_id: str, project_id: str):
+            self.user_id = user_id
+            self.project_id = project_id
+
+        def get_agent_state(self, agent_name: str) -> dict:
+            if agent_name == "coding":
+                return {
+                    "artifacts": [
+                        {
+                            "path": "contracts/AvaVestVesting.sol",
+                            "contract_names": ["AvaVestVesting"],
+                            "plan_contract_ids": ["pc_vesting"],
+                        },
+                        {
+                            "path": "contracts/AvaVestToken.sol",
+                            "contract_names": ["AvaVestToken"],
+                            "plan_contract_ids": ["pc_token"],
+                        },
+                    ]
+                }
+            if agent_name == "planning":
+                return {
+                    "plan_summary": {
+                        "project_name": "AvaVest",
+                        "plan_contracts": [
+                            {
+                                "plan_contract_id": "pc_vesting",
+                                "name": "AvaVestVesting",
+                                "deployment_role": "primary_deployable",
+                                "deploy_order": 1,
+                            },
+                            {
+                                "plan_contract_id": "pc_token",
+                                "name": "AvaVestToken",
+                                "deployment_role": "supporting",
+                                "deploy_order": 2,
+                            },
+                        ],
+                    }
+                }
+            return {"artifacts": []}
+
+        def get_plan(self) -> dict:
+            return {
+                "project_name": "AvaVest",
+                "contracts": [
+                    {"name": "AvaVestVesting"},
+                    {"name": "AvaVestToken"},
+                ],
+            }
+
+    task = FakeTask(
+        id=uuid.uuid4(),
+        pipeline_run_id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        assigned_to="deployment",
+        created_by="testing",
+        task_type="deployment.prepare_script",
+        description="Prepare deployment script",
+        status="in_progress",
+        context={},
+        artifact_revision=3,
+    )
+
+    monkeypatch.setattr(orchestrator, "MemoryManager", MinimalMemoryManager)
+    monkeypatch.setattr(orchestrator, "load_saved_manifest", lambda project_id: (manifest, None))
+    monkeypatch.setattr(
+        orchestrator,
+        "load_code_artifact",
+        SimpleNamespace(
+            func=lambda path: {
+                "code": f"contract {path.split('/')[-1].replace('.sol', '')} {{}}"
+            }
+        ),
+    )
+
+    def fake_generate(request):
+        captured["request"] = request
+        return {"generated_script": "// script"}
+
+    def fake_save_artifact(artifact):
+        captured["artifact"] = artifact
+        return {"success": True}
+
+    monkeypatch.setattr(orchestrator, "generate_foundry_deploy_script_direct", fake_generate)
+    monkeypatch.setattr(
+        orchestrator,
+        "save_deploy_artifact",
+        SimpleNamespace(func=fake_save_artifact),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "evaluate_deployment_prepare",
+        lambda project_id, user_id, script_path: {"status": "passed", "summary": "ok"},
+    )
+
+    async def fake_record_pipeline_evaluation(**kwargs):
+        return uuid.uuid4()
+
+    async def fake_create_gate_for_task(**kwargs):
+        return FakeGate(
+            id=uuid.uuid4(),
+            pipeline_run_id=uuid.UUID(kwargs["pipeline_run_id"]),
+            pipeline_task_id=kwargs["task"].id,
+            gate_type="pre_deploy",
+        )
+
+    async def fake_next_task_payload(*args, **kwargs):
+        return {
+            "assigned_to": kwargs["assigned_to"],
+            "task_type": kwargs["task_type"],
+            "description": kwargs["description"],
+            "parent_task_id": str(task.id),
+            "sequence_index": 0,
+            "artifact_revision": kwargs["artifact_revision"],
+            "retry_budget_key": "deploy",
+            "retry_attempt": 0,
+            "status": kwargs.get("status", "pending"),
+            "gate_id": kwargs.get("gate_id"),
+            "context": kwargs["context"],
+        }
+
+    async def fake_finalize_direct_task(**kwargs):
+        captured["finalize"] = kwargs
+
+    monkeypatch.setattr(orchestrator, "_record_pipeline_evaluation", fake_record_pipeline_evaluation)
+    monkeypatch.setattr(orchestrator, "_create_gate_for_task", fake_create_gate_for_task)
+    monkeypatch.setattr(orchestrator, "_next_task_payload", fake_next_task_payload)
+    monkeypatch.setattr(orchestrator, "_finalize_direct_task", fake_finalize_direct_task)
+
+    events = asyncio.run(
+        orchestrator._handle_prepare_script(
+            task,
+            project_id=str(task.project_id),
+            user_id=str(uuid.uuid4()),
+            pipeline_run_id=str(task.pipeline_run_id),
+        )
+    )
+
+    assert events[0]["tool"] == "generate_foundry_deploy_script_direct"
+    request = captured["request"]
+    assert request.deployment_manifest["contracts"][0]["name"] == "AvaVestVesting"
+    assert request.deployment_manifest["contracts"][1]["name"] == "AvaVestToken"
+    assert "// contracts/AvaVestVesting.sol" in request.contract_sources
+    assert "// contracts/AvaVestToken.sol" in request.contract_sources
+    artifact = captured["artifact"]
+    assert artifact.plan_contract_ids == ["pc_vesting", "pc_token"]
+    next_task = captured["finalize"]["next_tasks"][0]
+    assert next_task["task_type"] == "deployment.execute_deploy"
+    assert next_task["context"]["plan_contract_ids"] == ["pc_vesting", "pc_token"]
+
+
+def test_handle_execute_deploy_records_multi_contract_results(monkeypatch):
+    manifest = _multi_contract_manifest()
+    captured: dict[str, object] = {}
+
+    class MinimalMemoryManager:
+        def __init__(self, user_id: str, project_id: str):
+            self.user_id = user_id
+            self.project_id = project_id
+
+        def get_agent_state(self, agent_name: str) -> dict:
+            return {"artifacts": []}
+
+    task = FakeTask(
+        id=uuid.uuid4(),
+        pipeline_run_id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        assigned_to="deployment",
+        created_by="testing",
+        task_type="deployment.execute_deploy",
+        description="Execute deployment",
+        status="in_progress",
+        artifact_revision=4,
+        context={
+            "script_path": "script/DeployAvaVestVesting.s.sol",
+            "contract_name": "AvaVestVesting",
+            "plan_contract_id": "pc_vesting",
+            "plan_contract_ids": ["pc_vesting", "pc_token"],
+        },
+    )
+
+    monkeypatch.setattr(orchestrator, "MemoryManager", MinimalMemoryManager)
+    monkeypatch.setattr(orchestrator, "load_saved_manifest", lambda project_id: (manifest, None))
+
+    def fake_run_deploy(request):
+        captured["request"] = request
+        return {
+            "success": True,
+            "exit_code": 0,
+            "command": "forge script script/DeployAvaVestVesting.s.sol --broadcast",
+            "stdout_path": "stdout.log",
+            "stderr_path": "stderr.log",
+            "tx_hash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "deployed_address": "0x1111111111111111111111111111111111111111",
+            "deployed_contracts": [
+                {
+                    "contract_name": "AvaVestVesting",
+                    "plan_contract_id": "pc_vesting",
+                    "deploy_order": 1,
+                    "tx_hash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "deployed_address": "0x1111111111111111111111111111111111111111",
+                },
+                {
+                    "contract_name": "AvaVestToken",
+                    "plan_contract_id": "pc_token",
+                    "deploy_order": 2,
+                    "tx_hash": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "deployed_address": "0x2222222222222222222222222222222222222222",
+                },
+            ],
+            "executed_calls": [
+                {
+                    "target_contract_name": "AvaVestVesting",
+                    "target_plan_contract_id": "pc_vesting",
+                    "function_name": "setToken",
+                    "args": ["<deployed:AvaVestToken.address>"],
+                    "call_order": 1,
+                    "tx_hash": "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                    "status": "success",
+                }
+            ],
+        }
+
+    def fake_record_deployment(record):
+        captured["record"] = record
+        return {"success": True}
+
+    async def fake_finalize_direct_task(**kwargs):
+        captured["finalize"] = kwargs
+
+    monkeypatch.setattr(
+        orchestrator,
+        "run_foundry_deploy",
+        SimpleNamespace(func=fake_run_deploy),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "record_deployment",
+        SimpleNamespace(func=fake_record_deployment),
+    )
+    monkeypatch.setattr(orchestrator, "_finalize_direct_task", fake_finalize_direct_task)
+
+    events = asyncio.run(
+        orchestrator._handle_execute_deploy(
+            task,
+            project_id=str(task.project_id),
+            user_id=str(uuid.uuid4()),
+            pipeline_run_id=str(task.pipeline_run_id),
+        )
+    )
+
+    assert events[0]["tool"] == "run_foundry_deploy"
+    assert captured["request"].deployment_manifest["contracts"][1]["name"] == "AvaVestToken"
+    assert len(captured["record"].deployed_contracts) == 2
+    assert captured["record"].executed_calls[0].function_name == "setToken"
+    assert captured["finalize"]["task_status"] == "completed"

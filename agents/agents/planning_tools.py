@@ -5,10 +5,11 @@ Tools defined here:
     1. get_current_plan: to read current draft from memory
     2. send_question_batch: to expose up to 5 pending questions to UI
     3. send_answer_recommendations: legacy quick replies for single-question UI
-    4. save_plan_draft: to persist intermediate draft mid-conversation
-    5. validate_plan: to run Pydantic schema check explicitly
-    6. publish_final_plan: to finalise and save to user + global memory
-    7. save_reasoning_note: to log WHY a decision was made (episodic memory)
+    4. request_plan_verification: to expose a structured approval indicator to UI
+    5. save_plan_draft: to persist intermediate draft mid-conversation
+    6. validate_plan: to run Pydantic schema check explicitly
+    7. publish_final_plan: to finalise and save to user + global memory
+    8. save_reasoning_note: to log WHY a decision was made (episodic memory)
 """
 
 import sys
@@ -19,6 +20,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
+from agents.deployment_manifest import validate_deployed_placeholders
 from schemas.plan_schema import SmartContractPlan, PlanStatus
 
 
@@ -56,6 +58,17 @@ class PlanningQuestion(BaseModel):
             "Optional quick-reply suggestions for this specific question. "
             "Use 0-5 items."
         ),
+    )
+
+
+class PlanApprovalRequest(BaseModel):
+    type: str = Field(
+        default="plan_verification",
+        description="Frontend-visible approval request type for planning flows.",
+    )
+    required: bool = Field(
+        default=True,
+        description="Whether the user must verify or approve the plan before continuing.",
     )
 
 
@@ -114,6 +127,22 @@ def get_pending_questions() -> List[dict]:
         return []
 
 
+def get_approval_request() -> dict | None:
+    """
+    Read the latest structured planning approval request from agent state.
+    Returns None when no approval indicator is available.
+    """
+    try:
+        mm = _get_memory_manager()
+        state = mm.get_agent_state("planning")
+        approval_request = state.get("approval_request")
+        if isinstance(approval_request, dict):
+            return approval_request
+        return None
+    except Exception:
+        return None
+
+
 def clear_answer_recommendations() -> None:
     """
     Clear transient answer recommendations before each planning turn.
@@ -142,6 +171,9 @@ def clear_pending_questions() -> None:
             updated = True
         if state.get("answer_recommendations"):
             state["answer_recommendations"] = []
+            updated = True
+        if state.get("approval_request"):
+            state["approval_request"] = None
             updated = True
         if updated:
             mm.set_agent_state("planning", state)
@@ -205,6 +237,30 @@ def _deployment_manifest_issues(plan: SmartContractPlan) -> List[str]:
         )
     if len(deploy_orders) != len(set(deploy_orders)):
         issues.append("deploy_order values must be unique across deployable contracts.")
+
+    known_contract_names = {contract.name for contract in plan.contracts}
+    seen_call_orders: set[int] = set()
+    for index, call in enumerate(plan.post_deploy_calls, start=1):
+        if call.target_contract_name not in known_contract_names:
+            issues.append(
+                f"post_deploy_calls[{index}] references unknown target_contract_name '{call.target_contract_name}'."
+            )
+        if call.call_order in seen_call_orders:
+            issues.append(
+                f"post_deploy_calls has duplicate call_order {call.call_order}."
+            )
+        seen_call_orders.add(call.call_order)
+        for arg_index, arg in enumerate(call.args, start=1):
+            issues.extend(
+                validate_deployed_placeholders(
+                    arg,
+                    context=(
+                        f"post_deploy_calls[{index}] arg {arg_index} for "
+                        f"{call.target_contract_name}.{call.function_name}"
+                    ),
+                    known_contract_names=known_contract_names,
+                )
+            )
     return issues
 
 
@@ -339,6 +395,28 @@ def send_answer_recommendations(recommendations: List[AnswerRecommendation]) -> 
         }
     except Exception as e:
         return {"error": f"Could not save answer recommendations: {str(e)}"}
+
+
+@tool
+def request_plan_verification() -> dict:
+    """
+    Save a structured approval indicator for the current planning turn.
+
+    Use this when the plan is complete enough that the user should verify or
+    approve it through the frontend, instead of relying on prose alone.
+    """
+    try:
+        mm = _get_memory_manager()
+        state = mm.get_agent_state("planning")
+        approval_request = PlanApprovalRequest().model_dump()
+        state["approval_request"] = approval_request
+        mm.set_agent_state("planning", state)
+        return {
+            "success": True,
+            "approval_request": approval_request,
+        }
+    except Exception as e:
+        return {"error": f"Could not save approval request: {str(e)}"}
 
 
 @tool
@@ -505,6 +583,7 @@ PLANNING_TOOLS = [
     get_current_plan,
     send_question_batch,
     send_answer_recommendations,
+    request_plan_verification,
     save_plan_draft,
     validate_plan,
     publish_final_plan,
@@ -553,6 +632,7 @@ def set_planning_mcp_tools(tools: List) -> None:
         get_current_plan,
         send_question_batch,
         send_answer_recommendations,
+        request_plan_verification,
         save_plan_draft,
         validate_plan,
         publish_final_plan,

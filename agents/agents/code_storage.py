@@ -1,4 +1,6 @@
+import asyncio
 import os
+import time
 from io import BytesIO
 from pathlib import Path
 from typing import Protocol
@@ -33,6 +35,12 @@ class CodeStorage(Protocol):
     def load_code(self, path: str) -> str: ...
 
     def list_paths(self) -> list[str]: ...
+
+    async def asave_code(self, artifact: CodeArtifact, code: str) -> str: ...
+
+    async def aload_code(self, path: str) -> str: ...
+
+    async def alist_paths(self) -> list[str]: ...
 
 
 class LocalCodeStorage:
@@ -85,6 +93,15 @@ class LocalCodeStorage:
             if p.is_file()
         ]
 
+    async def asave_code(self, artifact: CodeArtifact, code: str) -> str:
+        return await asyncio.to_thread(self.save_code, artifact, code)
+
+    async def aload_code(self, path: str) -> str:
+        return await asyncio.to_thread(self.load_code, path)
+
+    async def alist_paths(self) -> list[str]:
+        return await asyncio.to_thread(self.list_paths)
+
 
 class ModalVolumeCodeStorage:
     """
@@ -117,6 +134,7 @@ class ModalVolumeCodeStorage:
             else:
                 base_dir = root
         self.base_dir = Path(str(base_dir).lstrip("/"))
+        self._last_reload_at = 0.0
 
     def _resolve_path(self, relative_path: str) -> Path:
         rel = Path(relative_path.lstrip("/"))
@@ -128,52 +146,11 @@ class ModalVolumeCodeStorage:
     def _as_volume_path(path: Path) -> str:
         return path.as_posix().lstrip("/")
 
-    def _safe_reload(self) -> None:
-        """
-        Refresh the volume view when running inside a Modal function.
+    @staticmethod
+    def _is_missing_path_error(error: Exception) -> bool:
+        return "No such file or directory" in str(error)
 
-        In local API processes (outside a running Modal function), Modal can raise
-        a RuntimeError for reload(). In that case we skip reload and keep serving
-        from the current mounted/accessible volume state.
-        """
-        try:
-            self._volume.reload()
-        except RuntimeError as e:
-            msg = str(e)
-            if "can only be called from within a running function" in msg:
-                return
-            raise
-        except Exception as e:
-            # Modal may surface missing volume paths via generic SDK exceptions.
-            if "No such file or directory" in str(e):
-                return
-            raise
-
-    def save_code(self, artifact: CodeArtifact, code: str) -> str:
-        rel_path = Path(artifact.path.lstrip("/"))
-        full_path = self._resolve_path(str(rel_path))
-        with self._volume.batch_upload(force=True) as batch:
-            batch.put_file(
-                BytesIO(code.encode("utf-8")),
-                self._as_volume_path(full_path),
-            )
-        return str(rel_path)
-
-    def load_code(self, path: str) -> str:
-        rel_path = Path(path.lstrip("/"))
-        full_path = self._resolve_path(str(rel_path))
-        self._safe_reload()
-        chunks = list(self._volume.read_file(self._as_volume_path(full_path)))
-        return b"".join(chunks).decode("utf-8")
-
-    def list_paths(self) -> list[str]:
-        self._safe_reload()
-        try:
-            entries = self._volume.listdir(self._as_volume_path(self.base_dir), recursive=True)
-        except Exception as e:
-            if "No such file or directory" not in str(e):
-                raise
-            return []
+    def _relative_file_paths(self, entries: list) -> list[str]:
         out: list[str] = []
         for entry in entries:
             # modal.volume.FileEntryType.FILE == 1
@@ -187,6 +164,107 @@ class ModalVolumeCodeStorage:
             out.append(rel.as_posix())
         out.sort()
         return out
+
+    def _safe_reload(self) -> None:
+        """
+        Refresh the volume view when running inside a Modal function.
+
+        In local API processes (outside a running Modal function), Modal can raise
+        a RuntimeError for reload(). In that case we skip reload and keep serving
+        from the current mounted/accessible volume state.
+        """
+        now = time.monotonic()
+        if now - self._last_reload_at < 0.25:
+            return
+        try:
+            self._volume.reload()
+            self._last_reload_at = now
+        except RuntimeError as e:
+            msg = str(e)
+            if "can only be called from within a running function" in msg:
+                return
+            raise
+        except Exception as e:
+            # Modal may surface missing volume paths via generic SDK exceptions.
+            if self._is_missing_path_error(e):
+                return
+            raise
+
+    async def _asafe_reload(self) -> None:
+        now = time.monotonic()
+        if now - self._last_reload_at < 0.25:
+            return
+        try:
+            await self._volume.reload.aio()
+            self._last_reload_at = now
+        except RuntimeError as e:
+            msg = str(e)
+            if "can only be called from within a running function" in msg:
+                return
+            raise
+        except Exception as e:
+            if self._is_missing_path_error(e):
+                return
+            raise
+
+    def save_code(self, artifact: CodeArtifact, code: str) -> str:
+        rel_path = Path(artifact.path.lstrip("/"))
+        full_path = self._resolve_path(str(rel_path))
+        with self._volume.batch_upload(force=True) as batch:
+            batch.put_file(
+                BytesIO(code.encode("utf-8")),
+                self._as_volume_path(full_path),
+            )
+        return str(rel_path)
+
+    async def asave_code(self, artifact: CodeArtifact, code: str) -> str:
+        rel_path = Path(artifact.path.lstrip("/"))
+        full_path = self._resolve_path(str(rel_path))
+        async with self._volume.batch_upload.aio(force=True) as batch:
+            batch.put_file(
+                BytesIO(code.encode("utf-8")),
+                self._as_volume_path(full_path),
+            )
+        return str(rel_path)
+
+    def load_code(self, path: str) -> str:
+        rel_path = Path(path.lstrip("/"))
+        full_path = self._resolve_path(str(rel_path))
+        self._safe_reload()
+        chunks = list(self._volume.read_file(self._as_volume_path(full_path)))
+        return b"".join(chunks).decode("utf-8")
+
+    async def aload_code(self, path: str) -> str:
+        rel_path = Path(path.lstrip("/"))
+        full_path = self._resolve_path(str(rel_path))
+        await self._asafe_reload()
+        chunks: list[bytes] = []
+        async for chunk in self._volume.read_file.aio(self._as_volume_path(full_path)):
+            chunks.append(chunk)
+        return b"".join(chunks).decode("utf-8")
+
+    def list_paths(self) -> list[str]:
+        self._safe_reload()
+        try:
+            entries = self._volume.listdir(self._as_volume_path(self.base_dir), recursive=True)
+        except Exception as e:
+            if not self._is_missing_path_error(e):
+                raise
+            return []
+        return self._relative_file_paths(entries)
+
+    async def alist_paths(self) -> list[str]:
+        await self._asafe_reload()
+        try:
+            entries = await self._volume.listdir.aio(
+                self._as_volume_path(self.base_dir),
+                recursive=True,
+            )
+        except Exception as e:
+            if not self._is_missing_path_error(e):
+                raise
+            return []
+        return self._relative_file_paths(entries)
 
 
 _STORAGE_CACHE: dict[tuple[bool, str | None], CodeStorage] = {}

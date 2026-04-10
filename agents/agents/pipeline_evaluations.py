@@ -4,6 +4,7 @@ import re
 from typing import Any
 
 from agents.code_storage import get_code_storage
+from agents.contract_identity import resolve_plan_contract_ids
 from agents.deployment_manifest import (
     MANIFEST_PATH,
     build_deployment_manifest,
@@ -16,21 +17,33 @@ from schemas.coding_schema import CodeArtifact
 
 
 def _upsert_agent_artifact(mm: MemoryManager, agent_name: str, artifact: dict[str, Any]) -> None:
-    data, block = mm._read_user_block()  # type: ignore[attr-defined]
-    mm._ensure_agents_structure(data)  # type: ignore[attr-defined]
-    agent_state = data["agents"][agent_name]
+    agent_state = mm.get_agent_state(agent_name)
     artifacts = agent_state.get("artifacts", [])
     filtered = [entry for entry in artifacts if entry.get("path") != artifact.get("path")]
     filtered.append(artifact)
     agent_state["artifacts"] = filtered
-    mm.client.blocks.update(  # type: ignore[attr-defined]
-        block.id,
-        value=mm._serialize(data),  # type: ignore[attr-defined]
-    )
+    mm.set_agent_state(agent_name, agent_state)
 
 
 def _memory_manager(project_id: str, user_id: str) -> MemoryManager:
     return MemoryManager(user_id=user_id, project_id=project_id)
+
+
+def _artifact_link_issues(
+    plan: dict | None,
+    artifacts: list[dict],
+) -> list[str]:
+    issues: list[str] = []
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            continue
+        _, artifact_issues = resolve_plan_contract_ids(
+            plan,
+            artifact,
+            allow_name_fallback=True,
+        )
+        issues.extend(artifact_issues)
+    return issues
 
 
 def evaluate_code_generation(project_id: str, user_id: str) -> dict[str, Any]:
@@ -38,10 +51,20 @@ def evaluate_code_generation(project_id: str, user_id: str) -> dict[str, Any]:
     plan = mm.get_plan() or {}
     coding_state = mm.get_agent_state("coding")
     artifacts = coding_state.get("artifacts", [])
-    manifest, issues = build_deployment_manifest(plan, artifacts)
+    issues = _artifact_link_issues(
+        plan,
+        [
+            artifact
+            for artifact in artifacts
+            if isinstance(artifact, dict)
+            and str(artifact.get("path") or "").startswith("contracts/")
+        ],
+    )
+    manifest, manifest_issues = build_deployment_manifest(plan, artifacts)
+    issues.extend(manifest_issues)
     artifact_revision = int(coding_state.get("latest_artifact_revision", 0) or 0)
 
-    if manifest is None:
+    if manifest is None or issues:
         return {
             "status": "failed",
             "blocking": True,
@@ -65,6 +88,7 @@ def evaluate_code_generation(project_id: str, user_id: str) -> dict[str, Any]:
             "language": "json",
             "description": "Authoritative deployment manifest",
             "contract_names": [c.name for c in manifest.contracts],
+            "plan_contract_ids": [c.plan_contract_id for c in manifest.contracts],
         },
     )
 
@@ -80,6 +104,7 @@ def evaluate_code_generation(project_id: str, user_id: str) -> dict[str, Any]:
 
 def evaluate_generated_tests(project_id: str, user_id: str) -> dict[str, Any]:
     mm = _memory_manager(project_id, user_id)
+    plan = mm.get_plan() or {}
     testing_state = mm.get_agent_state("testing")
     artifacts = testing_state.get("artifacts", [])
     storage = get_code_storage(project_id=project_id)
@@ -92,6 +117,12 @@ def evaluate_generated_tests(project_id: str, user_id: str) -> dict[str, Any]:
 
     for artifact in test_artifacts:
         path = str(artifact.get("path") or "")
+        _, artifact_issues = resolve_plan_contract_ids(
+            plan,
+            artifact,
+            allow_name_fallback=True,
+        )
+        issues.extend(artifact_issues)
         if not canonical_pattern.match(path):
             issues.append(f"Test artifact '{path}' is not in canonical test/*Test.t.sol form.")
             continue

@@ -21,6 +21,7 @@ from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
+from agents.contract_identity import enrich_artifact_with_plan_contract_ids
 from agents.pipeline_specs import (
     TERMINAL_SUCCESS_TASK_TYPES,
     retry_budget_key_for_task,
@@ -97,18 +98,47 @@ def _get_memory_manager(project_id: str | None, user_id: str | None):
 
 def _get_artifact_snapshot(project_id: str | None, user_id: str | None) -> dict:
     mm = _get_memory_manager(project_id, user_id)
+    plan = mm.get_plan()
+    def _enrich(entries: list[dict]) -> list[dict]:
+        return [
+            enrich_artifact_with_plan_contract_ids(
+                plan,
+                artifact,
+                allow_name_fallback=True,
+            )[0]
+            for artifact in entries
+            if isinstance(artifact, dict)
+        ]
     return {
-        "coding": mm.get_agent_state("coding").get("artifacts", []),
-        "testing": mm.get_agent_state("testing").get("artifacts", []),
-        "deployment": mm.get_agent_state("deployment").get("artifacts", []),
+        "coding": _enrich(mm.get_agent_state("coding").get("artifacts", [])),
+        "testing": _enrich(mm.get_agent_state("testing").get("artifacts", [])),
+        "deployment": _enrich(mm.get_agent_state("deployment").get("artifacts", [])),
     }
+
+
+def _get_agent_artifacts(
+    project_id: str | None,
+    user_id: str | None,
+    agent_name: str,
+) -> list[dict]:
+    mm = _get_memory_manager(project_id, user_id)
+    plan = mm.get_plan()
+    return [
+        enrich_artifact_with_plan_contract_ids(
+            plan,
+            artifact,
+            allow_name_fallback=True,
+        )[0]
+        for artifact in mm.get_agent_state(agent_name).get("artifacts", [])
+        if isinstance(artifact, dict)
+    ]
 
 
 def _get_plan_summary(project_id: str | None, user_id: str | None) -> dict:
     mm = _get_memory_manager(project_id, user_id)
     planning = mm.get_agent_state("planning")
     summary = planning.get("plan_summary")
-    if summary:
+    if summary and summary.get("plan_contracts") is not None:
         return summary
     plan = mm.get_plan()
     return extract_plan_summary(plan)
@@ -196,7 +226,7 @@ def _complete_and_create_sync(
                 ),
                 sequence_index=t.get("sequence_index", idx),
                 artifact_revision=t.get("artifact_revision", 0),
-                depends_on_task_ids=t.get("depends_on_task_ids"),
+                depends_on_task_ids=t.get("depends_on_task_ids") or [],
                 retry_budget_key=t.get("retry_budget_key"),
                 retry_attempt=t.get("retry_attempt", 0),
                 failure_class=t.get("failure_class"),
@@ -333,8 +363,29 @@ def _normalize_next_tasks(
 ) -> list[dict]:
     """Apply default pipeline context before writing follow-up tasks."""
     normalized = []
-    artifact_snapshot = _get_artifact_snapshot(project_id, user_id)
-    plan_summary = _get_plan_summary(project_id, user_id)
+    current_context = current_task.context if isinstance(current_task.context, dict) else {}
+    base_snapshot = current_context.get("input_artifacts")
+    if isinstance(base_snapshot, dict):
+        artifact_snapshot = {
+            "coding": list(base_snapshot.get("coding", []) or []),
+            "testing": list(base_snapshot.get("testing", []) or []),
+            "deployment": list(base_snapshot.get("deployment", []) or []),
+        }
+    else:
+        artifact_snapshot = {"coding": [], "testing": [], "deployment": []}
+
+    if current_task.assigned_to in artifact_snapshot:
+        artifact_snapshot[current_task.assigned_to] = _get_agent_artifacts(
+            project_id,
+            user_id,
+            current_task.assigned_to,
+        )
+    elif not any(artifact_snapshot.values()):
+        artifact_snapshot = _get_artifact_snapshot(project_id, user_id)
+
+    plan_summary = current_context.get("plan_summary")
+    if not isinstance(plan_summary, dict) or plan_summary.get("plan_contracts") is None:
+        plan_summary = _get_plan_summary(project_id, user_id)
     artifact_revision = _next_artifact_revision(current_task, task_status)
     upstream_task = {
         "task_id": str(current_task.id),

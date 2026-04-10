@@ -139,6 +139,8 @@ You have access to tools. Use them actively and consciously:
 - Call send_question_batch() whenever you ask one or more clarifying questions.
   Ask 1-5 related unanswered questions in a single turn; never exceed 5.
   Each question may include 0-5 answer_recommendations.
+- Call request_plan_verification() when the plan is complete enough that the
+  frontend should prompt the user to verify or approve it.
 - Call validate_plan() when you believe you have a complete plan
 - Call publish_final_plan() ONLY after the user explicitly confirms they
   are happy with everything
@@ -181,8 +183,12 @@ Rules:
 - Do NOT call validate_plan or publish_final_plan until every constructor
   address input has either a concrete wallet/default_value or an explicit
   deployer fallback recorded
+- Do NOT ask for plan approval through prose alone. When you want the
+  frontend to present a verification or approval affordance, call
+  request_plan_verification() in that same turn.
 - Record deployment_target explicitly in the plan. For the current runtime,
-  use Avalanche Fuji with chain_id 43113, rpc_url_env_var FUJI_RPC_URL,
+  set deployment_target.network to the exact string avalanche_fuji and use
+  name "Avalanche Fuji", chain_id 43113, rpc_url_env_var FUJI_RPC_URL,
   and private_key_env_var FUJI_PRIVATE_KEY unless the user is explicitly
   planning for a future non-runtime target
 - The user can edit their plan at any time as long as the contract is not
@@ -355,10 +361,12 @@ AFTER GENERATING CODE
 → call save_code_artifact()
 
 Save the generated contract files.
+Each saved artifact MUST include the matching `plan_contract_ids` from the validated plan.
 
 You MUST also emit manifests/deployment.json containing:
 - deployment_target from the validated plan
 - a contracts array
+- plan_contract_id for each deployable contract
 - exactly one role="primary_deployable"
 - deploy_order
 - source_path
@@ -553,6 +561,7 @@ test/
 - VaultTest.t.sol
 
 Then save them with save_test_artifact().
+Every saved test artifact MUST include `plan_contract_ids` for the contracts it covers.
 
 --------------------------------------------------------------------
 
@@ -609,6 +618,10 @@ Available tools:
 - verify_contract_on_snowtrace  -> verify deployed contract on Snowtrace (Fuji/mainnet)
 - record_deployment             -> persist deployment outcome
 - get_deployment_history        -> retrieve prior deployment state
+
+All deployment artifacts and deployment records MUST carry the validated plan's `plan_contract_id`
+for the primary deployed contract. Deployment script artifacts may include multiple `plan_contract_ids`
+when they touch several planned contracts.
 
 If the plan is not validated/ready -> STOP.
 If contract code artifacts are missing -> STOP.
@@ -819,6 +832,7 @@ def chat_with_intent(
     """
     from agents.planning_tools import (
         get_answer_recommendations,
+        get_approval_request,
         get_pending_questions,
         clear_pending_questions,
     )
@@ -881,9 +895,12 @@ async def stream_chat_with_intent(
     Stream agent responses and tool calls for the given intent.
     Yields event dicts: {"type": "step", "content": ..., "tool_calls": ...} per step,
     then {"type": "done", "session_id": ..., "response": ..., "tool_calls": [...]}.
+    Planning done events also include approval_request, answer_recommendations,
+    and pending_questions.
     """
     from agents.planning_tools import (
         get_answer_recommendations,
+        get_approval_request,
         get_pending_questions,
         clear_pending_questions,
     )
@@ -929,6 +946,9 @@ async def stream_chat_with_intent(
             "session_id": session_id,
             "response": response_text,
             "tool_calls": tool_calls_made,
+            "approval_request": (
+                get_approval_request() if intent == "planning" else None
+            ),
             "answer_recommendations": (
                 get_answer_recommendations() if intent == "planning" else []
             ),

@@ -1,11 +1,14 @@
 """CRUD for users, projects, and all agent memory tables."""
 
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select, desc, func, update
+from sqlalchemy import select, desc, func, or_, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import load_only
 
+from agents.db import run_with_retry
+from agents.pipeline_status import build_pipeline_status_payload
 
 from agents.db.models import (
     Project,
@@ -19,12 +22,26 @@ from agents.db.models import (
     PipelineEvaluation,
     PipelineHumanGate,
     PipelineRun,
+    PipelineRunSnapshot,
+    PipelineRunEvent,
+    NotificationOutbox,
+    ProjectRuntimeState,
+    TelegramLinkToken,
+    TelegramUserLink,
 )
 
 
 def pending_task_sort_key(task) -> tuple:
     """In-memory mirror of the FIFO dispatch ordering used by pending task queries."""
     return (task.created_at, task.sequence_index, task.id)
+
+
+async def _get_user_by_id_once(
+    session: AsyncSession,
+    user_id: uuid.UUID,
+) -> User | None:
+    result = await session.execute(select(User).where(User.id == user_id))
+    return result.scalar_one_or_none()
 
 
 async def create_user(
@@ -45,14 +62,166 @@ async def create_user(
 
 async def get_user_by_id(session: AsyncSession, user_id: uuid.UUID) -> User | None:
     """Fetch user by id."""
-    result = await session.execute(select(User).where(User.id == user_id))
+    return await run_with_retry(
+        session,
+        lambda active_session: _get_user_by_id_once(active_session, user_id),
+    )
+
+
+async def _get_user_by_wallet_once(session: AsyncSession, wallet: str) -> User | None:
+    result = await session.execute(select(User).where(User.wallet == wallet))
     return result.scalar_one_or_none()
 
 
 async def get_user_by_wallet(session: AsyncSession, wallet: str) -> User | None:
     """Fetch user by wallet address."""
-    result = await session.execute(select(User).where(User.wallet == wallet))
+    return await run_with_retry(
+        session,
+        lambda active_session: _get_user_by_wallet_once(active_session, wallet),
+    )
+
+
+async def get_telegram_user_link(
+    session: AsyncSession,
+    user_id: uuid.UUID,
+) -> TelegramUserLink | None:
+    result = await session.execute(
+        select(TelegramUserLink).where(TelegramUserLink.user_id == user_id)
+    )
     return result.scalar_one_or_none()
+
+
+async def upsert_telegram_user_link(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    chat_id: int,
+    chat_type: str,
+    telegram_user_id: int | None = None,
+    chat_username: str | None = None,
+    first_name: str | None = None,
+    enabled: bool = True,
+) -> TelegramUserLink:
+    existing_for_user = await get_telegram_user_link(session, user_id)
+    result = await session.execute(
+        select(TelegramUserLink).where(TelegramUserLink.chat_id == int(chat_id))
+    )
+    existing_for_chat = result.scalar_one_or_none()
+    if existing_for_chat is not None and existing_for_chat.user_id != user_id:
+        await session.delete(existing_for_chat)
+
+    now = datetime.now(timezone.utc)
+    if existing_for_user is None:
+        row = TelegramUserLink(
+            user_id=user_id,
+            chat_id=int(chat_id),
+            chat_type=chat_type,
+            telegram_user_id=telegram_user_id,
+            chat_username=chat_username,
+            first_name=first_name,
+            enabled=enabled,
+            linked_at=now,
+            updated_at=now,
+        )
+        session.add(row)
+    else:
+        row = existing_for_user
+        row.chat_id = int(chat_id)
+        row.chat_type = chat_type
+        row.telegram_user_id = telegram_user_id
+        row.chat_username = chat_username
+        row.first_name = first_name
+        row.enabled = enabled
+        row.linked_at = now
+        row.updated_at = now
+
+    await session.commit()
+    await session.refresh(row)
+    return row
+
+
+async def set_telegram_user_link_enabled(
+    session: AsyncSession,
+    user_id: uuid.UUID,
+    *,
+    enabled: bool,
+) -> TelegramUserLink | None:
+    row = await get_telegram_user_link(session, user_id)
+    if row is None:
+        return None
+    row.enabled = enabled
+    row.updated_at = datetime.now(timezone.utc)
+    await session.commit()
+    await session.refresh(row)
+    return row
+
+
+async def delete_telegram_user_link(
+    session: AsyncSession,
+    user_id: uuid.UUID,
+) -> bool:
+    row = await get_telegram_user_link(session, user_id)
+    if row is None:
+        return False
+    await session.delete(row)
+    await session.commit()
+    return True
+
+
+async def delete_unused_telegram_link_tokens(
+    session: AsyncSession,
+    user_id: uuid.UUID,
+) -> int:
+    result = await session.execute(
+        select(TelegramLinkToken).where(
+            TelegramLinkToken.user_id == user_id,
+            TelegramLinkToken.used_at.is_(None),
+        )
+    )
+    rows = list(result.scalars().all())
+    for row in rows:
+        await session.delete(row)
+    await session.commit()
+    return len(rows)
+
+
+async def create_telegram_link_token(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    token_hash: str,
+    expires_at: datetime,
+) -> TelegramLinkToken:
+    row = TelegramLinkToken(
+        user_id=user_id,
+        token_hash=token_hash,
+        expires_at=expires_at,
+    )
+    session.add(row)
+    await session.commit()
+    await session.refresh(row)
+    return row
+
+
+async def consume_telegram_link_token(
+    session: AsyncSession,
+    token_hash: str,
+) -> TelegramLinkToken | None:
+    now = datetime.now(timezone.utc)
+    result = await session.execute(
+        select(TelegramLinkToken)
+        .where(TelegramLinkToken.token_hash == token_hash)
+        .with_for_update()
+    )
+    row = result.scalar_one_or_none()
+    if row is None:
+        return None
+    if row.used_at is not None or row.expires_at <= now:
+        return None
+    row.used_at = now
+    await session.commit()
+    await session.refresh(row)
+    return row
 
 
 async def create_project(
@@ -75,12 +244,11 @@ async def create_project(
     return project
 
 
-async def get_project(
+async def _get_project_once(
     session: AsyncSession,
     project_id: uuid.UUID,
     user_id: uuid.UUID | None = None,
 ) -> Project | None:
-    """Fetch project by id. If user_id is provided, ensure project belongs to user."""
     result = await session.execute(select(Project).where(Project.id == project_id))
     project = result.scalar_one_or_none()
     if project is None:
@@ -90,17 +258,110 @@ async def get_project(
     return project
 
 
-async def list_projects_by_user(
+async def _project_access_exists_once(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    user_id: uuid.UUID,
+) -> bool:
+    result = await session.execute(
+        select(Project.id).where(
+            Project.id == project_id,
+            Project.user_id == user_id,
+        )
+    )
+    return result.scalar_one_or_none() is not None
+
+
+async def project_access_exists(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    user_id: uuid.UUID,
+) -> bool:
+    return await run_with_retry(
+        session,
+        lambda active_session: _project_access_exists_once(
+            active_session,
+            project_id,
+            user_id,
+        ),
+    )
+
+
+async def get_project(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    user_id: uuid.UUID | None = None,
+) -> Project | None:
+    """Fetch project by id. If user_id is provided, ensure project belongs to user."""
+    return await run_with_retry(
+        session,
+        lambda active_session: _get_project_once(
+            active_session,
+            project_id,
+            user_id=user_id,
+        ),
+    )
+
+
+async def _list_projects_by_user_once(
     session: AsyncSession,
     user_id: uuid.UUID,
+    *,
+    include_screenshot: bool = False,
 ) -> list[Project]:
-    """List all projects for a user."""
-    result = await session.execute(
+    query = (
         select(Project)
         .where(Project.user_id == user_id)
         .order_by(Project.created_at.desc())
     )
+    if not include_screenshot:
+        query = query.options(
+            load_only(
+                Project.id,
+                Project.user_id,
+                Project.name,
+                Project.created_at,
+            )
+        )
+    result = await session.execute(query)
     return list(result.scalars().all())
+
+
+async def list_projects_by_user(
+    session: AsyncSession,
+    user_id: uuid.UUID,
+    *,
+    include_screenshot: bool = False,
+) -> list[Project]:
+    """List all projects for a user."""
+    return await run_with_retry(
+        session,
+        lambda active_session: _list_projects_by_user_once(
+            active_session,
+            user_id,
+            include_screenshot=include_screenshot,
+        ),
+    )
+
+
+async def _update_project_once(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    name: str | None = None,
+    screenshot_base64: str | None = None,
+    set_name: bool = False,
+    set_screenshot_base64: bool = False,
+) -> Project | None:
+    project = await _get_project_once(session, project_id)
+    if project is None:
+        return None
+    if set_name:
+        project.name = name
+    if set_screenshot_base64:
+        project.screenshot_base64 = screenshot_base64
+    await session.commit()
+    await session.refresh(project)
+    return project
 
 
 async def update_project(
@@ -112,16 +373,17 @@ async def update_project(
     set_screenshot_base64: bool = False,
 ) -> Project | None:
     """Update project fields by id; only provided fields are modified."""
-    project = await get_project(session, project_id)
-    if project is None:
-        return None
-    if set_name:
-        project.name = name
-    if set_screenshot_base64:
-        project.screenshot_base64 = screenshot_base64
-    await session.commit()
-    await session.refresh(project)
-    return project
+    return await run_with_retry(
+        session,
+        lambda active_session: _update_project_once(
+            active_session,
+            project_id,
+            name=name,
+            screenshot_base64=screenshot_base64,
+            set_name=set_name,
+            set_screenshot_base64=set_screenshot_base64,
+        ),
+    )
 
 
 # Plans
@@ -329,13 +591,34 @@ async def list_test_runs(
     session: AsyncSession,
     project_id: uuid.UUID,
     limit: int = 20,
+    *,
+    include_output: bool = True,
 ) -> list[TestRun]:
-    result = await session.execute(
+    query = (
         select(TestRun)
         .where(TestRun.project_id == project_id)
         .order_by(TestRun.created_at.desc())
         .limit(limit)
     )
+    if not include_output:
+        query = query.options(
+            load_only(
+                TestRun.id,
+                TestRun.project_id,
+                TestRun.status,
+                TestRun.tests_run,
+                TestRun.tests_passed,
+                TestRun.pipeline_run_id,
+                TestRun.pipeline_task_id,
+                TestRun.artifact_revision,
+                TestRun.stdout_path,
+                TestRun.stderr_path,
+                TestRun.exit_code,
+                TestRun.trace_id,
+                TestRun.created_at,
+            )
+        )
+    result = await session.execute(query)
     return list(result.scalars().all())
 
 
@@ -362,6 +645,7 @@ async def save_deployment(
     project_id: uuid.UUID,
     status: str,
     contract_name: str | None = None,
+    plan_contract_id: str | None = None,
     deployed_address: str | None = None,
     tx_hash: str | None = None,
     snowtrace_url: str | None = None,
@@ -373,12 +657,15 @@ async def save_deployment(
     stderr_path: str | None = None,
     exit_code: int | None = None,
     trace_id: str | None = None,
+    deployed_contracts: list[dict] | None = None,
+    executed_calls: list[dict] | None = None,
 ) -> Deployment:
     """Record a deployment result for a project."""
     dep = Deployment(
         project_id=project_id,
         network=network,
         contract_name=contract_name,
+        plan_contract_id=plan_contract_id,
         deployed_address=deployed_address,
         tx_hash=tx_hash,
         snowtrace_url=snowtrace_url,
@@ -390,6 +677,8 @@ async def save_deployment(
         stderr_path=stderr_path,
         exit_code=exit_code,
         trace_id=trace_id,
+        deployed_contracts=deployed_contracts,
+        executed_calls=executed_calls,
     )
     session.add(dep)
     await session.commit()
@@ -461,6 +750,208 @@ async def get_successful_terminal_deployment(
     return result.scalar_one_or_none()
 
 
+async def get_notification_outbox_by_dedupe_key(
+    session: AsyncSession,
+    dedupe_key: str,
+) -> NotificationOutbox | None:
+    result = await session.execute(
+        select(NotificationOutbox).where(NotificationOutbox.dedupe_key == dedupe_key)
+    )
+    return result.scalar_one_or_none()
+
+
+async def enqueue_notification_outbox(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    project_id: uuid.UUID,
+    pipeline_run_id: uuid.UUID,
+    channel: str,
+    event_type: str,
+    payload_json: dict,
+    dedupe_key: str,
+) -> NotificationOutbox:
+    existing = await get_notification_outbox_by_dedupe_key(session, dedupe_key)
+    if existing is not None:
+        return existing
+
+    row = NotificationOutbox(
+        user_id=user_id,
+        project_id=project_id,
+        pipeline_run_id=pipeline_run_id,
+        channel=channel,
+        event_type=event_type,
+        payload_json=payload_json,
+        dedupe_key=dedupe_key,
+        status="pending",
+    )
+    session.add(row)
+    await session.commit()
+    await session.refresh(row)
+    return row
+
+
+async def claim_next_notification_outbox(
+    session: AsyncSession,
+    *,
+    channel: str,
+    stale_after_seconds: int = 300,
+) -> NotificationOutbox | None:
+    now = datetime.now(timezone.utc)
+    stale_cutoff = now - timedelta(seconds=stale_after_seconds)
+    result = await session.execute(
+        select(NotificationOutbox)
+        .where(
+            NotificationOutbox.channel == channel,
+            or_(
+                NotificationOutbox.status == "pending",
+                (
+                    (NotificationOutbox.status == "claimed")
+                    & (NotificationOutbox.claimed_at.is_not(None))
+                    & (NotificationOutbox.claimed_at < stale_cutoff)
+                ),
+            ),
+        )
+        .order_by(NotificationOutbox.created_at.asc(), NotificationOutbox.id.asc())
+        .with_for_update(skip_locked=True)
+        .limit(1)
+    )
+    row = result.scalar_one_or_none()
+    if row is None:
+        await session.rollback()
+        return None
+
+    row.status = "claimed"
+    row.claimed_at = now
+    row.attempts = int(row.attempts or 0) + 1
+    row.updated_at = now
+    await session.commit()
+    await session.refresh(row)
+    return row
+
+
+async def mark_notification_outbox_sent(
+    session: AsyncSession,
+    notification_id: uuid.UUID,
+) -> NotificationOutbox | None:
+    result = await session.execute(
+        select(NotificationOutbox).where(NotificationOutbox.id == notification_id)
+    )
+    row = result.scalar_one_or_none()
+    if row is None:
+        return None
+    now = datetime.now(timezone.utc)
+    row.status = "sent"
+    row.sent_at = now
+    row.claimed_at = None
+    row.last_error = None
+    row.updated_at = now
+    await session.commit()
+    await session.refresh(row)
+    return row
+
+
+async def mark_notification_outbox_pending(
+    session: AsyncSession,
+    notification_id: uuid.UUID,
+    *,
+    last_error: str | None = None,
+) -> NotificationOutbox | None:
+    result = await session.execute(
+        select(NotificationOutbox).where(NotificationOutbox.id == notification_id)
+    )
+    row = result.scalar_one_or_none()
+    if row is None:
+        return None
+    row.status = "pending"
+    row.claimed_at = None
+    row.last_error = last_error
+    row.updated_at = datetime.now(timezone.utc)
+    await session.commit()
+    await session.refresh(row)
+    return row
+
+
+async def mark_notification_outbox_failed(
+    session: AsyncSession,
+    notification_id: uuid.UUID,
+    *,
+    last_error: str | None = None,
+) -> NotificationOutbox | None:
+    result = await session.execute(
+        select(NotificationOutbox).where(NotificationOutbox.id == notification_id)
+    )
+    row = result.scalar_one_or_none()
+    if row is None:
+        return None
+    row.status = "failed"
+    row.claimed_at = None
+    row.last_error = last_error
+    row.updated_at = datetime.now(timezone.utc)
+    await session.commit()
+    await session.refresh(row)
+    return row
+
+
+async def finalize_pipeline_run_and_enqueue_notification(
+    session: AsyncSession,
+    *,
+    pipeline_run_id: uuid.UUID,
+    status: str,
+    completed_at: datetime,
+    terminal_deployment_id: uuid.UUID | None = None,
+    failure_class: str | None = None,
+    failure_reason: str | None = None,
+    notification_channel: str = "telegram",
+    notification_event_type: str | None = None,
+    notification_payload: dict | None = None,
+    notification_dedupe_key: str | None = None,
+) -> tuple[PipelineRun | None, NotificationOutbox | None]:
+    run = await get_pipeline_run(session, pipeline_run_id)
+    if run is None:
+        return None, None
+
+    run.status = status
+    run.completed_at = completed_at
+    run.terminal_deployment_id = terminal_deployment_id
+    run.failure_class = failure_class
+    run.failure_reason = failure_reason
+    run.updated_at = datetime.now(timezone.utc)
+
+    outbox: NotificationOutbox | None = None
+    if (
+        run.user_id is not None
+        and notification_event_type
+        and notification_payload is not None
+        and notification_dedupe_key
+    ):
+        link = await get_telegram_user_link(session, run.user_id)
+        existing = await get_notification_outbox_by_dedupe_key(
+            session, notification_dedupe_key
+        )
+        if link is not None and link.enabled and existing is None:
+            outbox = NotificationOutbox(
+                user_id=run.user_id,
+                project_id=run.project_id,
+                pipeline_run_id=run.id,
+                channel=notification_channel,
+                event_type=notification_event_type,
+                payload_json=notification_payload,
+                dedupe_key=notification_dedupe_key,
+                status="pending",
+            )
+            session.add(outbox)
+        elif existing is not None:
+            outbox = existing
+
+    await session.commit()
+    await session.refresh(run)
+    if outbox is not None:
+        await session.refresh(outbox)
+    await refresh_pipeline_run_snapshot(session, run.id)
+    return run, outbox
+
+
 async def create_pipeline_run(
     session: AsyncSession,
     *,
@@ -483,6 +974,7 @@ async def create_pipeline_run(
     session.add(run)
     await session.commit()
     await session.refresh(run)
+    await refresh_pipeline_run_snapshot(session, run.id)
     return run
 
 
@@ -490,10 +982,77 @@ async def get_pipeline_run(
     session: AsyncSession,
     pipeline_run_id: uuid.UUID,
 ) -> PipelineRun | None:
+    async def _get_pipeline_run_once(active_session: AsyncSession) -> PipelineRun | None:
+        result = await active_session.execute(
+            select(PipelineRun).where(PipelineRun.id == pipeline_run_id)
+        )
+        return result.scalar_one_or_none()
+
+    return await run_with_retry(session, _get_pipeline_run_once)
+
+
+async def acquire_pipeline_run_lease(
+    session: AsyncSession,
+    pipeline_run_id: uuid.UUID,
+    runner_token: str,
+    *,
+    replace_stale_after_seconds: int = 900,
+) -> PipelineRun | None:
     result = await session.execute(
-        select(PipelineRun).where(PipelineRun.id == pipeline_run_id)
+        select(PipelineRun)
+        .where(PipelineRun.id == pipeline_run_id)
+        .with_for_update()
     )
-    return result.scalar_one_or_none()
+    run = result.scalar_one_or_none()
+    if run is None:
+        return None
+
+    now = datetime.now(timezone.utc)
+    stale_cutoff = now - timedelta(seconds=replace_stale_after_seconds)
+    current_token = getattr(run, "runner_token", None)
+    heartbeat = getattr(run, "runner_heartbeat_at", None)
+    lease_is_fresh = current_token and heartbeat and heartbeat >= stale_cutoff
+
+    if current_token and current_token != runner_token and lease_is_fresh:
+        return None
+
+    run.runner_token = runner_token
+    run.runner_started_at = now
+    run.runner_heartbeat_at = now
+    run.updated_at = now
+    await session.commit()
+    await session.refresh(run)
+    return run
+
+
+async def refresh_pipeline_run_lease(
+    session: AsyncSession,
+    pipeline_run_id: uuid.UUID,
+    runner_token: str,
+) -> bool:
+    run = await get_pipeline_run(session, pipeline_run_id)
+    if run is None or getattr(run, "runner_token", None) != runner_token:
+        return False
+    run.runner_heartbeat_at = datetime.now(timezone.utc)
+    run.updated_at = datetime.now(timezone.utc)
+    await session.commit()
+    return True
+
+
+async def release_pipeline_run_lease(
+    session: AsyncSession,
+    pipeline_run_id: uuid.UUID,
+    runner_token: str,
+) -> bool:
+    run = await get_pipeline_run(session, pipeline_run_id)
+    if run is None or getattr(run, "runner_token", None) != runner_token:
+        return False
+    run.runner_token = None
+    run.runner_heartbeat_at = None
+    run.updated_at = datetime.now(timezone.utc)
+    await session.commit()
+    await session.refresh(run)
+    return True
 
 
 async def update_pipeline_run(
@@ -509,6 +1068,7 @@ async def update_pipeline_run(
     run.updated_at = datetime.now(timezone.utc)
     await session.commit()
     await session.refresh(run)
+    await refresh_pipeline_run_snapshot(session, run.id)
     return run
 
 
@@ -528,6 +1088,7 @@ async def request_pipeline_cancellation(
     run.updated_at = datetime.now(timezone.utc)
     await session.commit()
     await session.refresh(run)
+    await refresh_pipeline_run_snapshot(session, run.id)
     return run
 
 
@@ -558,6 +1119,7 @@ async def create_pipeline_human_gate(
     session.add(gate)
     await session.commit()
     await session.refresh(gate)
+    await refresh_pipeline_run_snapshot(session, gate.pipeline_run_id)
     return gate
 
 
@@ -602,6 +1164,7 @@ async def resolve_pipeline_human_gate(
     gate.resolved_at = datetime.now(timezone.utc)
     await session.commit()
     await session.refresh(gate)
+    await refresh_pipeline_run_snapshot(session, gate.pipeline_run_id)
     return gate
 
 
@@ -636,6 +1199,7 @@ async def create_pipeline_evaluation(
     session.add(evaluation)
     await session.commit()
     await session.refresh(evaluation)
+    await refresh_pipeline_run_snapshot(session, evaluation.pipeline_run_id)
     return evaluation
 
 
@@ -649,6 +1213,262 @@ async def list_pipeline_evaluations(
         .order_by(PipelineEvaluation.created_at.asc())
     )
     return list(result.scalars().all())
+
+
+async def get_pipeline_run_snapshot(
+    session: AsyncSession,
+    pipeline_run_id: uuid.UUID,
+) -> PipelineRunSnapshot | None:
+    result = await session.execute(
+        select(PipelineRunSnapshot).where(
+            PipelineRunSnapshot.pipeline_run_id == pipeline_run_id
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_pipeline_run_poll_state(
+    session: AsyncSession,
+    pipeline_run_id: uuid.UUID,
+):
+    result = await session.execute(
+        select(
+            PipelineRun.id,
+            PipelineRun.status,
+            PipelineRun.next_event_seq,
+            PipelineRun.updated_at,
+        ).where(PipelineRun.id == pipeline_run_id)
+    )
+    row = result.one_or_none()
+    if row is None:
+        return None
+    return row
+
+
+async def refresh_pipeline_run_snapshot(
+    session: AsyncSession,
+    pipeline_run_id: uuid.UUID,
+) -> PipelineRunSnapshot | None:
+    run = await get_pipeline_run(session, pipeline_run_id)
+    if run is None:
+        return None
+    tasks = await get_pipeline_run_tasks(session, pipeline_run_id)
+    gates = await list_pipeline_human_gates(session, pipeline_run_id)
+    evaluations = await list_pipeline_evaluations(session, pipeline_run_id)
+    payload = build_pipeline_status_payload(
+        project_id=str(run.project_id),
+        pipeline_run_id=str(pipeline_run_id),
+        run=run,
+        tasks=tasks,
+        gates=gates,
+        evaluations=evaluations,
+    )
+    snapshot = await get_pipeline_run_snapshot(session, pipeline_run_id)
+    now = datetime.now(timezone.utc)
+    if snapshot is None:
+        snapshot = PipelineRunSnapshot(
+            pipeline_run_id=pipeline_run_id,
+            project_id=run.project_id,
+            status=payload["status"],
+            failure_reason=payload.get("failure_reason"),
+            snapshot_json=payload,
+            version=1,
+            updated_at=now,
+        )
+        session.add(snapshot)
+    else:
+        snapshot.project_id = run.project_id
+        snapshot.status = payload["status"]
+        snapshot.failure_reason = payload.get("failure_reason")
+        snapshot.snapshot_json = payload
+        snapshot.version = int(snapshot.version or 0) + 1
+        snapshot.updated_at = now
+    await session.commit()
+    await session.refresh(snapshot)
+    return snapshot
+
+
+async def get_project_runtime_state(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    scope: str,
+) -> ProjectRuntimeState | None:
+    result = await session.execute(
+        select(ProjectRuntimeState).where(
+            ProjectRuntimeState.project_id == project_id,
+            ProjectRuntimeState.scope == scope,
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def list_project_runtime_states(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    scopes: list[str] | None = None,
+) -> list[ProjectRuntimeState]:
+    query = select(ProjectRuntimeState).where(
+        ProjectRuntimeState.project_id == project_id
+    )
+    if scopes:
+        query = query.where(ProjectRuntimeState.scope.in_(scopes))
+    query = query.order_by(ProjectRuntimeState.scope.asc())
+    result = await session.execute(query)
+    return list(result.scalars().all())
+
+
+async def get_project_runtime_state_versions(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    scopes: list[str] | None = None,
+) -> dict[str, int]:
+    query = select(ProjectRuntimeState.scope, ProjectRuntimeState.version).where(
+        ProjectRuntimeState.project_id == project_id
+    )
+    if scopes:
+        query = query.where(ProjectRuntimeState.scope.in_(scopes))
+    result = await session.execute(query)
+    return {str(scope): int(version or 0) for scope, version in result.all()}
+
+
+async def upsert_project_runtime_state(
+    session: AsyncSession,
+    *,
+    project_id: uuid.UUID,
+    scope: str,
+    state_json: dict | None,
+) -> ProjectRuntimeState:
+    existing = await get_project_runtime_state(session, project_id, scope)
+    payload = state_json or {}
+    now = datetime.now(timezone.utc)
+    if existing is not None:
+        if existing.state_json == payload:
+            return existing
+        existing.state_json = payload
+        existing.version = int(existing.version or 0) + 1
+        existing.updated_at = now
+        await session.commit()
+        await session.refresh(existing)
+        return existing
+
+    row = ProjectRuntimeState(
+        project_id=project_id,
+        scope=scope,
+        state_json=payload,
+        version=1,
+        updated_at=now,
+    )
+    session.add(row)
+    await session.commit()
+    await session.refresh(row)
+    return row
+
+
+def _pipeline_task_uuid_from_event(event: dict) -> uuid.UUID | None:
+    raw_task_id = event.get("task_id")
+    if not isinstance(raw_task_id, str):
+        return None
+    try:
+        return uuid.UUID(raw_task_id)
+    except ValueError:
+        return None
+
+
+async def create_pipeline_run_event(
+    session: AsyncSession,
+    *,
+    project_id: uuid.UUID,
+    pipeline_run_id: uuid.UUID,
+    event: dict,
+) -> PipelineRunEvent:
+    rows = await create_pipeline_run_events(
+        session,
+        project_id=project_id,
+        pipeline_run_id=pipeline_run_id,
+        events=[event],
+    )
+    return rows[0]
+
+
+async def create_pipeline_run_events(
+    session: AsyncSession,
+    *,
+    project_id: uuid.UUID,
+    pipeline_run_id: uuid.UUID,
+    events: list[dict],
+) -> list[PipelineRunEvent]:
+    if not events:
+        return []
+
+    seq_result = await session.execute(
+        text(
+            """
+            UPDATE pipeline_runs
+            SET next_event_seq = COALESCE(next_event_seq, 1) + :count,
+                updated_at = NOW()
+            WHERE id = :pipeline_run_id
+            RETURNING next_event_seq - :count AS start_seq;
+            """
+        ),
+        {
+            "pipeline_run_id": pipeline_run_id,
+            "count": len(events),
+        },
+    )
+    start_seq = seq_result.scalar_one_or_none()
+    if start_seq is None:
+        raise ValueError(f"Unknown pipeline_run_id {pipeline_run_id}")
+
+    rows: list[PipelineRunEvent] = []
+    for index, event in enumerate(events):
+        rows.append(
+            PipelineRunEvent(
+                project_id=project_id,
+                pipeline_run_id=pipeline_run_id,
+                pipeline_task_id=_pipeline_task_uuid_from_event(event),
+                seq=int(start_seq) + index,
+                event_type=str(event.get("type") or "unknown"),
+                stage=event.get("stage"),
+                payload=event,
+            )
+        )
+    session.add_all(rows)
+    await session.commit()
+    return rows
+
+
+async def list_pipeline_run_events(
+    session: AsyncSession,
+    pipeline_run_id: uuid.UUID,
+    *,
+    after_seq: int = 0,
+    limit: int = 200,
+) -> list[PipelineRunEvent]:
+    result = await session.execute(
+        select(PipelineRunEvent)
+        .where(
+            PipelineRunEvent.pipeline_run_id == pipeline_run_id,
+            PipelineRunEvent.seq > after_seq,
+        )
+        .order_by(PipelineRunEvent.seq.asc())
+        .limit(limit)
+    )
+    return list(result.scalars().all())
+
+
+async def get_latest_pipeline_run_event_seq(
+    session: AsyncSession,
+    pipeline_run_id: uuid.UUID,
+) -> int:
+    result = await session.execute(
+        select(PipelineRun.next_event_seq).where(
+            PipelineRun.id == pipeline_run_id
+        )
+    )
+    next_seq = result.scalar()
+    if next_seq is None:
+        return 0
+    return max(0, int(next_seq) - 1)
 
 
 async def count_claimed_tasks_for_run(
@@ -714,16 +1534,19 @@ async def list_messages(
     limit: int = 200,
 ) -> list[Message]:
     """List messages for a project, chronological; optionally filter by session."""
-    query = (
-        select(Message)
-        .where(Message.project_id == project_id)
-        .order_by(Message.created_at.asc())
-        .limit(limit)
-    )
-    if session_id:
-        query = query.where(Message.session_id == session_id)
-    result = await session.execute(query)
-    return list(result.scalars().all())
+    async def _list_messages_once(active_session: AsyncSession) -> list[Message]:
+        query = (
+            select(Message)
+            .where(Message.project_id == project_id)
+            .order_by(Message.created_at.asc())
+            .limit(limit)
+        )
+        if session_id:
+            query = query.where(Message.session_id == session_id)
+        result = await active_session.execute(query)
+        return list(result.scalars().all())
+
+    return await run_with_retry(session, _list_messages_once)
 
 
 async def create_pipeline_task(
@@ -758,7 +1581,7 @@ async def create_pipeline_task(
         parent_task_id=parent_task_id,
         sequence_index=sequence_index,
         artifact_revision=artifact_revision,
-        depends_on_task_ids=depends_on_task_ids,
+        depends_on_task_ids=depends_on_task_ids or [],
         retry_budget_key=retry_budget_key,
         retry_attempt=retry_attempt,
         failure_class=failure_class,
@@ -769,6 +1592,7 @@ async def create_pipeline_task(
     session.add(task)
     await session.commit()
     await session.refresh(task)
+    await refresh_pipeline_run_snapshot(session, task.pipeline_run_id)
     return task
 
 
@@ -802,40 +1626,59 @@ async def claim_next_pending_task(
     """Atomically claim the next runnable pending task for a pipeline run."""
     from agents.db.models import PipelineTask
 
-    result = await session.execute(
-        select(PipelineTask)
-        .where(PipelineTask.pipeline_run_id == pipeline_run_id)
-        .order_by(
-            PipelineTask.created_at.asc(),
-            PipelineTask.sequence_index.asc(),
-            PipelineTask.id.asc(),
-        )
-    )
-    tasks = list(result.scalars().all())
-    completed_ids = {str(task.id) for task in tasks if task.status == "completed"}
-
-    for task in tasks:
-        if task.status != "pending":
-            continue
-        dependencies = task.depends_on_task_ids or []
-        if any(dep not in completed_ids for dep in dependencies):
-            continue
-
-        claim_time = datetime.now(timezone.utc)
-        claim_result = await session.execute(
-            update(PipelineTask)
-            .where(PipelineTask.id == task.id, PipelineTask.status == "pending")
-            .values(status="in_progress", claimed_at=claim_time)
-        )
-        if claim_result.rowcount:
-            await session.commit()
-            refresh_result = await session.execute(
-                select(PipelineTask).where(PipelineTask.id == task.id)
+    claim_result = await session.execute(
+        text(
+            """
+            WITH runnable AS (
+              SELECT pt.id
+              FROM pipeline_tasks AS pt
+              WHERE pt.pipeline_run_id = :pipeline_run_id
+                AND pt.status = 'pending'
+                AND NOT EXISTS (
+                  SELECT 1
+                  FROM jsonb_array_elements_text(
+                    CASE
+                      WHEN pt.depends_on_task_ids IS NULL THEN '[]'::jsonb
+                      WHEN jsonb_typeof(pt.depends_on_task_ids::jsonb) = 'array'
+                        THEN pt.depends_on_task_ids::jsonb
+                      ELSE '[]'::jsonb
+                    END
+                  ) AS dep(dep_id)
+                  LEFT JOIN pipeline_tasks AS completed
+                    ON completed.pipeline_run_id = pt.pipeline_run_id
+                   AND completed.id::text = dep.dep_id
+                   AND completed.status = 'completed'
+                  WHERE completed.id IS NULL
+                )
+              ORDER BY pt.created_at ASC, pt.sequence_index ASC, pt.id ASC
+              FOR UPDATE SKIP LOCKED
+              LIMIT 1
             )
-            return refresh_result.scalar_one_or_none()
+            UPDATE pipeline_tasks AS pt
+            SET status = 'in_progress',
+                claimed_at = NOW()
+            FROM runnable
+            WHERE pt.id = runnable.id
+            RETURNING pt.id;
+            """
+        ),
+        {
+            "pipeline_run_id": pipeline_run_id,
+        },
+    )
+    claimed_id = claim_result.scalar_one_or_none()
+    if claimed_id is None:
         await session.rollback()
+        return None
 
-    return None
+    await session.commit()
+    refresh_result = await session.execute(
+        select(PipelineTask).where(PipelineTask.id == claimed_id)
+    )
+    task = refresh_result.scalar_one_or_none()
+    if task is not None:
+        await refresh_pipeline_run_snapshot(session, task.pipeline_run_id)
+    return task
 
 
 async def set_task_in_progress(
@@ -855,7 +1698,28 @@ async def set_task_in_progress(
     task.claimed_at = datetime.now(timezone.utc)
     await session.commit()
     await session.refresh(task)
+    await refresh_pipeline_run_snapshot(session, task.pipeline_run_id)
     return task
+
+
+async def reset_in_progress_tasks_for_run(
+    session: AsyncSession,
+    pipeline_run_id: uuid.UUID,
+) -> int:
+    from agents.db.models import PipelineTask
+
+    result = await session.execute(
+        update(PipelineTask)
+        .where(
+            PipelineTask.pipeline_run_id == pipeline_run_id,
+            PipelineTask.status == "in_progress",
+        )
+        .values(status="pending", claimed_at=None)
+    )
+    await session.commit()
+    if result.rowcount:
+        await refresh_pipeline_run_snapshot(session, pipeline_run_id)
+    return int(result.rowcount or 0)
 
 
 async def get_pipeline_task(
@@ -946,6 +1810,7 @@ async def complete_pipeline_task_and_create_next(
     await session.refresh(task)
     for new_task in created:
         await session.refresh(new_task)
+    await refresh_pipeline_run_snapshot(session, pipeline_run_id)
     return task, created
 
 
@@ -977,6 +1842,7 @@ async def update_pipeline_task(
         setattr(task, key, value)
     await session.commit()
     await session.refresh(task)
+    await refresh_pipeline_run_snapshot(session, task.pipeline_run_id)
     return task
 
 
@@ -997,4 +1863,6 @@ async def cancel_pending_followup_tasks(
         .values(status="cancelled", completed_at=datetime.now(timezone.utc))
     )
     await session.commit()
+    if result.rowcount:
+        await refresh_pipeline_run_snapshot(session, pipeline_run_id)
     return int(result.rowcount or 0)

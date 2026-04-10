@@ -24,18 +24,30 @@ from agents.db.crud import (
     create_pipeline_human_gate,
     create_pipeline_run,
     create_pipeline_task,
+    finalize_pipeline_run_and_enqueue_notification,
     get_current_plan as get_current_plan_row,
     get_deployment_for_task,
     get_next_retry_attempt,
     get_pipeline_run,
+    get_pipeline_run_snapshot,
     get_pipeline_run_tasks,
     get_pipeline_task,
     get_successful_terminal_deployment,
     get_test_run_for_task,
     list_pipeline_evaluations,
     list_pipeline_human_gates,
+    refresh_pipeline_run_snapshot,
     update_pipeline_run,
     update_pipeline_task,
+)
+from agents.pipeline_status import (
+    build_pipeline_status_payload,
+    derive_pipeline_status,
+    project_pipeline_status_payload,
+    serialize_evaluation,
+    serialize_gate,
+    serialize_run,
+    serialize_task,
 )
 from agents.deployment_manifest import MANIFEST_PATH
 from agents.pipeline_evaluations import (
@@ -70,6 +82,11 @@ from agents.pipeline_specs import (
     stage_name_for_task,
 )
 from agents.testing_tools import run_foundry_tests
+from agents.telegram_service import (
+    build_terminal_notification_payload,
+    terminal_event_type_for_status,
+    terminal_notification_dedupe_key,
+)
 from agents.tracing import current_trace_id, start_span
 from schemas.coding_schema import CodeArtifact
 from schemas.deployment_schema import (
@@ -151,137 +168,30 @@ def _current_plan_summary(mm: MemoryManager, task_context: dict | None = None) -
     if task_context and task_context.get("plan_summary"):
         return task_context["plan_summary"]
     planning_state = mm.get_agent_state("planning")
-    if planning_state.get("plan_summary"):
+    summary = planning_state.get("plan_summary")
+    if summary and summary.get("plan_contracts") is not None:
         return planning_state["plan_summary"]
     return extract_plan_summary(mm.get_plan())
 
 
 def _serialize_task(task) -> dict:
-    queue_duration = duration_ms(task.created_at, task.claimed_at)
-    execution_duration = duration_ms(task.claimed_at, task.completed_at)
-    total_duration = duration_ms(task.created_at, task.completed_at)
-    return {
-        "id": str(task.id),
-        "assigned_to": task.assigned_to,
-        "created_by": task.created_by,
-        "task_type": task.task_type,
-        "description": task.description,
-        "parent_task_id": str(task.parent_task_id) if task.parent_task_id else None,
-        "sequence_index": task.sequence_index,
-        "artifact_revision": task.artifact_revision,
-        "depends_on_task_ids": task.depends_on_task_ids,
-        "retry_budget_key": getattr(task, "retry_budget_key", None),
-        "retry_attempt": getattr(task, "retry_attempt", 0),
-        "failure_class": getattr(task, "failure_class", None),
-        "gate_id": str(getattr(task, "gate_id", None))
-        if getattr(task, "gate_id", None)
-        else None,
-        "status": task.status,
-        "result_summary": task.result_summary,
-        "context": task.context,
-        "queued_at": task.created_at.isoformat() if task.created_at else None,
-        "created_at": task.created_at.isoformat() if task.created_at else None,
-        "claimed_at": task.claimed_at.isoformat() if task.claimed_at else None,
-        "completed_at": task.completed_at.isoformat() if task.completed_at else None,
-        "queue_duration_ms": queue_duration,
-        "execution_duration_ms": execution_duration,
-        "total_duration_ms": total_duration,
-    }
+    return serialize_task(task)
 
 
 def _serialize_run(run) -> dict:
-    return {
-        "id": str(run.id),
-        "project_id": str(run.project_id),
-        "user_id": str(run.user_id) if run.user_id else None,
-        "plan_id": str(run.plan_id) if run.plan_id else None,
-        "status": run.status,
-        "current_stage": run.current_stage,
-        "current_task_id": str(run.current_task_id) if run.current_task_id else None,
-        "deployment_target": run.deployment_target,
-        "cancellation_requested_at": (
-            run.cancellation_requested_at.isoformat()
-            if run.cancellation_requested_at
-            else None
-        ),
-        "cancellation_reason": run.cancellation_reason,
-        "terminal_deployment_id": (
-            str(run.terminal_deployment_id) if run.terminal_deployment_id else None
-        ),
-        "failure_class": run.failure_class,
-        "failure_reason": run.failure_reason,
-        "trace_id": run.trace_id,
-        "created_at": run.created_at.isoformat() if run.created_at else None,
-        "started_at": run.started_at.isoformat() if run.started_at else None,
-        "paused_at": run.paused_at.isoformat() if run.paused_at else None,
-        "resumed_at": run.resumed_at.isoformat() if run.resumed_at else None,
-        "completed_at": run.completed_at.isoformat() if run.completed_at else None,
-        "updated_at": run.updated_at.isoformat() if run.updated_at else None,
-    }
+    return serialize_run(run)
 
 
 def _serialize_gate(gate) -> dict:
-    return {
-        "id": str(gate.id),
-        "pipeline_run_id": str(gate.pipeline_run_id),
-        "pipeline_task_id": str(gate.pipeline_task_id)
-        if gate.pipeline_task_id
-        else None,
-        "evaluation_id": str(gate.evaluation_id) if gate.evaluation_id else None,
-        "gate_type": gate.gate_type,
-        "status": gate.status,
-        "requested_payload": gate.requested_payload,
-        "resolved_payload": gate.resolved_payload,
-        "requested_reason": gate.requested_reason,
-        "resolved_reason": gate.resolved_reason,
-        "requested_by": gate.requested_by,
-        "resolved_by": gate.resolved_by,
-        "trace_id": gate.trace_id,
-        "created_at": gate.created_at.isoformat() if gate.created_at else None,
-        "resolved_at": gate.resolved_at.isoformat() if gate.resolved_at else None,
-    }
+    return serialize_gate(gate)
 
 
 def _serialize_evaluation(evaluation) -> dict:
-    return {
-        "id": str(evaluation.id),
-        "pipeline_run_id": str(evaluation.pipeline_run_id),
-        "pipeline_task_id": str(evaluation.pipeline_task_id)
-        if evaluation.pipeline_task_id
-        else None,
-        "stage": evaluation.stage,
-        "evaluation_type": evaluation.evaluation_type,
-        "blocking": evaluation.blocking,
-        "status": evaluation.status,
-        "summary": evaluation.summary,
-        "details_json": evaluation.details_json,
-        "artifact_revision": evaluation.artifact_revision,
-        "trace_id": evaluation.trace_id,
-        "created_at": evaluation.created_at.isoformat()
-        if evaluation.created_at
-        else None,
-    }
+    return serialize_evaluation(evaluation)
 
 
 def _derive_pipeline_status(run, tasks: list) -> tuple[str, str | None]:
-    if run is not None:
-        return run.status, run.failure_reason
-    if not tasks:
-        return "pending", None
-    if any(task.status == "in_progress" for task in tasks):
-        return "running", None
-    if any(task.status == "waiting_for_approval" for task in tasks):
-        return "waiting_for_approval", None
-    if any(task.status == "pending" for task in tasks):
-        return "queued", None
-    failed_tasks = [task for task in tasks if task.status == "failed"]
-    if failed_tasks:
-        latest_failed = failed_tasks[-1]
-        return "failed", latest_failed.result_summary
-    cancelled_tasks = [task for task in tasks if task.status == "cancelled"]
-    if cancelled_tasks:
-        return "cancelled", cancelled_tasks[-1].result_summary
-    return "failed", "Pipeline exhausted all tasks without a successful terminal deployment."
+    return derive_pipeline_status(run, tasks)
 
 
 def _build_upstream_task(task, task_status: str, result_summary: str) -> dict:
@@ -292,6 +202,69 @@ def _build_upstream_task(task, task_status: str, result_summary: str) -> dict:
         "status": task_status,
         "result_summary": result_summary,
     }
+
+
+def _project_name_for_notification(project_id: str, user_id: str) -> str | None:
+    try:
+        mm = MemoryManager(user_id=user_id, project_id=project_id)
+        plan = mm.get_plan()
+    except Exception:
+        return None
+    if not isinstance(plan, dict):
+        return None
+    if isinstance(plan.get("project_name"), str) and plan.get("project_name"):
+        return plan["project_name"]
+    summary = extract_plan_summary(plan)
+    if isinstance(summary, dict):
+        project_name = summary.get("project_name")
+        if isinstance(project_name, str) and project_name:
+            return project_name
+    return None
+
+
+async def _finalize_pipeline_terminal_status(
+    *,
+    project_id: str,
+    user_id: str,
+    pipeline_run_id: str,
+    status: str,
+    terminal_deployment=None,
+    failure_class: str | None = None,
+    failure_reason: str | None = None,
+) -> None:
+    project_name = _project_name_for_notification(project_id, user_id)
+    async with async_session_factory() as session:
+        run = await get_pipeline_run(session, uuid.UUID(pipeline_run_id))
+        if run is None:
+            return
+        payload = build_terminal_notification_payload(
+            pipeline_run_id=pipeline_run_id,
+            project_id=project_id,
+            project_name=project_name,
+            terminal_status=status,
+            deployment_target=run.deployment_target or default_deployment_target_payload(),
+            terminal_deployment=terminal_deployment,
+            failure_reason=failure_reason if status == "failed" else None,
+            cancelled_reason=failure_reason if status == "cancelled" else None,
+        )
+        await finalize_pipeline_run_and_enqueue_notification(
+            session,
+            pipeline_run_id=uuid.UUID(pipeline_run_id),
+            status=status,
+            completed_at=datetime.now(timezone.utc),
+            terminal_deployment_id=(
+                terminal_deployment.id
+                if status == "completed" and terminal_deployment is not None
+                else None
+            ),
+            failure_class=failure_class,
+            failure_reason=failure_reason,
+            notification_event_type=terminal_event_type_for_status(status),
+            notification_payload=payload,
+            notification_dedupe_key=terminal_notification_dedupe_key(
+                pipeline_run_id, status
+            ),
+        )
 
 
 async def _next_task_payload(
@@ -456,11 +429,89 @@ def _deployment_constraints(contract_plan: dict | None) -> list[str]:
     return constraints
 
 
-def _load_contract_sources(coding_artifacts: list[dict]) -> str:
+def _summarize_artifact_metadata(artifacts: list[dict]) -> list[dict]:
+    summary: list[dict] = []
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            continue
+        summary.append(
+            {
+                "path": artifact.get("path"),
+                "language": artifact.get("language"),
+                "contract_names": artifact.get("contract_names"),
+                "plan_contract_ids": artifact.get("plan_contract_ids"),
+                "description": artifact.get("description"),
+            }
+        )
+    return summary
+
+
+def _slim_task_context(task_context: dict | None) -> dict:
+    if not isinstance(task_context, dict):
+        return {}
+
+    slim: dict[str, object] = {}
+    for key in (
+        "artifact_revision",
+        "script_path",
+        "contract_name",
+        "plan_contract_id",
+        "plan_contract_ids",
+        "expected_outputs",
+        "failure_context",
+        "upstream_task",
+    ):
+        value = task_context.get(key)
+        if value is not None:
+            slim[key] = value
+
+    if isinstance(task_context.get("plan_summary"), dict):
+        plan_summary = task_context["plan_summary"]
+        slim["plan_summary"] = {
+            "project_name": plan_summary.get("project_name"),
+            "erc_standard": plan_summary.get("erc_standard"),
+            "contract_names": plan_summary.get("contract_names"),
+            "plan_contracts": plan_summary.get("plan_contracts"),
+            "key_constraints": plan_summary.get("key_constraints"),
+        }
+
+    if isinstance(task_context.get("input_artifacts"), dict):
+        slim["input_artifacts"] = {
+            key: _summarize_artifact_metadata(value or [])
+            for key, value in task_context["input_artifacts"].items()
+            if key in {"coding", "testing", "deployment"}
+        }
+
+    for key, value in task_context.items():
+        if key not in slim and key not in {"input_artifacts", "plan_summary"}:
+            slim[key] = value
+
+    return slim
+
+
+def _load_contract_sources(
+    coding_artifacts: list[dict],
+    *,
+    target_plan_contract_ids: list[str] | None = None,
+    target_contract_names: list[str] | None = None,
+) -> str:
+    target_ids = {value for value in (target_plan_contract_ids or []) if value}
+    target_names = {value for value in (target_contract_names or []) if value}
     chunks: list[str] = []
     for artifact in coding_artifacts:
         path = artifact.get("path")
         if not path or not str(path).startswith("contracts/"):
+            continue
+        artifact_ids = {
+            value for value in (artifact.get("plan_contract_ids") or []) if value
+        }
+        artifact_names = {
+            value for value in (artifact.get("contract_names") or []) if value
+        }
+        if target_ids and not (artifact_ids & target_ids):
+            if not target_names or not (artifact_names & target_names):
+                continue
+        elif target_names and not (artifact_names & target_names):
             continue
         loaded = load_code_artifact.func(path)
         if isinstance(loaded, dict) and loaded.get("code"):
@@ -947,8 +998,11 @@ async def _handle_prepare_script(task, project_id: str, user_id: str, pipeline_r
         return events
 
     contract_name = primary_contract.name
+    plan_contract_id = primary_contract.plan_contract_id
+    all_manifest_contract_ids = [contract.plan_contract_id for contract in manifest.contracts]
     script_name = f"Deploy{contract_name}"
     script_path = f"script/{script_name}.s.sol"
+    serialized_manifest = manifest.model_dump()
     generation = generate_foundry_deploy_script_direct(
         FoundryDeployScriptGenerationRequest(
             goal=f"Deploy {contract_name} to Avalanche Fuji.",
@@ -957,7 +1011,11 @@ async def _handle_prepare_script(task, project_id: str, user_id: str, pipeline_r
             constructor_args=_constructor_literals_from_manifest(primary_contract),
             constraints=_deployment_constraints(None),
             plan_summary=json.dumps(_current_plan_summary(mm, task.context), indent=2),
-            contract_sources=_load_contract_sources(snapshot.get("coding", [])),
+            contract_sources=_load_contract_sources(
+                snapshot.get("coding", []),
+                target_plan_contract_ids=all_manifest_contract_ids,
+            ),
+            deployment_manifest=serialized_manifest,
         )
     )
     if generation.get("error"):
@@ -998,6 +1056,7 @@ async def _handle_prepare_script(task, project_id: str, user_id: str, pipeline_r
             language="solidity",
             description=f"Foundry deployment script for {contract_name}",
             contract_names=[script_name],
+            plan_contract_ids=all_manifest_contract_ids,
             code=generation.get("generated_script", ""),
         )
     )
@@ -1108,6 +1167,8 @@ async def _handle_prepare_script(task, project_id: str, user_id: str, pipeline_r
             "script_path": script_path,
             "manifest_path": MANIFEST_PATH,
             "contract_name": contract_name,
+            "plan_contract_id": plan_contract_id,
+            "plan_contract_ids": all_manifest_contract_ids,
         },
         evaluation_id=evaluation_row,
     )
@@ -1122,6 +1183,8 @@ async def _handle_prepare_script(task, project_id: str, user_id: str, pipeline_r
             "script_path": script_path,
             "script_name": script_name,
             "contract_name": contract_name,
+            "plan_contract_id": plan_contract_id,
+            "plan_contract_ids": all_manifest_contract_ids,
         },
         artifact_revision=task.artifact_revision,
         task_status="completed",
@@ -1151,6 +1214,7 @@ async def _handle_execute_deploy(task, project_id: str, user_id: str, pipeline_r
     snapshot = _artifact_snapshot(mm)
     task_context = task.context or {}
     script_path = task_context.get("script_path") or _latest_deploy_script(snapshot)
+    plan_contract_id = task_context.get("plan_contract_id")
     if not script_path:
         result_summary = "No deployment script artifact available to execute."
         next_task = await _next_task_payload(
@@ -1174,13 +1238,37 @@ async def _handle_execute_deploy(task, project_id: str, user_id: str, pipeline_r
             next_tasks=[next_task],
         )
         return events
+    if not plan_contract_id:
+        result_summary = "Deployment task is missing plan_contract_id."
+        next_task = await _next_task_payload(
+            pipeline_run_id,
+            task,
+            assigned_to="coding",
+            task_type="coding.generate_contracts",
+            description=result_summary,
+            context={"failure_context": {"summary": result_summary}},
+            artifact_revision=task.artifact_revision,
+            task_status="failed",
+            result_summary=result_summary,
+            failure_class="artifact_contract_mismatch",
+        )
+        await _finalize_direct_task(
+            project_id=project_id,
+            pipeline_run_id=pipeline_run_id,
+            task=task,
+            task_status="failed",
+            result_summary=result_summary,
+            next_tasks=[next_task],
+        )
+        return events
 
     manifest, _ = load_saved_manifest(project_id)
-    target_payload = (
+    target = DeploymentTarget.model_validate(
         manifest.deployment_target.model_dump()
         if manifest is not None
         else default_deployment_target_payload()
     )
+    target_payload = target.model_dump()
 
     deploy_result = run_foundry_deploy.func(
         FoundryDeployRequest(
@@ -1190,6 +1278,8 @@ async def _handle_execute_deploy(task, project_id: str, user_id: str, pipeline_r
             rpc_url_env_var=target_payload.get("rpc_url_env_var") or "FUJI_RPC_URL",
             private_key_env_var=target_payload.get("private_key_env_var")
             or "FUJI_PRIVATE_KEY",
+            plan_contract_id=plan_contract_id,
+            deployment_manifest=manifest.model_dump() if manifest is not None else None,
             quiet_output=True,
         )
     )
@@ -1216,11 +1306,11 @@ async def _handle_execute_deploy(task, project_id: str, user_id: str, pipeline_r
                 rpc_url_env_var=target_payload.get("rpc_url_env_var") or "FUJI_RPC_URL",
                 private_key_env_var=target_payload.get("private_key_env_var")
                 or "FUJI_PRIVATE_KEY",
+                plan_contract_id=plan_contract_id,
+                deployment_manifest=manifest.model_dump() if manifest is not None else None,
                 quiet_output=True,
             )
         )
-    target = DeploymentTarget.model_validate(target_payload)
-
     if deploy_result.get("success"):
         events.append(
             {
@@ -1239,12 +1329,15 @@ async def _handle_execute_deploy(task, project_id: str, user_id: str, pipeline_r
                 pipeline_task_id=str(task.id),
                 deployed_address=deploy_result.get("deployed_address"),
                 contract_name=task_context.get("contract_name"),
+                plan_contract_id=plan_contract_id,
                 script_path=script_path,
                 chain_id=target_payload.get("chain_id") or 43113,
                 command=deploy_result.get("command"),
                 stdout_path=deploy_result.get("stdout_path"),
                 stderr_path=deploy_result.get("stderr_path"),
                 exit_code=deploy_result.get("exit_code"),
+                deployed_contracts=deploy_result.get("deployed_contracts") or [],
+                executed_calls=deploy_result.get("executed_calls") or [],
             )
         )
         result_summary = compact_execution_summary(
@@ -1290,12 +1383,15 @@ async def _handle_execute_deploy(task, project_id: str, user_id: str, pipeline_r
             pipeline_task_id=str(task.id),
             deployed_address=deploy_result.get("deployed_address"),
             contract_name=task_context.get("contract_name"),
+            plan_contract_id=plan_contract_id,
             script_path=script_path,
             chain_id=target_payload.get("chain_id") or 43113,
             command=deploy_result.get("command"),
             stdout_path=deploy_result.get("stdout_path"),
             stderr_path=deploy_result.get("stderr_path"),
             exit_code=deploy_result.get("exit_code"),
+            deployed_contracts=deploy_result.get("deployed_contracts") or [],
+            executed_calls=deploy_result.get("executed_calls") or [],
         )
     )
 
@@ -1306,6 +1402,8 @@ async def _handle_execute_deploy(task, project_id: str, user_id: str, pipeline_r
     context = {
         "script_path": script_path,
         "contract_name": task_context.get("contract_name"),
+        "plan_contract_id": plan_contract_id,
+        "plan_contract_ids": task_context.get("plan_contract_ids"),
         "failure_context": {
             "summary": compact_execution_summary(
                 deploy_result.get("exit_code", 1),
@@ -1560,11 +1658,13 @@ async def run_autonomous_pipeline(
                         project_id=uuid.UUID(project_id),
                         user_id=uuid.UUID(user_id),
                         plan_id=plan_row.id if plan_row else None,
-                        deployment_target=(
-                            (plan_row.plan_data or {}).get("deployment_target")
-                            if plan_row
-                            else default_deployment_target_payload()
-                        ),
+                        deployment_target=DeploymentTarget.model_validate(
+                            (
+                                (plan_row.plan_data or {}).get("deployment_target")
+                                if plan_row
+                                else default_deployment_target_payload()
+                            )
+                        ).model_dump(),
                         trace_id=trace_id,
                     )
                     pipeline_run_id = str(run.id)
@@ -1598,6 +1698,15 @@ async def run_autonomous_pipeline(
                         current_stage="coding",
                     )
         except Exception as e:
+            if pipeline_run_id is not None:
+                await _finalize_pipeline_terminal_status(
+                    project_id=project_id,
+                    user_id=user_id,
+                    pipeline_run_id=pipeline_run_id,
+                    status="failed",
+                    failure_class="unknown",
+                    failure_reason=f"Could not seed first task: {e}",
+                )
             yield {
                 "type": "pipeline_error",
                 "stage": "init",
@@ -1648,15 +1757,14 @@ async def run_autonomous_pipeline(
 
     while True:
         if is_pipeline_cancelled(pipeline_run_id):
-            async with async_session_factory() as session:
-                await update_pipeline_run(
-                    session,
-                    uuid.UUID(pipeline_run_id),
-                    status="cancelled",
-                    completed_at=datetime.now(timezone.utc),
-                    failure_class="cancelled",
-                    failure_reason="Cancellation requested by operator.",
-                )
+            await _finalize_pipeline_terminal_status(
+                project_id=project_id,
+                user_id=user_id,
+                pipeline_run_id=pipeline_run_id,
+                status="cancelled",
+                failure_class="cancelled",
+                failure_reason="Cancellation requested by operator.",
+            )
             yield {
                 "type": "pipeline_cancelled",
                 "pipeline_run_id": pipeline_run_id,
@@ -1673,11 +1781,11 @@ async def run_autonomous_pipeline(
                     session, uuid.UUID(pipeline_run_id)
                 )
                 if claimed_count >= EMERGENCY_TASK_FUSE:
-                    await update_pipeline_run(
-                        session,
-                        uuid.UUID(pipeline_run_id),
+                    await _finalize_pipeline_terminal_status(
+                        project_id=project_id,
+                        user_id=user_id,
+                        pipeline_run_id=pipeline_run_id,
                         status="failed",
-                        completed_at=datetime.now(timezone.utc),
                         failure_class="unknown",
                         failure_reason=(
                             f"Run exceeded the emergency claimed-task fuse ({EMERGENCY_TASK_FUSE})."
@@ -1705,6 +1813,14 @@ async def run_autonomous_pipeline(
                         current_task_id=task.id,
                     )
         except Exception as e:
+            await _finalize_pipeline_terminal_status(
+                project_id=project_id,
+                user_id=user_id,
+                pipeline_run_id=pipeline_run_id,
+                status="failed",
+                failure_class="unknown",
+                failure_reason=f"DB error reading tasks: {e}",
+            )
             yield {
                 "type": "pipeline_error",
                 "stage": "dispatch",
@@ -1723,14 +1839,12 @@ async def run_autonomous_pipeline(
                 )
 
                 if terminal is not None:
-                    await update_pipeline_run(
-                        session,
-                        uuid.UUID(pipeline_run_id),
+                    await _finalize_pipeline_terminal_status(
+                        project_id=project_id,
+                        user_id=user_id,
+                        pipeline_run_id=pipeline_run_id,
                         status="completed",
-                        completed_at=datetime.now(timezone.utc),
-                        terminal_deployment_id=terminal.id,
-                        failure_class=None,
-                        failure_reason=None,
+                        terminal_deployment=terminal,
                     )
                     yield {
                         "type": "pipeline_complete",
@@ -1754,29 +1868,44 @@ async def run_autonomous_pipeline(
                     break
 
                 status, failure_reason = _derive_pipeline_status(run, tasks)
-                await update_pipeline_run(
-                    session,
-                    uuid.UUID(pipeline_run_id),
-                    status="failed" if status not in {"cancelled", "completed"} else status,
-                    completed_at=datetime.now(timezone.utc),
+                terminal_status = (
+                    "failed" if status not in {"cancelled", "completed"} else status
+                )
+                final_reason = (
+                    failure_reason
+                    or "Pipeline ended without a successful terminal deployment."
+                )
+                await _finalize_pipeline_terminal_status(
+                    project_id=project_id,
+                    user_id=user_id,
+                    pipeline_run_id=pipeline_run_id,
+                    status=terminal_status,
                     failure_class=(run.failure_class if run else "unknown"),
-                    failure_reason=(
-                        failure_reason
-                        or "Pipeline ended without a successful terminal deployment."
-                    ),
+                    failure_reason=final_reason,
                 )
                 yield {
                     "type": "pipeline_error",
                     "stage": "deployment",
                     "pipeline_run_id": pipeline_run_id,
-                    "error": failure_reason
-                    or "Pipeline ended without a successful terminal deployment.",
+                    "error": final_reason,
                     "status": status,
                 }
-                _update_plan_status(project_id, user_id, "failed")
+                _update_plan_status(
+                    project_id,
+                    user_id,
+                    "ready" if terminal_status == "cancelled" else "failed",
+                )
                 break
 
         if task.assigned_to not in VALID_AGENTS:
+            await _finalize_pipeline_terminal_status(
+                project_id=project_id,
+                user_id=user_id,
+                pipeline_run_id=pipeline_run_id,
+                status="failed",
+                failure_class="unknown",
+                failure_reason=f"Invalid agent assignment: '{task.assigned_to}'",
+            )
             yield {
                 "type": "pipeline_error",
                 "stage": task.assigned_to,
@@ -1817,10 +1946,11 @@ async def run_autonomous_pipeline(
             else:
                 agent_message = task.description
                 if task.context:
+                    slim_context = _slim_task_context(task.context)
                     agent_message = (
                         f"{task.description}\n\n"
                         "Pipeline task context:\n"
-                        f"{json.dumps(task.context, indent=2, sort_keys=True)}"
+                        f"{json.dumps(slim_context, indent=2, sort_keys=True)}"
                     )
                 with start_span(
                     "model.call",
@@ -1847,19 +1977,20 @@ async def run_autonomous_pipeline(
                                     result_summary="Cancellation requested by operator.",
                                     completed_at=datetime.now(timezone.utc),
                                 )
-                                await update_pipeline_run(
-                                    session,
-                                    uuid.UUID(pipeline_run_id),
-                                    status="cancelled",
-                                    completed_at=datetime.now(timezone.utc),
-                                    failure_class="cancelled",
-                                    failure_reason="Cancellation requested by operator.",
-                                )
+                            await _finalize_pipeline_terminal_status(
+                                project_id=project_id,
+                                user_id=user_id,
+                                pipeline_run_id=pipeline_run_id,
+                                status="cancelled",
+                                failure_class="cancelled",
+                                failure_reason="Cancellation requested by operator.",
+                            )
                             yield {
                                 "type": "pipeline_cancelled",
                                 "pipeline_run_id": pipeline_run_id,
                                 "stage": stage,
                             }
+                            _update_plan_status(project_id, user_id, "ready")
                             clear_project_context()
                             return
 
@@ -1888,15 +2019,14 @@ async def run_autonomous_pipeline(
                                     "content": event["content"],
                                 }
         except Exception as e:
-            async with async_session_factory() as session:
-                await update_pipeline_run(
-                    session,
-                    uuid.UUID(pipeline_run_id),
-                    status="failed",
-                    completed_at=datetime.now(timezone.utc),
-                    failure_class="unknown",
-                    failure_reason=f"Task '{task.task_type}' raised an exception: {e}",
-                )
+            await _finalize_pipeline_terminal_status(
+                project_id=project_id,
+                user_id=user_id,
+                pipeline_run_id=pipeline_run_id,
+                status="failed",
+                failure_class="unknown",
+                failure_reason=f"Task '{task.task_type}' raised an exception: {e}",
+            )
             yield {
                 "type": "pipeline_error",
                 "stage": stage,
@@ -1912,6 +2042,14 @@ async def run_autonomous_pipeline(
             async with async_session_factory() as session:
                 updated_task = await get_pipeline_task(session, uuid.UUID(task_id))
         except Exception as e:
+            await _finalize_pipeline_terminal_status(
+                project_id=project_id,
+                user_id=user_id,
+                pipeline_run_id=pipeline_run_id,
+                status="failed",
+                failure_class="unknown",
+                failure_reason=f"Could not reload task after execution: {e}",
+            )
             yield {
                 "type": "pipeline_error",
                 "stage": stage,
@@ -1922,6 +2060,14 @@ async def run_autonomous_pipeline(
             break
 
         if updated_task is None:
+            await _finalize_pipeline_terminal_status(
+                project_id=project_id,
+                user_id=user_id,
+                pipeline_run_id=pipeline_run_id,
+                status="failed",
+                failure_class="unknown",
+                failure_reason="Pipeline task disappeared before completion could be verified.",
+            )
             yield {
                 "type": "pipeline_error",
                 "stage": stage,
@@ -1932,6 +2078,16 @@ async def run_autonomous_pipeline(
             break
 
         if updated_task.status not in {"completed", "failed", "cancelled"}:
+            await _finalize_pipeline_terminal_status(
+                project_id=project_id,
+                user_id=user_id,
+                pipeline_run_id=pipeline_run_id,
+                status="failed",
+                failure_class="unknown",
+                failure_reason=(
+                    "Task finished without resolving its pipeline task into a terminal state."
+                ),
+            )
             yield {
                 "type": "pipeline_error",
                 "stage": stage,
@@ -1948,6 +2104,14 @@ async def run_autonomous_pipeline(
             task=updated_task,
         )
         if updated_task.task_type in DIRECT_TASK_TYPES and not valid_result:
+            await _finalize_pipeline_terminal_status(
+                project_id=project_id,
+                user_id=user_id,
+                pipeline_run_id=pipeline_run_id,
+                status="failed",
+                failure_class="unknown",
+                failure_reason=validation_error,
+            )
             yield {
                 "type": "pipeline_error",
                 "stage": stage,
@@ -1970,6 +2134,15 @@ async def run_autonomous_pipeline(
             run = await get_pipeline_run(session, uuid.UUID(pipeline_run_id))
 
         if updated_task.status == "cancelled":
+            await _finalize_pipeline_terminal_status(
+                project_id=project_id,
+                user_id=user_id,
+                pipeline_run_id=pipeline_run_id,
+                status="cancelled",
+                failure_class="cancelled",
+                failure_reason=updated_task.result_summary
+                or "Cancellation requested by operator.",
+            )
             yield {
                 "type": "pipeline_cancelled",
                 "pipeline_run_id": pipeline_run_id,
@@ -2025,34 +2198,44 @@ async def get_pipeline_status(
     project_id: str,
     user_id: str,
     pipeline_run_id: str,
+    *,
+    include_tasks: bool = True,
+    include_gates: bool = True,
+    include_evaluations: bool = True,
 ) -> dict:
     """
     Return the full task history for a pipeline run.
     Used by GET /pipeline/status for frontend display.
     """
     try:
+        run_uuid = uuid.UUID(pipeline_run_id)
         async with async_session_factory() as session:
-            run = await get_pipeline_run(session, uuid.UUID(pipeline_run_id))
-            tasks = await get_pipeline_run_tasks(session, uuid.UUID(pipeline_run_id))
-            gates = await list_pipeline_human_gates(session, uuid.UUID(pipeline_run_id))
-            evaluations = await list_pipeline_evaluations(
-                session, uuid.UUID(pipeline_run_id)
-            )
+            run = await get_pipeline_run(session, run_uuid)
+            snapshot = await get_pipeline_run_snapshot(session, run_uuid)
+            if snapshot is not None:
+                payload = dict(snapshot.snapshot_json or {})
+            else:
+                refreshed_snapshot = await refresh_pipeline_run_snapshot(session, run_uuid)
+                if refreshed_snapshot is not None:
+                    payload = dict(refreshed_snapshot.snapshot_json or {})
+                else:
+                    tasks = await get_pipeline_run_tasks(session, run_uuid)
+                    gates = await list_pipeline_human_gates(session, run_uuid)
+                    evaluations = await list_pipeline_evaluations(session, run_uuid)
+                    payload = build_pipeline_status_payload(
+                        project_id=project_id,
+                        pipeline_run_id=pipeline_run_id,
+                        run=run,
+                        tasks=tasks,
+                        gates=gates,
+                        evaluations=evaluations,
+                    )
 
-        status, failure_reason = _derive_pipeline_status(run, tasks)
-
-        return {
-            "pipeline_run_id": pipeline_run_id,
-            "project_id": project_id,
-            "status": status,
-            "failure_reason": failure_reason,
-            "run": _serialize_run(run) if run is not None else None,
-            "total_tasks": len(tasks),
-            "tasks": [_serialize_task(task) for task in tasks],
-            "gates": [_serialize_gate(gate) for gate in gates],
-            "evaluations": [
-                _serialize_evaluation(evaluation) for evaluation in evaluations
-            ],
-        }
+        return project_pipeline_status_payload(
+            payload,
+            include_tasks=include_tasks,
+            include_gates=include_gates,
+            include_evaluations=include_evaluations,
+        )
     except Exception as e:
         return {"error": f"Could not retrieve pipeline status: {e}"}

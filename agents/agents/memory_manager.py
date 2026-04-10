@@ -2,17 +2,19 @@ import asyncio
 import os
 import sys
 import json
+import threading
 import uuid
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from functools import lru_cache
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from dotenv import load_dotenv
+from agents.contract_identity import normalize_plan_contracts
 from letta_client import Letta
 from agents.pipeline_specs import default_deployment_target_payload
 from agents.pipeline_context import extract_plan_summary
+from schemas.deployment_schema import DeploymentTarget
 
 try:
     # Prefer TOON for token-efficient storage, but fall back to JSON if unavailable
@@ -30,17 +32,123 @@ load_dotenv(
     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
 )
 
-# Thread pool for running async Neon CRUD from sync tool context
-_db_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="partyhat-db")
+_db_runtime_lock = threading.Lock()
+_db_loop_ready = threading.Event()
+_db_loop: asyncio.AbstractEventLoop | None = None
+_db_loop_thread: threading.Thread | None = None
+_db_async_engine = None
+_db_async_session_factory = None
+_HOT_AGENT_STATE_DEFAULTS: dict[str, dict] = {
+    "planning": {
+        "plan_id": None,
+        "plan_status": None,
+        "plan_summary": {},
+        "note_count": 0,
+        "current_plan": None,
+        "approval_request": None,
+    },
+    "coding": {
+        "artifact_count": 0,
+        "last_artifact_path": None,
+        "latest_artifact_revision": 0,
+        "artifacts": [],
+        "notes": [],
+    },
+    "testing": {
+        "last_test_status": None,
+        "last_run_id": None,
+        "last_run": None,
+        "last_test_results": [],
+        "artifacts": [],
+        "notes": [],
+    },
+    "deployment": {
+        "last_deploy_status": None,
+        "last_deploy_ref": None,
+        "deployed_address": None,
+        "tx_hash": None,
+        "snowtrace_url": None,
+        "deployed_contracts": [],
+        "executed_calls": [],
+        "last_deploy_results": [],
+        "artifacts": [],
+        "targets": [],
+        "deployments": [],
+    },
+    "audit": {
+        "open_issues": 0,
+        "issues": [],
+        "reports": [],
+    },
+}
+
+
+def _db_loop_worker() -> None:
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    global _db_loop
+    _db_loop = loop
+    _db_loop_ready.set()
+    loop.run_forever()
+
+
+def _get_db_session_factory():
+    global _db_loop_thread, _db_async_engine, _db_async_session_factory
+
+    with _db_runtime_lock:
+        if _db_loop is None or not _db_loop.is_running():
+            _db_async_engine = None
+            _db_async_session_factory = None
+            _db_loop_ready.clear()
+            _db_loop_thread = threading.Thread(
+                target=_db_loop_worker,
+                name="partyhat-db-loop",
+                daemon=True,
+            )
+            _db_loop_thread.start()
+
+        if _db_async_session_factory is None:
+            from agents.db import _get_async_url, _is_remote_ssl_host  # type: ignore[attr-defined]
+            from sqlalchemy.ext.asyncio import (
+                AsyncSession,
+                async_sessionmaker,
+                create_async_engine,
+            )
+
+            db_url = _get_async_url()
+            if not db_url:
+                return None
+
+            connect_args = {"ssl": True} if _is_remote_ssl_host(db_url) else {}
+            _db_async_engine = create_async_engine(
+                db_url,
+                echo=False,
+                pool_pre_ping=True,
+                pool_recycle=300,
+                pool_use_lifo=True,
+                connect_args=connect_args,
+            )
+            _db_async_session_factory = async_sessionmaker(
+                _db_async_engine,
+                class_=AsyncSession,
+                expire_on_commit=False,
+                autoflush=False,
+            )
+
+    _db_loop_ready.wait()
+    return _db_async_session_factory
 
 
 def _run_db(coro):
     """
     Run an async coroutine from a sync context safely.
-    Uses a dedicated thread so asyncio.run() always gets a fresh event loop,
-    avoiding conflicts with FastAPI's running loop.
+    Uses a dedicated event loop thread so asyncpg connections stay bound to
+    one loop and can be safely pooled across sync callers.
     """
-    future = _db_executor.submit(asyncio.run, coro)
+    session_factory = _get_db_session_factory()
+    if session_factory is None or _db_loop is None:
+        return None
+    future = asyncio.run_coroutine_threadsafe(coro, _db_loop)
     return future.result()
 
 
@@ -240,6 +348,8 @@ class MemoryManager:
         deployment.setdefault("deployed_address", None)
         deployment.setdefault("tx_hash", None)
         deployment.setdefault("snowtrace_url", None)
+        deployment.setdefault("deployed_contracts", [])
+        deployment.setdefault("executed_calls", [])
         deployment.setdefault("last_deploy_results", [])
         deployment.setdefault("artifacts", [])
         deployment.setdefault("targets", [])
@@ -257,6 +367,63 @@ class MemoryManager:
         except ValueError:
             return None
 
+    def _hot_state_enabled(self, agent_name: str) -> bool:
+        return (
+            self._db_available
+            and self._project_uuid() is not None
+            and agent_name in _HOT_AGENT_STATE_DEFAULTS
+        )
+
+    def _default_agent_state(self, agent_name: str) -> dict:
+        template = _HOT_AGENT_STATE_DEFAULTS.get(agent_name, {})
+        return json.loads(json.dumps(template))
+
+    def _normalize_agent_state(self, agent_name: str, state: dict | None) -> dict:
+        normalized = self._default_agent_state(agent_name)
+        if isinstance(state, dict):
+            normalized.update(state)
+        return normalized
+
+    def get_agent_state_version(self, agent_name: str) -> int:
+        project_uuid = self._project_uuid()
+        if project_uuid and self._hot_state_enabled(agent_name):
+            from agents.db.crud import get_project_runtime_state_versions
+
+            versions = self._db_call(
+                lambda session: get_project_runtime_state_versions(
+                    session,
+                    project_uuid,
+                    scopes=[agent_name],
+                )
+            )
+            if isinstance(versions, dict):
+                return int(versions.get(agent_name, 0) or 0)
+        return 0
+
+    def get_project_state_versions(self) -> dict[str, str]:
+        project_uuid = self._project_uuid()
+        if project_uuid and self._db_available:
+            from agents.db.crud import get_project_runtime_state_versions
+
+            versions = self._db_call(
+                lambda session: get_project_runtime_state_versions(
+                    session,
+                    project_uuid,
+                    scopes=["planning", "coding", "deployment"],
+                )
+            )
+            if isinstance(versions, dict):
+                return {
+                    "plan": str(versions.get("planning", 0)),
+                    "code": str(versions.get("coding", 0)),
+                    "deployment": str(versions.get("deployment", 0)),
+                }
+        return {
+            "plan": str(self.get_agent_state_version("planning")),
+            "code": str(self.get_agent_state_version("coding")),
+            "deployment": str(self.get_agent_state_version("deployment")),
+        }
+
     def _db_call(self, coro_factory):
         """
         Run an async DB operation from sync context.
@@ -266,45 +433,23 @@ class MemoryManager:
         if not self._db_available:
             return None
 
+        session_factory = _get_db_session_factory()
+        if session_factory is None:
+            return None
+
         async def _run():
             """
-            Run the DB coroutine using a per-call async engine bound to this
-            event loop, to avoid sharing asyncpg connections across loops.
+            Run the DB coroutine on the shared DB loop so pooled asyncpg
+            connections stay on a single event loop.
             """
-            from agents.db import _get_async_url, _is_remote_ssl_host  # type: ignore[attr-defined]
-            from sqlalchemy.ext.asyncio import (
-                AsyncSession,
-                async_sessionmaker,
-                create_async_engine,
-            )
+            from agents.db import run_with_retry
 
-            db_url = _get_async_url()
-            if not db_url:
-                return None
-
-            connect_args = (
-                {"ssl": True} if _is_remote_ssl_host(db_url) else {}
-            )
-
-            engine = create_async_engine(
-                db_url,
-                echo=False,
-                pool_pre_ping=True,
-                pool_recycle=300,
-                connect_args=connect_args,
-            )
-            session_factory = async_sessionmaker(
-                engine,
-                class_=AsyncSession,
-                expire_on_commit=False,
-                autoflush=False,
-            )
-
-            try:
-                async with session_factory() as session:
-                    return await coro_factory(session)
-            finally:
-                await engine.dispose()
+            async with session_factory() as session:
+                return await run_with_retry(
+                    session,
+                    coro_factory,
+                    session_factory=session_factory,
+                )
 
         try:
             return _run_db(_run())
@@ -321,7 +466,11 @@ class MemoryManager:
           - a copy of the current plan JSON
           - a copy of the previous plan JSON (one-step history only)
         """
-        plan = self._normalize_plan_payload(plan)
+        try:
+            previous_plan = self.get_plan()
+        except Exception:
+            previous_plan = None
+        plan = self._normalize_plan_payload(plan, previous_plan=previous_plan)
         project_uuid = self._project_uuid()
         status = plan.get("status", "draft")
 
@@ -335,11 +484,7 @@ class MemoryManager:
             )
 
         compact_summary = extract_plan_summary(plan)
-
-        # Updating Letta planning slice in Letta
-        data, block = self._read_user_block()
-        self._ensure_agents_structure(data)
-        planning = self._get_agent_slice(data, "planning")
+        planning = self.get_agent_state("planning")
         planning["plan_status"] = status
         planning["plan_summary"] = compact_summary
         if saved_plan:
@@ -347,7 +492,14 @@ class MemoryManager:
             planning["current_plan"] = None
         else:
             planning["current_plan"] = plan
-        self._write_user_block(data, block)
+        self.set_agent_state("planning", planning)
+
+    def _sync_plan_summary(self, plan: dict) -> None:
+        summary = extract_plan_summary(plan)
+        planning = self.get_agent_state("planning")
+        if planning.get("plan_summary") != summary:
+            planning["plan_summary"] = summary
+            self.set_agent_state("planning", planning)
 
     def get_plan(self) -> dict | None:
         """
@@ -359,16 +511,34 @@ class MemoryManager:
 
         if project_uuid and self._db_available:
             from agents.db.crud import get_current_plan as db_get_plan
+            from agents.db.crud import upsert_plan as db_upsert_plan
 
             plan_row = self._db_call(lambda session: db_get_plan(session, project_uuid))
-            if plan_row:
-                return self._normalize_plan_payload(plan_row.plan_data)
+            if plan_row and getattr(plan_row, "plan_data", None) is not None:
+                normalized = self._normalize_plan_payload(plan_row.plan_data)
+                if normalized != plan_row.plan_data:
+                    self._db_call(
+                        lambda session: db_upsert_plan(
+                            session,
+                            project_uuid,
+                            normalized,
+                            normalized.get("status", getattr(plan_row, "status", "draft")),
+                        )
+                    )
+                self._sync_plan_summary(normalized)
+                return normalized
 
         # Fallback: read from Letta planning slice (current_plan).
-        data, _ = self._read_user_block()
-        planning = self._get_agent_slice(data, "planning")
+        planning = self.get_agent_state("planning")
         plan = planning.get("current_plan") or None
-        return self._normalize_plan_payload(plan) if isinstance(plan, dict) else plan
+        if not isinstance(plan, dict):
+            return plan
+        normalized = self._normalize_plan_payload(plan)
+        if normalized != plan:
+            planning["current_plan"] = normalized
+            self.set_agent_state("planning", planning)
+        self._sync_plan_summary(normalized)
+        return normalized
 
     def get_plan_history(self) -> list:
         """Plan history is no longer stored; return empty list."""
@@ -388,12 +558,9 @@ class MemoryManager:
                 lambda session: db_update_status(session, project_uuid, status)
             )
 
-        # Updating Letta pointer
-        data, block = self._read_user_block()
-        self._ensure_agents_structure(data)
-        planning = self._get_agent_slice(data, "planning")
+        planning = self.get_agent_state("planning")
         planning["plan_status"] = status
-        self._write_user_block(data, block)
+        self.set_agent_state("planning", planning)
 
     def save_reasoning_note(self, note: str) -> None:
         """
@@ -408,11 +575,9 @@ class MemoryManager:
 
             self._db_call(lambda session: db_add_note(session, project_uuid, note))
 
-        # Incrementing counter in Letta
-        data, block = self._read_user_block()
-        planning = self._get_agent_slice(data, "planning")
+        planning = self.get_agent_state("planning")
         planning["note_count"] = planning.get("note_count", 0) + 1
-        self._write_user_block(data, block)
+        self.set_agent_state("planning", planning)
 
     def get_reasoning_notes(self) -> list:
         """
@@ -556,6 +721,7 @@ class MemoryManager:
         Letta block updated with last_test_status pointer only.
         """
         project_uuid = self._project_uuid()
+        run = None
 
         if project_uuid and self._db_available:
             from agents.db.crud import save_test_run as db_save_run
@@ -581,19 +747,20 @@ class MemoryManager:
                     trace_id=trace_id,
                 )
             )
-            # Updating Letta pointer
-            data, block = self._read_user_block()
-            self._ensure_agents_structure(data)
-            testing = self._get_agent_slice(data, "testing")
-            testing["last_test_status"] = status
-            if run:
-                testing["last_run_id"] = str(run.id)
-                testing["last_run"] = {
-                    "id": str(run.id),
-                    "status": status,
-                    "created_at": run.created_at.isoformat(),
-                }
-            self._write_user_block(data, block)
+
+        testing = self.get_agent_state("testing")
+        testing["last_test_status"] = status
+        if run:
+            testing["last_run_id"] = str(run.id)
+            testing["last_run"] = {
+                "id": str(run.id),
+                "status": status,
+                "created_at": run.created_at.isoformat(),
+                "stdout_path": run.stdout_path,
+                "stderr_path": run.stderr_path,
+                "exit_code": run.exit_code,
+            }
+        self.set_agent_state("testing", testing)
 
     def get_last_test_run(self) -> dict | None:
         """Get the most recent test run result from Neon."""
@@ -627,6 +794,7 @@ class MemoryManager:
         self,
         status: str,
         contract_name: str | None = None,
+        plan_contract_id: str | None = None,
         deployed_address: str | None = None,
         tx_hash: str | None = None,
         snowtrace_url: str | None = None,
@@ -638,6 +806,8 @@ class MemoryManager:
         stderr_path: str | None = None,
         exit_code: int | None = None,
         trace_id: str | None = None,
+        deployed_contracts: list[dict] | None = None,
+        executed_calls: list[dict] | None = None,
     ) -> None:
         """
         Save a deployment record.
@@ -655,6 +825,7 @@ class MemoryManager:
                     project_uuid,
                     status=status,
                     contract_name=contract_name,
+                    plan_contract_id=plan_contract_id,
                     deployed_address=deployed_address,
                     tx_hash=tx_hash,
                     snowtrace_url=snowtrace_url,
@@ -670,13 +841,12 @@ class MemoryManager:
                     stderr_path=stderr_path,
                     exit_code=exit_code,
                     trace_id=trace_id,
+                    deployed_contracts=deployed_contracts,
+                    executed_calls=executed_calls,
                 )
             )
 
-        # Updating Letta pointer with only the small strings agents actually need
-        data, block = self._read_user_block()
-        self._ensure_agents_structure(data)
-        deployment = self._get_agent_slice(data, "deployment")
+        deployment = self.get_agent_state("deployment")
         deployment["last_deploy_status"] = status
         if deployed_address:
             deployment["deployed_address"] = deployed_address
@@ -684,14 +854,21 @@ class MemoryManager:
             deployment["tx_hash"] = tx_hash
         if snowtrace_url:
             deployment["snowtrace_url"] = snowtrace_url
+        if deployed_contracts:
+            deployment["deployed_contracts"] = list(deployed_contracts)
+        if executed_calls:
+            deployment["executed_calls"] = list(executed_calls)
         deployment["last_deploy_ref"] = {
             "status": status,
             "contract_name": contract_name,
+            "plan_contract_id": plan_contract_id,
             "network": network,
             "deployed_address": deployed_address,
             "tx_hash": tx_hash,
+            "deployed_contracts": list(deployed_contracts or []),
+            "executed_calls": list(executed_calls or []),
         }
-        self._write_user_block(data, block)
+        self.set_agent_state("deployment", deployment)
 
     def get_last_deployment(self) -> dict | None:
         """Get the most recent deployment record from Neon."""
@@ -707,6 +884,7 @@ class MemoryManager:
         return {
             "status": dep.status,
             "contract_name": dep.contract_name,
+            "plan_contract_id": dep.plan_contract_id,
             "deployed_address": dep.deployed_address,
             "tx_hash": dep.tx_hash,
             "snowtrace_url": dep.snowtrace_url,
@@ -720,10 +898,17 @@ class MemoryManager:
             "stderr_path": dep.stderr_path,
             "exit_code": dep.exit_code,
             "trace_id": dep.trace_id,
+            "deployed_contracts": dep.deployed_contracts or [],
+            "executed_calls": dep.executed_calls or [],
             "created_at": dep.created_at.isoformat(),
         }
 
-    def list_test_runs(self, limit: int = 20) -> list[dict]:
+    def list_test_runs(
+        self,
+        limit: int = 20,
+        *,
+        include_output: bool = True,
+    ) -> list[dict]:
         project_uuid = self._project_uuid()
         if not project_uuid or not self._db_available:
             return []
@@ -731,14 +916,19 @@ class MemoryManager:
         from agents.db.crud import list_test_runs as db_list_test_runs
 
         rows = self._db_call(
-            lambda session: db_list_test_runs(session, project_uuid, limit=limit)
+            lambda session: db_list_test_runs(
+                session,
+                project_uuid,
+                limit=limit,
+                include_output=include_output,
+            )
         )
         return [
             {
                 "status": row.status,
                 "tests_run": row.tests_run,
                 "tests_passed": row.tests_passed,
-                "output": row.output,
+                "output": row.output if include_output else None,
                 "pipeline_run_id": str(row.pipeline_run_id)
                 if row.pipeline_run_id
                 else None,
@@ -750,6 +940,8 @@ class MemoryManager:
                 "stderr_path": row.stderr_path,
                 "exit_code": row.exit_code,
                 "trace_id": row.trace_id,
+                "deployed_contracts": row.deployed_contracts or [],
+                "executed_calls": row.executed_calls or [],
                 "created_at": row.created_at.isoformat(),
             }
             for row in rows or []
@@ -769,6 +961,7 @@ class MemoryManager:
             {
                 "status": row.status,
                 "contract_name": row.contract_name,
+                "plan_contract_id": row.plan_contract_id,
                 "deployed_address": row.deployed_address,
                 "tx_hash": row.tx_hash,
                 "snowtrace_url": row.snowtrace_url,
@@ -824,25 +1017,21 @@ class MemoryManager:
         last_artifact_path: str | None = None,
         latest_artifact_revision: int | None = None,
     ) -> None:
-        """Update the coding agent's working state pointer in Letta."""
-        data, block = self._read_user_block()
-        self._ensure_agents_structure(data)
-        coding = self._get_agent_slice(data, "coding")
+        """Update the coding agent's working state pointer."""
+        coding = self.get_agent_state("coding")
         if artifact_count is not None:
             coding["artifact_count"] = artifact_count
         if last_artifact_path is not None:
             coding["last_artifact_path"] = last_artifact_path
         if latest_artifact_revision is not None:
             coding["latest_artifact_revision"] = latest_artifact_revision
-        self._write_user_block(data, block)
+        self.set_agent_state("coding", coding)
 
     def update_audit_state(self, open_issues: int) -> None:
-        """Update the audit agent's open issue count in Letta."""
-        data, block = self._read_user_block()
-        self._ensure_agents_structure(data)
-        audit = self._get_agent_slice(data, "audit")
+        """Update the audit agent's open issue count."""
+        audit = self.get_agent_state("audit")
         audit["open_issues"] = open_issues
-        self._write_user_block(data, block)
+        self.set_agent_state("audit", audit)
 
     def save_session_summary(self, summary: str) -> None:
         """Log session summary as an agent log entry in Neon."""
@@ -861,23 +1050,67 @@ class MemoryManager:
         ]
 
     def get_agent_state(self, agent_name: str) -> dict:
-        """Return the working state slice for a given agent from Letta."""
+        """Return the working state slice for a given agent."""
+        project_uuid = self._project_uuid()
+        if project_uuid and self._hot_state_enabled(agent_name):
+            from agents.db.crud import get_project_runtime_state
+
+            row = self._db_call(
+                lambda session: get_project_runtime_state(session, project_uuid, agent_name)
+            )
+            if row is not None:
+                return self._normalize_agent_state(agent_name, row.state_json)
+            default_state = self._default_agent_state(agent_name)
+            self.set_agent_state(agent_name, default_state)
+            return default_state
+
         data, _ = self._read_user_block()
         self._ensure_agents_structure(data)
-        return data.get("agents", {}).get(agent_name, {})
+        return self._normalize_agent_state(
+            agent_name,
+            data.get("agents", {}).get(agent_name, {}),
+        )
 
     def set_agent_state(self, agent_name: str, state: dict) -> None:
-        """Replace the working state slice for a given agent in Letta."""
+        """Replace the working state slice for a given agent."""
+        normalized = self._normalize_agent_state(agent_name, state)
+        project_uuid = self._project_uuid()
+        if project_uuid and self._hot_state_enabled(agent_name):
+            from agents.db.crud import upsert_project_runtime_state
+
+            self._db_call(
+                lambda session: upsert_project_runtime_state(
+                    session,
+                    project_id=project_uuid,
+                    scope=agent_name,
+                    state_json=normalized,
+                )
+            )
+            return
+
         data, block = self._read_user_block()
         self._ensure_agents_structure(data)
-        data.setdefault("agents", {})[agent_name] = state
+        data.setdefault("agents", {})[agent_name] = normalized
         self._write_user_block(data, block)
 
-    def _normalize_plan_payload(self, plan: dict | None) -> dict | None:
+    def _normalize_plan_payload(
+        self,
+        plan: dict | None,
+        *,
+        previous_plan: dict | None = None,
+    ) -> dict | None:
         if not isinstance(plan, dict):
             return plan
-        normalized = dict(plan)
+        normalized = normalize_plan_contracts(plan, previous_plan=previous_plan)
+        if not isinstance(normalized, dict):
+            return normalized
         normalized.setdefault("deployment_target", default_deployment_target_payload())
+        try:
+            normalized["deployment_target"] = DeploymentTarget.model_validate(
+                normalized["deployment_target"]
+            ).model_dump(exclude_none=True)
+        except Exception:
+            pass
         return normalized
 
 

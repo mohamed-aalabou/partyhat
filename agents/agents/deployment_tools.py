@@ -20,10 +20,20 @@ from langchain_core.messages import HumanMessage
 import modal
 
 from modal_foundry_app import foundry_image
+from agents.contract_identity import (
+    enrich_artifact_with_plan_contract_ids,
+    validate_artifact_for_save,
+)
+from agents.deployment_manifest import (
+    extract_deployed_contract_references,
+    load_deployment_manifest,
+)
 from schemas.coding_schema import CodeArtifact
 from schemas.deployment_schema import (
+    DeployedContractResult,
     DeploymentTarget,
     DeploymentRecord,
+    ExecutedCallResult,
     FoundryDeployScriptGenerationRequest,
     FoundryDeployRequest,
     SnowtraceVerifyRequest,
@@ -100,6 +110,178 @@ def _normalize_contract_name(value: Any) -> Optional[str]:
     if not normalized:
         return None
     return normalized.rsplit(":", 1)[-1]
+
+
+def _instance_name(contract_name: str, *, used: set[str] | None = None) -> str:
+    pieces = [piece for piece in re.split(r"[^A-Za-z0-9]+", contract_name) if piece]
+    if not pieces:
+        base = "deployedContract"
+    else:
+        base = pieces[0][:1].lower() + pieces[0][1:]
+        for piece in pieces[1:]:
+            base += piece[:1].upper() + piece[1:]
+    if not re.match(r"^[A-Za-z_]", base):
+        base = f"contract{base}"
+    candidate = base
+    if used is None:
+        return candidate
+    suffix = 2
+    while candidate in used:
+        candidate = f"{base}{suffix}"
+        suffix += 1
+    used.add(candidate)
+    return candidate
+
+
+def _resolve_deployment_expression(
+    value: str,
+    *,
+    instance_names: dict[str, str],
+) -> str:
+    resolved = value
+    for contract_name in extract_deployed_contract_references(value):
+        instance_name = instance_names[contract_name]
+        resolved = resolved.replace(
+            f"<deployed:{contract_name}.address>",
+            f"address({instance_name})",
+        )
+    return resolved
+
+
+def _normalize_solidity_literal(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    return str(value)
+
+
+def _default_constructor_expression(arg_type: str) -> str:
+    lowered = (arg_type or "").strip().lower()
+    if lowered == "address":
+        return "deployer"
+    if lowered == "bool":
+        return "false"
+    if lowered == "string":
+        return '""'
+    if lowered.startswith("bytes"):
+        return 'hex""'
+    if lowered.endswith("[]"):
+        base = lowered[:-2] or "uint256"
+        return f"new {base}[](0)"
+    if lowered.startswith("uint") or lowered.startswith("int"):
+        return "0"
+    return "0"
+
+
+def _build_manifest_deploy_script(
+    request: FoundryDeployScriptGenerationRequest,
+) -> Optional[Dict[str, Any]]:
+    if not request.deployment_manifest:
+        return None
+
+    try:
+        manifest = load_deployment_manifest(request.deployment_manifest)
+    except Exception as exc:
+        return {"error": f"Failed to load deployment manifest for script generation: {exc}"}
+
+    contracts = sorted(manifest.contracts, key=lambda entry: (entry.deploy_order, entry.name))
+    if not contracts:
+        return {"error": "Deployment manifest has no contracts to deploy."}
+
+    primary = next(
+        (contract for contract in contracts if contract.role == "primary_deployable"),
+        contracts[0],
+    )
+    script_name = request.script_name or f"Deploy{primary.name}"
+    used_names: set[str] = set()
+    instance_names = {
+        contract.name: _instance_name(contract.name, used=used_names)
+        for contract in contracts
+    }
+
+    import_lines = [
+        f'import {{{contract.name}}} from "../{contract.source_path}";'
+        for contract in contracts
+    ]
+    import_block = "\n".join(dict.fromkeys(import_lines))
+
+    deploy_lines: list[str] = []
+    for contract in contracts:
+        args: list[str] = []
+        for item in contract.constructor_args_schema:
+            if str(item.source or "") == "deployer":
+                args.append("deployer")
+            else:
+                args.append(
+                    _resolve_deployment_expression(
+                        _normalize_solidity_literal(
+                            item.default_value
+                            if item.default_value not in (None, "")
+                            else _default_constructor_expression(item.type)
+                        ),
+                        instance_names=instance_names,
+                    )
+                )
+        deploy_args = ", ".join(args)
+        deploy_lines.append(
+            f"        // deploy-order:{contract.deploy_order} {contract.name}\n"
+            f"        {contract.name} {instance_names[contract.name]} = new {contract.name}({deploy_args});"
+        )
+
+    call_lines: list[str] = []
+    for call in sorted(
+        manifest.post_deploy_calls,
+        key=lambda entry: (entry.call_order, entry.target_contract_name, entry.function_name),
+    ):
+        resolved_args = [
+            _resolve_deployment_expression(str(arg), instance_names=instance_names)
+            for arg in call.args
+        ]
+        call_lines.append(
+            f"        // post-deploy:{call.call_order} {call.target_contract_name}.{call.function_name}\n"
+            f"        {instance_names[call.target_contract_name]}.{call.function_name}({', '.join(resolved_args)});"
+        )
+
+    body_lines = [
+        "pragma solidity ^0.8.20;",
+        "",
+        'import {Script} from "forge-std/Script.sol";',
+        import_block,
+        "",
+        f"contract {script_name} is Script {{",
+        "    function _loadPrivateKey() internal view returns (uint256) {",
+        '        string memory raw = vm.envString("FUJI_PRIVATE_KEY");',
+        "        bytes memory data = bytes(raw);",
+        "        if (data.length >= 2 && data[0] == 0x30 && (data[1] == 0x78 || data[1] == 0x58)) {",
+        "            return vm.parseUint(raw);",
+        "        }",
+        '        return vm.parseUint(string.concat("0x", raw));',
+        "    }",
+        "",
+        "    function run() external {",
+        "        uint256 privateKey = _loadPrivateKey();",
+        "        address deployer = vm.addr(privateKey);",
+        "",
+        "        vm.startBroadcast(privateKey);",
+        *deploy_lines,
+    ]
+
+    if call_lines:
+        body_lines.extend(["", *call_lines])
+
+    body_lines.extend(
+        [
+            "        vm.stopBroadcast();",
+            "    }",
+            "}",
+        ]
+    )
+
+    return {
+        "goal": request.goal,
+        "contract_name": primary.name,
+        "script_name": script_name,
+        "generated_script": "\n".join(body_lines) + "\n",
+    }
 
 
 def _contract_has_code(rpc_url: str, contract_address: str) -> bool:
@@ -199,11 +381,23 @@ def _extract_returned_contract_address(
     broadcast: Dict[str, Any],
     contract_name: str | None,
 ) -> Optional[str]:
+    expected_name = _normalize_contract_name(contract_name)
+    returned_by_name, addresses = _extract_returned_contract_addresses(broadcast)
+    if expected_name and expected_name in returned_by_name:
+        return returned_by_name[expected_name]
+    if len(addresses) == 1:
+        return addresses[0]
+    return None
+
+
+def _extract_returned_contract_addresses(
+    broadcast: Dict[str, Any],
+) -> tuple[Dict[str, str], list[str]]:
     returns = broadcast.get("returns")
     if not isinstance(returns, dict):
-        return None
+        return {}, []
 
-    expected_name = _normalize_contract_name(contract_name)
+    addresses_by_name: Dict[str, str] = {}
     addresses: list[str] = []
     for value in returns.values():
         if not isinstance(value, dict):
@@ -213,13 +407,73 @@ def _extract_returned_contract_address(
             continue
         internal_type = str(value.get("internal_type") or value.get("internalType") or "")
         normalized_internal = _normalize_contract_name(internal_type.removeprefix("contract "))
-        if expected_name and normalized_internal == expected_name:
-            return addr
+        if normalized_internal and normalized_internal not in addresses_by_name:
+            addresses_by_name[normalized_internal] = addr
         addresses.append(addr)
+    return addresses_by_name, addresses
 
-    if len(addresses) == 1:
-        return addresses[0]
-    return None
+
+def _receipt_address_map(broadcast: Dict[str, Any]) -> Dict[str, str]:
+    receipt_addresses: Dict[str, str] = {}
+    receipts = broadcast.get("receipts")
+    if isinstance(receipts, list):
+        for receipt in receipts:
+            if not isinstance(receipt, dict):
+                continue
+            tx_hash = _normalize_hex_match(
+                receipt.get("transactionHash") or receipt.get("hash"), 64
+            )
+            contract_address = _normalize_hex_match(receipt.get("contractAddress"), 40)
+            if tx_hash and contract_address:
+                receipt_addresses[tx_hash] = contract_address
+    return receipt_addresses
+
+
+def _broadcast_create_transactions(
+    transactions: List[Dict[str, Any]],
+    *,
+    receipt_addresses: Dict[str, str],
+) -> List[Dict[str, Any]]:
+    creates: List[Dict[str, Any]] = []
+    for idx, tx in enumerate(transactions):
+        if not isinstance(tx, dict):
+            continue
+        tx_hash = _normalize_hex_match(tx.get("hash"), 64)
+        contract_address = receipt_addresses.get(tx_hash or "") or _normalize_hex_match(
+            tx.get("contractAddress"), 40
+        )
+        tx_type = str(tx.get("transactionType") or tx.get("type") or "").upper()
+        if tx_type not in {"CREATE", "CREATE2"} and contract_address is None:
+            continue
+        creates.append(
+            {
+                "index": idx,
+                "tx_hash": tx_hash,
+                "deployed_address": contract_address,
+                "contract_name": _normalize_contract_name(tx.get("contractName")),
+            }
+        )
+    return creates
+
+
+def _broadcast_call_transactions(
+    transactions: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    calls: List[Dict[str, Any]] = []
+    for idx, tx in enumerate(transactions):
+        if not isinstance(tx, dict):
+            continue
+        tx_type = str(tx.get("transactionType") or tx.get("type") or "").upper()
+        contract_address = _normalize_hex_match(tx.get("contractAddress"), 40)
+        if tx_type in {"CREATE", "CREATE2"} or contract_address is not None:
+            continue
+        calls.append(
+            {
+                "index": idx,
+                "tx_hash": _normalize_hex_match(tx.get("hash"), 64),
+            }
+        )
+    return calls
 
 
 def _select_broadcast_transaction(
@@ -280,28 +534,125 @@ def _parse_broadcast_deploy_output(
     broadcast_text: str,
     *,
     contract_name: str | None,
-) -> Dict[str, Optional[str]]:
+    deployment_manifest: dict[str, Any] | None = None,
+) -> Dict[str, Any]:
     try:
         payload = json.loads(broadcast_text)
     except json.JSONDecodeError:
-        return {"tx_hash": None, "deployed_address": None}
+        return {
+            "tx_hash": None,
+            "deployed_address": None,
+            "deployed_contracts": [],
+            "executed_calls": [],
+        }
 
     transactions = payload.get("transactions")
     if not isinstance(transactions, list):
-        return {"tx_hash": None, "deployed_address": None}
+        return {
+            "tx_hash": None,
+            "deployed_address": None,
+            "deployed_contracts": [],
+            "executed_calls": [],
+        }
 
-    receipt_addresses: Dict[str, str] = {}
-    receipts = payload.get("receipts")
-    if isinstance(receipts, list):
-        for receipt in receipts:
-            if not isinstance(receipt, dict):
-                continue
-            tx_hash = _normalize_hex_match(
-                receipt.get("transactionHash") or receipt.get("hash"), 64
+    receipt_addresses = _receipt_address_map(payload)
+    returned_by_name, _ = _extract_returned_contract_addresses(payload)
+    create_transactions = _broadcast_create_transactions(
+        transactions,
+        receipt_addresses=receipt_addresses,
+    )
+    call_transactions = _broadcast_call_transactions(transactions)
+
+    deployed_contracts: list[dict[str, Any]] = []
+    executed_calls: list[dict[str, Any]] = []
+    if deployment_manifest:
+        try:
+            manifest = load_deployment_manifest(deployment_manifest)
+        except Exception:
+            manifest = None
+        if manifest is not None:
+            used_indices: set[int] = set()
+            for contract in sorted(
+                manifest.contracts,
+                key=lambda entry: (entry.deploy_order, entry.name),
+            ):
+                best_index: int | None = None
+                best_score = -1
+                for idx, tx in enumerate(create_transactions):
+                    if idx in used_indices:
+                        continue
+                    score = 0
+                    if tx.get("contract_name") == contract.name:
+                        score += 100
+                    if returned_by_name.get(contract.name) and tx.get("deployed_address") == returned_by_name.get(contract.name):
+                        score += 50
+                    if tx.get("deployed_address"):
+                        score += 10
+                    if tx.get("tx_hash"):
+                        score += 1
+                    if score > best_score:
+                        best_score = score
+                        best_index = idx
+                if best_index is None:
+                    continue
+                used_indices.add(best_index)
+                selected = create_transactions[best_index]
+                deployed_contracts.append(
+                    DeployedContractResult(
+                        contract_name=contract.name,
+                        plan_contract_id=contract.plan_contract_id,
+                        deploy_order=contract.deploy_order,
+                        tx_hash=selected.get("tx_hash"),
+                        deployed_address=selected.get("deployed_address"),
+                    ).model_dump()
+                )
+
+            for index, call in enumerate(
+                sorted(
+                    manifest.post_deploy_calls,
+                    key=lambda entry: (entry.call_order, entry.target_contract_name, entry.function_name),
+                )
+            ):
+                tx_hash = call_transactions[index].get("tx_hash") if index < len(call_transactions) else None
+                executed_calls.append(
+                    ExecutedCallResult(
+                        target_contract_name=call.target_contract_name,
+                        target_plan_contract_id=call.target_plan_contract_id,
+                        function_name=call.function_name,
+                        args=list(call.args),
+                        call_order=call.call_order,
+                        tx_hash=tx_hash,
+                        status="success" if tx_hash else "missing",
+                    ).model_dump()
+                )
+
+            primary = next(
+                (contract for contract in manifest.contracts if contract.role == "primary_deployable"),
+                manifest.contracts[0] if manifest.contracts else None,
             )
-            contract_address = _normalize_hex_match(receipt.get("contractAddress"), 40)
-            if tx_hash and contract_address:
-                receipt_addresses[tx_hash] = contract_address
+            if primary is not None:
+                matched_primary = next(
+                    (
+                        entry
+                        for entry in deployed_contracts
+                        if entry.get("plan_contract_id") == primary.plan_contract_id
+                    ),
+                    None,
+                )
+                if matched_primary is not None:
+                    return {
+                        "tx_hash": matched_primary.get("tx_hash"),
+                        "deployed_address": matched_primary.get("deployed_address"),
+                        "deployed_contracts": deployed_contracts,
+                        "executed_calls": executed_calls,
+                    }
+            if deployed_contracts:
+                return {
+                    "tx_hash": deployed_contracts[0].get("tx_hash"),
+                    "deployed_address": deployed_contracts[0].get("deployed_address"),
+                    "deployed_contracts": deployed_contracts,
+                    "executed_calls": executed_calls,
+                }
 
     returned_address = _extract_returned_contract_address(payload, contract_name)
     selected = _select_broadcast_transaction(
@@ -311,11 +662,17 @@ def _parse_broadcast_deploy_output(
         receipt_addresses=receipt_addresses,
     )
     if selected:
-        return selected
+        return {
+            **selected,
+            "deployed_contracts": deployed_contracts,
+            "executed_calls": executed_calls,
+        }
 
     return {
         "tx_hash": None,
         "deployed_address": returned_address,
+        "deployed_contracts": deployed_contracts,
+        "executed_calls": executed_calls,
     }
 
 
@@ -326,17 +683,25 @@ def _extract_deploy_metadata(
     stdout: str,
     stderr: str,
     volume: Any | None = None,
-) -> Dict[str, Optional[str]]:
+) -> Dict[str, Any]:
     broadcast_path = _broadcast_run_artifact_path(request.script_path, request.chain_id)
     broadcast_text = _read_project_artifact(root, broadcast_path, volume=volume)
     if broadcast_text:
         parsed = _parse_broadcast_deploy_output(
             broadcast_text,
             contract_name=request.contract_name,
+            deployment_manifest=request.deployment_manifest,
         )
-        if parsed.get("tx_hash") or parsed.get("deployed_address"):
+        if (
+            parsed.get("tx_hash")
+            or parsed.get("deployed_address")
+            or parsed.get("deployed_contracts")
+        ):
             return parsed
-    return _parse_deploy_output(stdout, stderr)
+    parsed = _parse_deploy_output(stdout, stderr)
+    parsed["deployed_contracts"] = []
+    parsed["executed_calls"] = []
+    return parsed
 
 
 def _normalize_private_key_hex(value: str) -> str:
@@ -363,6 +728,8 @@ def _record_deploy_result(
     modal_app: str,
     tx_hash: str | None = None,
     deployed_address: str | None = None,
+    deployed_contracts: list[dict[str, Any]] | None = None,
+    executed_calls: list[dict[str, Any]] | None = None,
     status: str | None = None,
 ) -> dict:
     stdout_path, stderr_path = save_execution_logs(
@@ -374,9 +741,7 @@ def _record_deploy_result(
     )
 
     mm = _get_memory_manager()
-    data, block = mm._read_user_block()  # type: ignore[attr-defined]
-    mm._ensure_agents_structure(data)  # type: ignore[attr-defined]
-    deployment_state = data["agents"]["deployment"]
+    deployment_state = mm.get_agent_state("deployment")
 
     history: List[Dict[str, Any]] = deployment_state.get("last_deploy_results", [])
     entry = {
@@ -394,19 +759,18 @@ def _record_deploy_result(
         "stderr_path": stderr_path,
         "summary": compact_execution_summary(exit_code, stdout, stderr),
         "modal_app": modal_app,
+        "plan_contract_id": request.plan_contract_id,
         "tx_hash": tx_hash,
         "deployed_address": deployed_address,
+        "deployed_contracts": list(deployed_contracts or []),
+        "executed_calls": list(executed_calls or []),
     }
     history.append(entry)
     deployment_state["last_deploy_results"] = history
     deployment_state["last_deploy_status"] = status or (
         "success" if exit_code == 0 else "failed"
     )
-
-    mm.client.blocks.update(  # type: ignore[attr-defined]
-        block.id,
-        value=mm._serialize(data),  # type: ignore[attr-defined]
-    )
+    mm.set_agent_state("deployment", deployment_state)
     return entry
 
 
@@ -530,6 +894,12 @@ def _parse_deploy_output(stdout: str, stderr: str) -> Dict[str, Optional[str]]:
 def generate_foundry_deploy_script_direct(
     request: FoundryDeployScriptGenerationRequest,
 ) -> Dict[str, Any]:
+    manifest_script = _build_manifest_deploy_script(request)
+    if manifest_script is not None and not manifest_script.get("error"):
+        return manifest_script
+    if manifest_script is not None and manifest_script.get("error"):
+        return manifest_script
+
     constraints_section = ""
     if request.constraints:
         joined = "\n".join(f"- {c}" for c in request.constraints)
@@ -548,6 +918,13 @@ def generate_foundry_deploy_script_direct(
             "----------------- SOURCE END -----------------\n"
         )
 
+    manifest_section = ""
+    if request.deployment_manifest:
+        manifest_section = (
+            "\n\nAuthoritative deployment manifest:\n"
+            f"{json.dumps(request.deployment_manifest, indent=2, sort_keys=True)}"
+        )
+
     args_comment = (
         ", ".join(request.constructor_args) if request.constructor_args else "none"
     )
@@ -564,7 +941,11 @@ def generate_foundry_deploy_script_direct(
         "- Load PRIVATE_KEY in a robust way: accept both `0x`-prefixed and non-prefixed hex env values.\n"
         "- Prefer `vm.envString(\"FUJI_PRIVATE_KEY\")` + normalization + `vm.parseUint(...)` over plain `vm.envUint(...)`.\n"
         "- Derive `address deployer = vm.addr(privateKey);` (or an equivalent broadcaster address) before deployment.\n"
-        "- Deploy exactly one requested contract instance.\n"
+        "- If a deployment manifest is provided, deploy every manifest contract in deploy_order using one script.\n"
+        "- Resolve constructor and post-deploy placeholders of the form <deployed:ContractName.address> to address(<local deployed instance variable>).\n"
+        "- Execute manifest post_deploy_calls only after all deployments complete.\n"
+        "- Emit brief marker comments in the form // deploy-order:<n> <ContractName> and // post-deploy:<n> <ContractName>.<function>.\n"
+        "- If no manifest is provided, deploy exactly one requested contract instance.\n"
         "- Treat the provided constructor arguments as authoritative Solidity expressions; preserve identifiers like `deployer` as script-local variables instead of converting them to literals.\n"
         "- Never infer `address(0)` for an address input. If no explicit non-zero wallet is provided, use `deployer` as the fallback.\n"
         "- For optional address env vars such as treasury/admin/owner recipients, use `deployer` as the non-zero fallback unless the plan explicitly requires another address.\n"
@@ -575,6 +956,7 @@ def generate_foundry_deploy_script_direct(
         f"Constructor arguments (Solidity expressions): {args_comment}"
         f"{constraints_section}"
         f"{plan_section}"
+        f"{manifest_section}"
         f"{source_section}"
     )
 
@@ -633,14 +1015,16 @@ def save_deploy_artifact(artifact: CodeArtifact) -> Dict[str, Any]:
     """
     try:
         mm = _get_memory_manager()
-        data, block = mm._read_user_block()  # type: ignore[attr-defined]
-        mm._ensure_agents_structure(data)  # type: ignore[attr-defined]
-        deployment_state = data["agents"]["deployment"]
+        deployment_state = mm.get_agent_state("deployment")
+        plan = mm.get_plan()
 
         storage = get_code_storage()
 
         raw = artifact.model_dump()
         code = raw.pop("code", None)
+        raw, issues = validate_artifact_for_save(plan, raw)
+        if issues:
+            return {"error": "; ".join(issues)}
 
         if code:
             with start_span(
@@ -656,11 +1040,7 @@ def save_deploy_artifact(artifact: CodeArtifact) -> Dict[str, Any]:
         artifacts: List[Dict[str, Any]] = deployment_state.get("artifacts", [])
         artifacts.append(raw)
         deployment_state["artifacts"] = artifacts
-
-        mm.client.blocks.update(  # type: ignore[attr-defined]
-            block.id,
-            value=mm._serialize(data),  # type: ignore[attr-defined]
-        )
+        mm.set_agent_state("deployment", deployment_state)
 
         mm.log_agent_action(
             agent_name="deployment",
@@ -682,18 +1062,12 @@ def save_deployment_target(target: DeploymentTarget) -> dict:
     """
     try:
         mm = _get_memory_manager()
-        data, block = mm._read_user_block()  # type: ignore[attr-defined]
-        mm._ensure_agents_structure(data)  # type: ignore[attr-defined]
-        deployment_state = data["agents"]["deployment"]
+        deployment_state = mm.get_agent_state("deployment")
 
         targets: List[dict] = deployment_state.get("targets", [])
         targets.append(target.model_dump())
         deployment_state["targets"] = targets
-
-        mm.client.blocks.update(  # type: ignore[attr-defined]
-            block.id,
-            value=mm._serialize(data),  # type: ignore[attr-defined]
-        )
+        mm.set_agent_state("deployment", deployment_state)
 
         mm.log_agent_action(
             agent_name="deployment",
@@ -760,6 +1134,7 @@ def run_foundry_deploy(
                 mm.save_deployment(
                     status="failed",
                     contract_name=request.contract_name,
+                    plan_contract_id=request.plan_contract_id,
                     network=request.network,
                     pipeline_run_id=pipeline_run_id,
                     pipeline_task_id=pipeline_task_id,
@@ -815,6 +1190,7 @@ def run_foundry_deploy(
                 mm.save_deployment(
                     status="failed",
                     contract_name=request.contract_name,
+                    plan_contract_id=request.plan_contract_id,
                     network=request.network,
                     pipeline_run_id=pipeline_run_id,
                     pipeline_task_id=pipeline_task_id,
@@ -861,6 +1237,7 @@ def run_foundry_deploy(
                 mm.save_deployment(
                     status="failed",
                     contract_name=request.contract_name,
+                    plan_contract_id=request.plan_contract_id,
                     network=request.network,
                     pipeline_run_id=pipeline_run_id,
                     pipeline_task_id=pipeline_task_id,
@@ -1006,6 +1383,8 @@ def run_foundry_deploy(
             modal_app=app_name,
             tx_hash=parsed.get("tx_hash"),
             deployed_address=parsed.get("deployed_address"),
+            deployed_contracts=parsed.get("deployed_contracts"),
+            executed_calls=parsed.get("executed_calls"),
             status="cancelled" if cancelled else ("success" if success else "failed"),
         )
         stdout_path = entry["stdout_path"]
@@ -1014,6 +1393,7 @@ def run_foundry_deploy(
             mm.save_deployment(
                 status="cancelled" if cancelled else ("success" if success else "failed"),
                 contract_name=request.contract_name,
+                plan_contract_id=request.plan_contract_id,
                 deployed_address=parsed.get("deployed_address"),
                 tx_hash=parsed.get("tx_hash"),
                 snowtrace_url=None,
@@ -1024,6 +1404,8 @@ def run_foundry_deploy(
                 stderr_path=stderr_path,
                 exit_code=exit_code,
                 trace_id=trace_id,
+                deployed_contracts=parsed.get("deployed_contracts") or [],
+                executed_calls=parsed.get("executed_calls") or [],
             )
         except Exception:
             pass
@@ -1056,6 +1438,8 @@ def run_foundry_deploy(
             "command": command_display,
             "tx_hash": parsed.get("tx_hash"),
             "deployed_address": parsed.get("deployed_address"),
+            "deployed_contracts": parsed.get("deployed_contracts") or [],
+            "executed_calls": parsed.get("executed_calls") or [],
         }
         if deploy_error:
             response["error"] = deploy_error
@@ -1094,6 +1478,7 @@ def run_foundry_deploy(
                 _get_memory_manager().save_deployment(
                     status="failed",
                     contract_name=request.contract_name,
+                    plan_contract_id=request.plan_contract_id,
                     network=request.network,
                     pipeline_run_id=pipeline_run_id,
                     pipeline_task_id=pipeline_task_id,
@@ -1137,9 +1522,7 @@ def record_deployment(record: DeploymentRecord) -> dict:
     """
     try:
         mm = _get_memory_manager()
-        data, block = mm._read_user_block()  # type: ignore[attr-defined]
-        mm._ensure_agents_structure(data)  # type: ignore[attr-defined]
-        deployment_state = data["agents"]["deployment"]
+        deployment_state = mm.get_agent_state("deployment")
 
         deployments: List[dict] = deployment_state.get("deployments", [])
         payload = record.model_dump()
@@ -1147,11 +1530,7 @@ def record_deployment(record: DeploymentRecord) -> dict:
         payload.pop("stderr", None)
         deployments.append(payload)
         deployment_state["deployments"] = deployments
-
-        mm.client.blocks.update(  # type: ignore[attr-defined]
-            block.id,
-            value=mm._serialize(data),  # type: ignore[attr-defined]
-        )
+        mm.set_agent_state("deployment", deployment_state)
 
         mm.log_agent_action(
             agent_name="deployment",
@@ -1174,9 +1553,19 @@ def get_deployment_history() -> dict:
     try:
         mm = _get_memory_manager()
         state = mm.get_agent_state("deployment")
+        plan = mm.get_plan()
+        artifacts = [
+            enrich_artifact_with_plan_contract_ids(
+                plan,
+                artifact,
+                allow_name_fallback=True,
+            )[0]
+            for artifact in state.get("artifacts", [])
+            if isinstance(artifact, dict)
+        ]
         return {
             "targets": state.get("targets", []),
-            "artifacts": state.get("artifacts", []),
+            "artifacts": artifacts,
             "last_deploy_results": state.get("last_deploy_results", []),
             "deployments": state.get("deployments", []),
         }

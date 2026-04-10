@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from agents.contract_identity import extract_plan_contracts
+
 
 def extract_plan_summary(plan: dict | None) -> dict:
     """Build a compact project summary suitable for Letta and task context."""
@@ -10,10 +12,20 @@ def extract_plan_summary(plan: dict | None) -> dict:
             "project_name": None,
             "erc_standard": None,
             "contract_names": [],
+            "plan_contracts": [],
             "key_constraints": [],
         }
 
     contracts = plan.get("contracts") or []
+    plan_contracts = [
+        {
+            "plan_contract_id": entry.get("plan_contract_id"),
+            "name": entry.get("name"),
+            "deployment_role": entry.get("deployment_role"),
+            "deploy_order": entry.get("deploy_order"),
+        }
+        for entry in extract_plan_contracts(plan)
+    ]
     contract_names = [
         contract.get("name")
         for contract in contracts
@@ -44,11 +56,19 @@ def extract_plan_summary(plan: dict | None) -> dict:
         erc_standard = None
 
     unique_constraints = list(dict.fromkeys(constraints))
+    for call in plan.get("post_deploy_calls") or []:
+        if not isinstance(call, dict):
+            continue
+        target = call.get("target_contract_name")
+        function_name = call.get("function_name")
+        if target and function_name:
+            unique_constraints.append(f"post_deploy:{target}.{function_name}")
     return {
         "project_name": plan.get("project_name"),
         "erc_standard": erc_standard,
         "contract_names": contract_names,
-        "key_constraints": unique_constraints[:12],
+        "plan_contracts": plan_contracts,
+        "key_constraints": list(dict.fromkeys(unique_constraints))[:12],
     }
 
 

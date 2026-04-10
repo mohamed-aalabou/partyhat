@@ -1,14 +1,15 @@
+import asyncio
 import json
 import uuid
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, Header
+from fastapi import Depends, FastAPI, HTTPException, Header, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -23,7 +24,15 @@ from agents.db.crud import (
     create_user as db_create_user,
     create_project as db_create_project,
     get_project as db_get_project,
+    get_user_by_id as db_get_user_by_id,
+    project_access_exists as db_project_access_exists,
     get_user_by_wallet as db_get_user_by_wallet,
+    get_pipeline_run as db_get_pipeline_run,
+    create_telegram_link_token,
+    delete_telegram_user_link,
+    delete_unused_telegram_link_tokens,
+    get_telegram_user_link,
+    list_pipeline_human_gates,
     list_projects_by_user,
     update_project as db_update_project,
 )
@@ -33,11 +42,39 @@ from agents.planning_tools import load_planning_tools, set_planning_mcp_tools
 from schemas.coding_schema import CodeGenerationRequest
 from agents.coding_tools import generate_solidity_code_direct
 from agents.code_storage import get_code_storage
+from agents.project_state import (
+    get_code_state,
+    get_deployment_state,
+    get_plan_state,
+    get_project_state_snapshot,
+    get_project_state_versions,
+)
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from agents.pipeline_orchestrator import run_autonomous_pipeline, get_pipeline_status
+from agents.pipeline_orchestrator import get_pipeline_status
 from agents.pipeline_cancel import cancel_pipeline_run
 from agents.db import async_session_factory
+from agents.pipeline_runtime import (
+    build_pipeline_control_response,
+    get_pipeline_run_poll_record,
+    get_pipeline_run_record,
+    list_serialized_pipeline_run_events,
+    spawn_detached_pipeline_runner,
+)
+from agents.telegram_service import (
+    TelegramApiError,
+    build_telegram_deep_link,
+    configure_telegram_webhook,
+    generate_telegram_connect_token,
+    get_telegram_bot_display_name,
+    get_telegram_bot_username,
+    get_telegram_connect_token_ttl_seconds,
+    get_telegram_webhook_secret,
+    handle_telegram_webhook_update,
+    hash_telegram_connect_token,
+    start_notification_dispatcher,
+    stop_notification_dispatcher,
+)
 from agents.tracing import configure_tracing
 
 load_dotenv()
@@ -65,6 +102,7 @@ app.add_middleware(
 
 
 planning_agent = build_planning_agent()
+_ARTIFACT_TREE_CACHE: dict[tuple[str, str], Any] = {}
 
 
 @app.on_event("startup")
@@ -84,6 +122,22 @@ async def db_startup() -> None:
     configure_tracing()
 
 
+@app.on_event("startup")
+async def telegram_startup() -> None:
+    try:
+        webhook_result = await configure_telegram_webhook()
+        if webhook_result.get("configured") is False:
+            print(f"[Telegram] Webhook setup skipped: {webhook_result.get('reason')}")
+    except Exception as exc:
+        print(f"[Telegram] Webhook setup failed: {exc}")
+    await start_notification_dispatcher()
+
+
+@app.on_event("shutdown")
+async def telegram_shutdown() -> None:
+    await stop_notification_dispatcher()
+
+
 async def ensure_project_context(
     project_id: str,
     user_id: str,
@@ -99,10 +153,12 @@ async def ensure_project_context(
                 detail="DATABASE_URL required for project-scoped features",
             )
         try:
-            proj = await db_get_project(
-                session, uuid.UUID(project_id), user_id=uuid.UUID(user_id)
+            has_access = await db_project_access_exists(
+                session,
+                uuid.UUID(project_id),
+                uuid.UUID(user_id),
             )
-            if not proj:
+            if not has_access:
                 raise HTTPException(
                     status_code=404,
                     detail="Project not found or does not belong to this user",
@@ -123,7 +179,44 @@ def _parse_project_uuid(project_id: str) -> uuid.UUID | None:
         return None
 
 
-def _compact_execution_history(entries: list[dict]) -> list[dict]:
+def _parse_user_uuid(user_id: str) -> uuid.UUID | None:
+    if not user_id or user_id == "default":
+        return None
+    try:
+        return uuid.UUID(user_id)
+    except ValueError:
+        return None
+
+
+async def _require_real_user(
+    session: AsyncSession | None,
+    user_id: str,
+):
+    if session is None:
+        raise HTTPException(status_code=503, detail="DATABASE_URL required")
+    user_uuid = _parse_user_uuid(user_id)
+    if user_uuid is None:
+        raise HTTPException(status_code=400, detail="X-User-Id is required")
+    user = await db_get_user_by_id(session, user_uuid)
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    return user
+
+
+def _coerce_bool_query(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    default = getattr(value, "default", None)
+    if isinstance(default, bool):
+        return default
+    return bool(value)
+
+
+def _compact_execution_history(
+    entries: list[dict],
+    *,
+    drop_output: bool = False,
+) -> list[dict]:
     compacted: list[dict] = []
     for entry in entries:
         if not isinstance(entry, dict):
@@ -131,6 +224,8 @@ def _compact_execution_history(entries: list[dict]) -> list[dict]:
         compact = dict(entry)
         compact.pop("stdout", None)
         compact.pop("stderr", None)
+        if drop_output:
+            compact.pop("output", None)
         compacted.append(compact)
     return compacted
 
@@ -233,6 +328,27 @@ class ProjectResponse(BaseModel):
     name: Optional[str]
     screenshot_base64: Optional[str]
     created_at: str
+
+
+class TelegramLinkResponse(BaseModel):
+    linked: bool
+    bot_username: str
+    bot_display_name: str
+    deep_link_url: str
+    expires_at: str
+
+
+class TelegramStatusResponse(BaseModel):
+    linked: bool
+    enabled: bool
+    bot_username: str
+    bot_display_name: str
+    chat_username: Optional[str] = None
+    linked_at: Optional[str] = None
+
+
+class TelegramUnlinkResponse(BaseModel):
+    success: bool
 
 
 class UpdateProjectRequest(BaseModel):
@@ -457,6 +573,7 @@ async def create_project_endpoint(
 @app.get("/projects", response_model=List[ProjectResponse])
 async def list_projects_endpoint(
     user_id: str,
+    include_screenshot: bool = False,
     session: AsyncSession | None = Depends(get_session),
 ):
     """List all projects for a user."""
@@ -466,13 +583,17 @@ async def list_projects_endpoint(
         user_uuid = uuid.UUID(user_id)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid user_id format")
-    projects = await list_projects_by_user(session, user_uuid)
+    projects = await list_projects_by_user(
+        session,
+        user_uuid,
+        include_screenshot=include_screenshot,
+    )
     return [
         ProjectResponse(
             id=str(p.id),
             user_id=str(p.user_id),
             name=p.name,
-            screenshot_base64=p.screenshot_base64,
+            screenshot_base64=p.screenshot_base64 if include_screenshot else None,
             created_at=p.created_at.isoformat(),
         )
         for p in projects
@@ -482,6 +603,7 @@ async def list_projects_endpoint(
 @app.get("/users/{user_id}/projects", response_model=List[ProjectResponse])
 async def list_projects_by_user_endpoint(
     user_id: str,
+    include_screenshot: bool = False,
     session: AsyncSession | None = Depends(get_session),
 ):
     """List all projects for a user (alias endpoint)."""
@@ -491,13 +613,17 @@ async def list_projects_by_user_endpoint(
         user_uuid = uuid.UUID(user_id)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid user_id format")
-    projects = await list_projects_by_user(session, user_uuid)
+    projects = await list_projects_by_user(
+        session,
+        user_uuid,
+        include_screenshot=include_screenshot,
+    )
     return [
         ProjectResponse(
             id=str(p.id),
             user_id=str(p.user_id),
             name=p.name,
-            screenshot_base64=p.screenshot_base64,
+            screenshot_base64=p.screenshot_base64 if include_screenshot else None,
             created_at=p.created_at.isoformat(),
         )
         for p in projects
@@ -564,6 +690,93 @@ async def update_project_endpoint(
         screenshot_base64=project.screenshot_base64,
         created_at=project.created_at.isoformat(),
     )
+
+
+@app.post("/integrations/telegram/link", response_model=TelegramLinkResponse)
+async def telegram_link(
+    ctx: RequestContext = Depends(get_request_context),
+    session: AsyncSession | None = Depends(get_session),
+):
+    user = await _require_real_user(session, ctx.user_id)
+
+    bot_username = get_telegram_bot_username()
+    if not bot_username:
+        raise HTTPException(
+            status_code=503,
+            detail="Telegram bot username is not configured",
+        )
+
+    existing_link = await get_telegram_user_link(session, user.id)
+    await delete_unused_telegram_link_tokens(session, user.id)
+
+    connect_token = generate_telegram_connect_token()
+    expires_at = datetime.now(timezone.utc) + timedelta(
+        seconds=get_telegram_connect_token_ttl_seconds()
+    )
+    await create_telegram_link_token(
+        session,
+        user_id=user.id,
+        token_hash=hash_telegram_connect_token(connect_token),
+        expires_at=expires_at,
+    )
+    try:
+        deep_link_url = build_telegram_deep_link(connect_token)
+    except TelegramApiError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+    return TelegramLinkResponse(
+        linked=existing_link is not None and existing_link.enabled,
+        bot_username=bot_username,
+        bot_display_name=get_telegram_bot_display_name(),
+        deep_link_url=deep_link_url,
+        expires_at=expires_at.isoformat(),
+    )
+
+
+@app.get("/integrations/telegram/status", response_model=TelegramStatusResponse)
+async def telegram_status(
+    ctx: RequestContext = Depends(get_request_context),
+    session: AsyncSession | None = Depends(get_session),
+):
+    user = await _require_real_user(session, ctx.user_id)
+    link = await get_telegram_user_link(session, user.id)
+    return TelegramStatusResponse(
+        linked=link is not None,
+        enabled=bool(link.enabled) if link is not None else False,
+        bot_username=get_telegram_bot_username(),
+        bot_display_name=get_telegram_bot_display_name(),
+        chat_username=(link.chat_username if link is not None else None),
+        linked_at=(link.linked_at.isoformat() if link is not None else None),
+    )
+
+
+@app.delete("/integrations/telegram/link", response_model=TelegramUnlinkResponse)
+async def telegram_unlink(
+    ctx: RequestContext = Depends(get_request_context),
+    session: AsyncSession | None = Depends(get_session),
+):
+    user = await _require_real_user(session, ctx.user_id)
+    await delete_unused_telegram_link_tokens(session, user.id)
+    deleted = await delete_telegram_user_link(session, user.id)
+    return TelegramUnlinkResponse(success=deleted or True)
+
+
+@app.post("/integrations/telegram/webhook")
+async def telegram_webhook(
+    update: Dict[str, Any],
+    x_telegram_bot_api_secret_token: Optional[str] = Header(
+        default=None,
+        alias="X-Telegram-Bot-Api-Secret-Token",
+    ),
+    session: AsyncSession | None = Depends(get_session),
+):
+    expected_secret = get_telegram_webhook_secret()
+    if not expected_secret or x_telegram_bot_api_secret_token != expected_secret:
+        raise HTTPException(status_code=403, detail="Invalid Telegram webhook secret")
+    if session is None:
+        raise HTTPException(status_code=503, detail="DATABASE_URL required")
+    result = await handle_telegram_webhook_update(update)
+    return {"ok": True, **result}
 
 
 @app.post("/plan/start", response_model=StartSessionResponse)
@@ -665,13 +878,11 @@ async def get_current_plan(
                 effective_project_id if effective_project_id != "default" else None
             ),
         )
-        plan = mm.get_plan()
-        if plan:
-            return PlanResponse(
-                plan=plan,
-                status=plan.get("status", PlanStatus.DRAFT.value),
-            )
-        return PlanResponse(plan=None, status=None)
+        plan_state = get_plan_state(mm)
+        return PlanResponse(
+            plan=plan_state["plan"],
+            status=plan_state["status"],
+        )
     except Exception as e:
         raise HTTPException(
             status_code=500, detail=f"Could not retrieve plan: {str(e)}"
@@ -699,9 +910,8 @@ async def get_current_code_artifacts(
                 effective_project_id if effective_project_id != "default" else None
             ),
         )
-        state = mm.get_agent_state("coding")
-        artifacts = state.get("artifacts", [])
-        return CodeArtifactsResponse(artifacts=artifacts)
+        code_state = get_code_state(mm)
+        return CodeArtifactsResponse(artifacts=code_state["artifacts"])
     except Exception as e:
         raise HTTPException(
             status_code=500,
@@ -730,8 +940,10 @@ async def get_current_deployment(
                 effective_project_id if effective_project_id != "default" else None
             ),
         )
-        last_deploy_results = _compact_execution_history(mm.list_deployments(limit=20))
-        return DeploymentCurrentResponse(last_deploy_results=last_deploy_results)
+        deployment_state = get_deployment_state(mm)
+        return DeploymentCurrentResponse(
+            last_deploy_results=deployment_state["last_deploy_results"]
+        )
     except Exception as e:
         raise HTTPException(
             status_code=500,
@@ -743,6 +955,7 @@ async def get_current_deployment(
 async def get_current_test_results(
     project_id: str = "default",
     user_id: str = "default",
+    include_output: bool = False,
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_session),
 ):
@@ -760,7 +973,10 @@ async def get_current_test_results(
                 effective_project_id if effective_project_id != "default" else None
             ),
         )
-        last_test_results = _compact_execution_history(mm.list_test_runs(limit=20))
+        last_test_results = _compact_execution_history(
+            mm.list_test_runs(limit=20, include_output=include_output),
+            drop_output=not include_output,
+        )
         return TestingCurrentResponse(last_test_results=last_test_results)
     except Exception as e:
         raise HTTPException(
@@ -808,8 +1024,11 @@ async def approve_plan(
         raise HTTPException(status_code=500, detail=f"Could not approve plan: {str(e)}")
 
 
-def _build_artifact_tree(project_id: str | None = None) -> ArtifactTreeNode:
-    storage = get_code_storage(project_id=project_id)
+def _artifact_tree_from_paths(
+    file_paths: list[str],
+    *,
+    project_id: str | None = None,
+) -> ArtifactTreeNode:
     base_root = (
         os.getenv("FOUNDRY_ARTIFACT_ROOT", "generated_contracts").strip("/")
         or "generated_contracts"
@@ -817,58 +1036,50 @@ def _build_artifact_tree(project_id: str | None = None) -> ArtifactTreeNode:
     if project_id:
         base_root = f"{base_root}/{project_id}"
 
-    try:
-        file_paths = storage.list_paths()
+    root = {
+        "name": Path(base_root).name or "artifacts",
+        "children": {},
+        "type": "directory",
+    }
 
-        root = {
-            "name": Path(base_root).name or "artifacts",
-            "children": {},
-            "type": "directory",
-        }
+    for rel_path in sorted(file_paths):
+        parts = [p for p in Path(rel_path).parts if p]
+        cursor = root
+        cumulative: list[str] = []
+        for idx, part in enumerate(parts):
+            cumulative.append(part)
+            is_file = idx == len(parts) - 1
+            children = cursor.setdefault("children", {})
+            if part not in children:
+                children[part] = {
+                    "name": part,
+                    "path": "/".join(cumulative),
+                    "type": "file" if is_file else "directory",
+                    "children": {} if not is_file else None,
+                }
+            cursor = children[part]
 
-        for rel_path in sorted(file_paths):
-            parts = [p for p in Path(rel_path).parts if p]
-            cursor = root
-            cumulative: list[str] = []
-            for idx, part in enumerate(parts):
-                cumulative.append(part)
-                is_file = idx == len(parts) - 1
-                children = cursor.setdefault("children", {})
-                if part not in children:
-                    children[part] = {
-                        "name": part,
-                        "path": "/".join(cumulative),
-                        "type": "file" if is_file else "directory",
-                        "children": {} if not is_file else None,
-                    }
-                cursor = children[part]
-
-        def to_node(node: dict) -> ArtifactTreeNode:
-            if node["type"] == "file":
-                return ArtifactTreeNode(
-                    name=node["name"],
-                    path=node.get("path", node["name"]),
-                    type="file",
-                    children=None,
-                )
-            raw_children = list((node.get("children") or {}).values())
-            children_nodes = sorted(
-                [to_node(child) for child in raw_children],
-                key=lambda n: (n.type != "directory", n.name),
-            )
+    def to_node(node: dict) -> ArtifactTreeNode:
+        if node["type"] == "file":
             return ArtifactTreeNode(
                 name=node["name"],
-                path=node.get("path", ""),
-                type="directory",
-                children=children_nodes,
+                path=node.get("path", node["name"]),
+                type="file",
+                children=None,
             )
-
-        return to_node(root)
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Could not build artifact tree: {str(e)}",
+        raw_children = list((node.get("children") or {}).values())
+        children_nodes = sorted(
+            [to_node(child) for child in raw_children],
+            key=lambda n: (n.type != "directory", n.name),
         )
+        return ArtifactTreeNode(
+            name=node["name"],
+            path=node.get("path", ""),
+            type="directory",
+            children=children_nodes,
+        )
+
+    return to_node(root)
 
 
 @app.get("/artifacts/tree", response_model=ArtifactTreeNode)
@@ -886,7 +1097,31 @@ async def get_artifact_tree(
     effective_user_id = user_id if user_id != "default" else ctx.user_id
     await ensure_project_context(effective_project_id, effective_user_id, session)
     pid = effective_project_id if effective_project_id != "default" else None
-    return _build_artifact_tree(project_id=pid)
+    cache_key: tuple[str, str] | None = None
+    if pid is not None:
+        versions = get_project_state_versions(
+            user_id=effective_user_id,
+            project_id=pid,
+            allow_recompute=False,
+        )
+        code_version = versions.get("code", "0")
+        if code_version != "0":
+            cache_key = (pid, code_version)
+            cached = _ARTIFACT_TREE_CACHE.get(cache_key)
+            if cached is not None:
+                return cached
+    storage = get_code_storage(project_id=pid)
+    try:
+        file_paths = await storage.alist_paths()
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not build artifact tree: {str(e)}",
+        )
+    tree = _artifact_tree_from_paths(file_paths, project_id=pid)
+    if cache_key is not None:
+        _ARTIFACT_TREE_CACHE[cache_key] = tree
+    return tree
 
 
 @app.get("/artifacts/file", response_model=ArtifactFileResponse)
@@ -910,7 +1145,7 @@ async def get_artifact_file(
     pid = effective_project_id if effective_project_id != "default" else None
     storage = get_code_storage(project_id=pid)
     try:
-        content = storage.load_code(relative_path)
+        content = await storage.aload_code(relative_path)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Artifact file not found")
     except Exception as e:
@@ -1025,7 +1260,8 @@ async def routed_message_stream(
     """
     Stream agent responses and tool calls via Server-Sent Events.
     Same request body as /agent/message; events are JSON objects with type:
-    "step" (content, tool_calls) and "done" (session_id, response, tool_calls).
+    "step" (content, tool_calls) and "done" (session_id, response, tool_calls,
+    plus planning-only UI metadata such as approval_request).
     """
     if not request.message.strip():
         raise HTTPException(status_code=400, detail="Message cannot be empty")
@@ -1123,12 +1359,43 @@ class PipelineResumeRequest(BaseModel):
     pipeline_run_id: str
 
 
+class PipelineControlResponse(BaseModel):
+    pipeline_run_id: str
+    status: str
+    events_url: str
+    status_url: str
+
+
 class GateDecisionRequest(BaseModel):
     project_id: str
     reason: Optional[str] = None
 
 
-@app.post("/pipeline/run")
+def _format_sse_event(
+    event_type: str,
+    payload: dict[str, Any],
+    *,
+    event_id: int | str | None = None,
+) -> str:
+    lines: list[str] = []
+    if event_id is not None:
+        lines.append(f"id: {event_id}")
+    lines.append(f"event: {event_type}")
+    lines.append(f"data: {json.dumps(payload)}")
+    return "\n".join(lines) + "\n\n"
+
+
+def _format_pipeline_sse_event(event: dict[str, Any]) -> str:
+    seq = int(event.get("seq") or 0)
+    event_type = str(event.get("type") or "message")
+    return _format_sse_event(event_type, event, event_id=seq)
+
+
+def _current_timestamp_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+@app.post("/pipeline/run", response_model=PipelineControlResponse, status_code=202)
 async def run_pipeline(
     request: PipelineRunRequest,
     ctx: RequestContext = Depends(get_request_context),
@@ -1136,7 +1403,7 @@ async def run_pipeline(
 ):
     """
     Launch the autonomous pipeline after plan approval.
-    Streams SSE events as the pipeline progresses through agents.
+    Return run metadata immediately; consume live updates via GET /pipeline/events.
     """
     project_id = request.project_id or ctx.project_id
     user_id = request.user_id or ctx.user_id
@@ -1172,15 +1439,116 @@ async def run_pipeline(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Could not validate plan: {e}")
 
+    start_result = await spawn_detached_pipeline_runner(
+        project_id=project_id,
+        user_id=user_id,
+    )
+    pipeline_run_id = start_result.get("pipeline_run_id")
+    if not isinstance(pipeline_run_id, str):
+        raise HTTPException(status_code=500, detail="Could not start the pipeline run")
+
+    run = await get_pipeline_run_record(pipeline_run_id)
+    status = run.status if run is not None else "running"
+    return build_pipeline_control_response(project_id, pipeline_run_id, status)
+
+
+@app.post("/pipeline/resume", response_model=PipelineControlResponse, status_code=202)
+async def resume_pipeline(
+    request: PipelineResumeRequest,
+    ctx: RequestContext = Depends(get_request_context),
+    session: AsyncSession = Depends(get_session),
+):
+    effective_project_id = request.project_id or ctx.project_id
+    await ensure_project_context(effective_project_id, ctx.user_id, session)
+
+    try:
+        pipeline_run_uuid = uuid.UUID(request.pipeline_run_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid pipeline_run_id format")
+
+    run = await db_get_pipeline_run(session, pipeline_run_uuid)
+    if run is None or str(run.project_id) != effective_project_id:
+        raise HTTPException(status_code=404, detail="Pipeline run not found")
+    if run.status in {"cancelled", "completed"}:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Pipeline run is already {run.status}.",
+        )
+
+    gates = await list_pipeline_human_gates(session, pipeline_run_uuid)
+    if any(gate.status == "pending" for gate in gates):
+        raise HTTPException(
+            status_code=409,
+            detail="Pipeline run is waiting for approval. Resolve the pending gate before resuming.",
+        )
+
+    await spawn_detached_pipeline_runner(
+        project_id=effective_project_id,
+        user_id=ctx.user_id,
+        pipeline_run_id=request.pipeline_run_id,
+        reset_in_progress=True,
+    )
+    run = await get_pipeline_run_record(request.pipeline_run_id)
+    status = run.status if run is not None else "running"
+    return build_pipeline_control_response(
+        effective_project_id,
+        request.pipeline_run_id,
+        status,
+    )
+
+
+@app.get("/pipeline/events")
+async def pipeline_events(
+    request: Request,
+    project_id: str,
+    pipeline_run_id: str,
+    after_seq: int = Query(default=0, ge=0),
+    ctx: RequestContext = Depends(get_request_context),
+    session: AsyncSession = Depends(get_session),
+):
+    effective_project_id = project_id if project_id != "default" else ctx.project_id
+    await ensure_project_context(effective_project_id, ctx.user_id, session)
+
+    try:
+        pipeline_run_uuid = uuid.UUID(pipeline_run_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid pipeline_run_id format")
+
+    run = await db_get_pipeline_run(session, pipeline_run_uuid)
+    if run is None or str(run.project_id) != effective_project_id:
+        raise HTTPException(status_code=404, detail="Pipeline run not found")
+
     async def event_stream():
-        try:
-            async for event in run_autonomous_pipeline(
-                project_id=project_id,
-                user_id=user_id,
-            ):
-                yield f"data: {json.dumps(event)}\n\n"
-        except Exception as e:
-            yield f"data: {json.dumps({'type': 'pipeline_error', 'error': str(e)})}\n\n"
+        cursor = after_seq
+        while True:
+            if await request.is_disconnected():
+                break
+
+            poll_state = await get_pipeline_run_poll_record(pipeline_run_id)
+            if poll_state is None:
+                break
+
+            latest_seq = max(0, int(getattr(poll_state, "next_event_seq", 1) or 1) - 1)
+            if latest_seq > cursor:
+                events = await list_serialized_pipeline_run_events(
+                    pipeline_run_id,
+                    after_seq=cursor,
+                )
+                if events:
+                    for event in events:
+                        cursor = max(cursor, int(event.get("seq") or 0))
+                        yield _format_pipeline_sse_event(event)
+                    continue
+
+            if getattr(poll_state, "status", None) in {
+                "cancelled",
+                "completed",
+                "failed",
+            }:
+                break
+
+            yield ": keepalive\n\n"
+            await asyncio.sleep(1.0)
 
     return StreamingResponse(
         event_stream(),
@@ -1193,25 +1561,123 @@ async def run_pipeline(
     )
 
 
-@app.post("/pipeline/resume")
-async def resume_pipeline(
-    request: PipelineResumeRequest,
+@app.get("/state/stream")
+async def state_stream(
+    request: Request,
+    project_id: str = "default",
+    user_id: str = "default",
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_session),
 ):
-    effective_project_id = request.project_id or ctx.project_id
-    await ensure_project_context(effective_project_id, ctx.user_id, session)
+    effective_project_id = project_id if project_id != "default" else ctx.project_id
+    effective_user_id = user_id if user_id != "default" else ctx.user_id
+    await ensure_project_context(effective_project_id, effective_user_id, session)
+
+    scoped_project_id = (
+        effective_project_id if effective_project_id != "default" else None
+    )
 
     async def event_stream():
         try:
-            async for event in run_autonomous_pipeline(
-                project_id=effective_project_id,
-                user_id=ctx.user_id,
-                pipeline_run_id=request.pipeline_run_id,
-            ):
-                yield f"data: {json.dumps(event)}\n\n"
+            snapshot = get_project_state_snapshot(
+                user_id=effective_user_id,
+                project_id=scoped_project_id,
+            )
         except Exception as e:
-            yield f"data: {json.dumps({'type': 'pipeline_error', 'error': str(e)})}\n\n"
+            yield _format_sse_event(
+                "error",
+                {
+                    "project_id": effective_project_id,
+                    "detail": f"Could not load project state: {str(e)}",
+                    "emitted_at": _current_timestamp_iso(),
+                },
+            )
+            return
+
+        yield _format_sse_event(
+            "state_snapshot",
+            {
+                "project_id": effective_project_id,
+                "plan": snapshot["plan"],
+                "code": snapshot["code"],
+                "deployment": snapshot["deployment"],
+                "emitted_at": _current_timestamp_iso(),
+            },
+        )
+
+        previous_versions = dict(snapshot["versions"])
+
+        while True:
+            if await request.is_disconnected():
+                break
+
+            await asyncio.sleep(1.0)
+
+            if await request.is_disconnected():
+                break
+
+            try:
+                next_versions = get_project_state_versions(
+                    user_id=effective_user_id,
+                    project_id=scoped_project_id,
+                    allow_recompute=False,
+                )
+            except Exception as e:
+                yield _format_sse_event(
+                    "error",
+                    {
+                        "project_id": effective_project_id,
+                        "detail": f"Could not refresh project state: {str(e)}",
+                        "emitted_at": _current_timestamp_iso(),
+                    },
+                )
+                return
+
+            changed_resources = [
+                resource
+                for resource in ("plan", "code", "deployment")
+                if next_versions[resource] != previous_versions.get(resource)
+            ]
+            if not changed_resources:
+                yield ": keepalive\n\n"
+                continue
+
+            try:
+                next_snapshot = get_project_state_snapshot(
+                    user_id=effective_user_id,
+                    project_id=scoped_project_id,
+                )
+            except Exception as e:
+                yield _format_sse_event(
+                    "error",
+                    {
+                        "project_id": effective_project_id,
+                        "detail": f"Could not refresh project state: {str(e)}",
+                        "emitted_at": _current_timestamp_iso(),
+                    },
+                )
+                return
+
+            emitted_at = _current_timestamp_iso()
+            for resource, event_name in (
+                ("plan", "plan_updated"),
+                ("code", "code_updated"),
+                ("deployment", "deployment_updated"),
+            ):
+                if resource not in changed_resources:
+                    continue
+                yield _format_sse_event(
+                    event_name,
+                    {
+                        "project_id": effective_project_id,
+                        "plan": next_snapshot["plan"],
+                        "code": next_snapshot["code"],
+                        "deployment": next_snapshot["deployment"],
+                        "emitted_at": emitted_at,
+                    },
+                )
+
+            previous_versions = next_versions
 
     return StreamingResponse(
         event_stream(),
@@ -1228,11 +1694,19 @@ async def resume_pipeline(
 async def pipeline_status(
     project_id: str,
     pipeline_run_id: str | None = None,
+    summary_only: bool = Query(default=False),
+    include_tasks: bool = Query(default=True),
+    include_gates: bool = Query(default=True),
+    include_evaluations: bool = Query(default=True),
     ctx: RequestContext = Depends(get_request_context),
     session: AsyncSession = Depends(get_session),
 ):
     """Return the task history for a pipeline run."""
     effective_project_id = project_id if project_id != "default" else ctx.project_id
+    summary_only = _coerce_bool_query(summary_only)
+    include_tasks = _coerce_bool_query(include_tasks)
+    include_gates = _coerce_bool_query(include_gates)
+    include_evaluations = _coerce_bool_query(include_evaluations)
     await ensure_project_context(effective_project_id, ctx.user_id, session)
 
     if not pipeline_run_id:
@@ -1252,8 +1726,18 @@ async def pipeline_status(
                 status_code=500, detail=f"Could not find pipeline run: {e}"
             )
 
+    if summary_only:
+        include_tasks = False
+        include_gates = False
+        include_evaluations = False
+
     result = await get_pipeline_status(
-        effective_project_id, ctx.user_id, pipeline_run_id
+        effective_project_id,
+        ctx.user_id,
+        pipeline_run_id,
+        include_tasks=include_tasks,
+        include_gates=include_gates,
+        include_evaluations=include_evaluations,
     )
     if "error" in result:
         raise HTTPException(status_code=500, detail=result["error"])

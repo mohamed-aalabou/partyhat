@@ -10,6 +10,10 @@ from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
 import modal
 
+from agents.contract_identity import (
+    enrich_artifact_with_plan_contract_ids,
+    validate_artifact_for_save,
+)
 from schemas.coding_schema import CodeArtifact, CodeGenerationRequest
 from agents.code_storage import get_code_storage
 from agents.task_tools import TASK_TOOLS
@@ -125,8 +129,18 @@ def get_current_artifacts() -> dict:
     try:
         mm = _get_memory_manager()
         state = mm.get_agent_state("coding")
+        plan = mm.get_plan()
+        artifacts = [
+            enrich_artifact_with_plan_contract_ids(
+                plan,
+                artifact,
+                allow_name_fallback=True,
+            )[0]
+            for artifact in state.get("artifacts", [])
+            if isinstance(artifact, dict)
+        ]
         return {
-            "artifacts": state.get("artifacts", []),
+            "artifacts": artifacts,
         }
     except Exception as e:
         return {"error": f"Could not retrieve artifacts: {str(e)}"}
@@ -144,15 +158,17 @@ def save_code_artifact(artifact: CodeArtifact) -> dict:
     """
     try:
         mm = _get_memory_manager()
-        data, block = mm._read_user_block()  # type: ignore[attr-defined]
-        mm._ensure_agents_structure(data)  # type: ignore[attr-defined]
-        coding_state = data["agents"]["coding"]
+        coding_state = mm.get_agent_state("coding")
+        plan = mm.get_plan()
 
         storage = get_code_storage()
 
         # Write code to storage if provided, then build a metadata-only record.
         raw = artifact.model_dump()
         code = raw.pop("code", None)
+        raw, issues = validate_artifact_for_save(plan, raw)
+        if issues:
+            return {"error": "; ".join(issues)}
 
         if code:
             with start_span(
@@ -168,11 +184,9 @@ def save_code_artifact(artifact: CodeArtifact) -> dict:
         artifacts: List[Dict[str, Any]] = coding_state.get("artifacts", [])
         artifacts.append(raw)
         coding_state["artifacts"] = artifacts
-
-        mm.client.blocks.update(  # type: ignore[attr-defined]
-            block.id,
-            value=mm._serialize(data),  # type: ignore[attr-defined]
-        )
+        coding_state["artifact_count"] = len(artifacts)
+        coding_state["last_artifact_path"] = raw.get("path", artifact.path)
+        mm.set_agent_state("coding", coding_state)
 
         mm.log_agent_action(
             agent_name="coding",
@@ -211,18 +225,12 @@ def save_coding_note(note: str) -> dict:
     """
     try:
         mm = _get_memory_manager()
-        data, block = mm._read_user_block()  # type: ignore[attr-defined]
-        mm._ensure_agents_structure(data)  # type: ignore[attr-defined]
-        coding_state = data["agents"]["coding"]
+        coding_state = mm.get_agent_state("coding")
 
         notes: List[str] = coding_state.get("notes", [])
         notes.append(note)
         coding_state["notes"] = notes
-
-        mm.client.blocks.update(  # type: ignore[attr-defined]
-            block.id,
-            value=mm._serialize(data),  # type: ignore[attr-defined]
-        )
+        mm.set_agent_state("coding", coding_state)
 
         mm.log_agent_action(
             agent_name="coding",

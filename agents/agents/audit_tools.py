@@ -26,18 +26,13 @@ def save_audit_issue(issue: AuditIssue) -> dict:
     """
     try:
         mm = _get_memory_manager()
-        data, block = mm._read_user_block()  # type: ignore[attr-defined]
-        mm._ensure_agents_structure(data)  # type: ignore[attr-defined]
-        audit_state = data["agents"]["audit"]
+        audit_state = mm.get_agent_state("audit")
 
         issues: List[dict] = audit_state.get("issues", [])
         issues.append(issue.model_dump())
         audit_state["issues"] = issues
-
-        mm.client.blocks.update(  # type: ignore[attr-defined]
-            block.id,
-            value=mm._serialize(data),  # type: ignore[attr-defined]
-        )
+        audit_state["open_issues"] = len(issues)
+        mm.set_agent_state("audit", audit_state)
 
         mm.log_agent_action(
             agent_name="audit",
@@ -59,18 +54,12 @@ def finalize_audit_report(report: AuditReport) -> dict:
     """
     try:
         mm = _get_memory_manager()
-        data, block = mm._read_user_block()  # type: ignore[attr-defined]
-        mm._ensure_agents_structure(data)  # type: ignore[attr-defined]
-        audit_state = data["agents"]["audit"]
+        audit_state = mm.get_agent_state("audit")
 
         reports: List[dict] = audit_state.get("reports", [])
         reports.append(report.model_dump())
         audit_state["reports"] = reports
-
-        mm.client.blocks.update(  # type: ignore[attr-defined]
-            block.id,
-            value=mm._serialize(data),  # type: ignore[attr-defined]
-        )
+        mm.set_agent_state("audit", audit_state)
 
         mm.log_agent_action(
             agent_name="audit",

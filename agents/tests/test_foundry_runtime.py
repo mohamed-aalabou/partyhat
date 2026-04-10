@@ -12,6 +12,7 @@ from agents.deployment_tools import (
     _parse_deploy_output,
     run_foundry_deploy,
 )
+from agents.pipeline_specs import default_deployment_target_payload
 from agents.modal_runtime import (
     build_foundry_bootstrap_cmd,
     default_foundry_remappings,
@@ -168,6 +169,118 @@ def test_parse_broadcast_deploy_output_falls_back_to_last_create_without_contrac
         == "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
     )
     assert parsed["deployed_address"] == "0x4444444444444444444444444444444444444444"
+
+
+def test_parse_broadcast_deploy_output_collects_all_manifest_contracts_and_calls():
+    manifest = {
+        "deployment_target": default_deployment_target_payload(),
+        "contracts": [
+            {
+                "plan_contract_id": "pc_vesting",
+                "name": "AvaVestVesting",
+                "role": "primary_deployable",
+                "deploy_order": 1,
+                "source_path": "contracts/AvaVestVesting.sol",
+                "constructor_args_schema": [],
+            },
+            {
+                "plan_contract_id": "pc_token",
+                "name": "AvaVestToken",
+                "role": "supporting",
+                "deploy_order": 2,
+                "source_path": "contracts/AvaVestToken.sol",
+                "constructor_args_schema": [
+                    {
+                        "name": "vesting",
+                        "type": "address",
+                        "source": "plan_default",
+                        "default_value": "<deployed:AvaVestVesting.address>",
+                    }
+                ],
+            },
+        ],
+        "post_deploy_calls": [
+            {
+                "target_contract_name": "AvaVestVesting",
+                "target_plan_contract_id": "pc_vesting",
+                "function_name": "setToken",
+                "args": ["<deployed:AvaVestToken.address>"],
+                "call_order": 1,
+                "description": "Wire token",
+            }
+        ],
+    }
+    broadcast = """
+    {
+      "transactions": [
+        {
+          "hash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "transactionType": "CREATE",
+          "contractName": "AvaVestVesting",
+          "contractAddress": "0x1111111111111111111111111111111111111111"
+        },
+        {
+          "hash": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "transactionType": "CREATE",
+          "contractName": "AvaVestToken",
+          "contractAddress": "0x2222222222222222222222222222222222222222"
+        },
+        {
+          "hash": "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "transactionType": "CALL"
+        }
+      ],
+      "receipts": [
+        {
+          "transactionHash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "contractAddress": "0x1111111111111111111111111111111111111111"
+        },
+        {
+          "transactionHash": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "contractAddress": "0x2222222222222222222222222222222222222222"
+        }
+      ]
+    }
+    """
+
+    parsed = _parse_broadcast_deploy_output(
+        broadcast,
+        contract_name=None,
+        deployment_manifest=manifest,
+    )
+
+    assert (
+        parsed["tx_hash"]
+        == "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    )
+    assert parsed["deployed_address"] == "0x1111111111111111111111111111111111111111"
+    assert parsed["deployed_contracts"] == [
+        {
+            "contract_name": "AvaVestVesting",
+            "plan_contract_id": "pc_vesting",
+            "deploy_order": 1,
+            "tx_hash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "deployed_address": "0x1111111111111111111111111111111111111111",
+        },
+        {
+            "contract_name": "AvaVestToken",
+            "plan_contract_id": "pc_token",
+            "deploy_order": 2,
+            "tx_hash": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "deployed_address": "0x2222222222222222222222222222222222222222",
+        },
+    ]
+    assert parsed["executed_calls"] == [
+        {
+            "target_contract_name": "AvaVestVesting",
+            "target_plan_contract_id": "pc_vesting",
+            "function_name": "setToken",
+            "args": ["<deployed:AvaVestToken.address>"],
+            "call_order": 1,
+            "tx_hash": "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "status": "success",
+        }
+    ]
 
 
 def test_parse_deploy_output_ignores_revert_data_and_unlabelled_addresses():
