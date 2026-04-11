@@ -1,9 +1,12 @@
 import asyncio
 import os
+import threading
 import time
 from io import BytesIO
 from pathlib import Path
 from typing import Protocol
+
+from deepagents.backends.utils import perform_string_replacement
 
 from schemas.coding_schema import CodeArtifact
 from agents.modal_runtime import get_modal_volume
@@ -35,6 +38,17 @@ class CodeStorage(Protocol):
     def load_code(self, path: str) -> str: ...
 
     def list_paths(self) -> list[str]: ...
+
+    def edit_code(
+        self,
+        path: str,
+        old_string: str,
+        new_string: str,
+        *,
+        replace_all: bool = False,
+    ) -> int: ...
+
+    def delete_code(self, path: str) -> None: ...
 
     async def asave_code(self, artifact: CodeArtifact, code: str) -> str: ...
 
@@ -93,6 +107,31 @@ class LocalCodeStorage:
             if p.is_file()
         ]
 
+    def edit_code(
+        self,
+        path: str,
+        old_string: str,
+        new_string: str,
+        *,
+        replace_all: bool = False,
+    ) -> int:
+        full_path = self._resolve_path(path)
+        current = full_path.read_text(encoding="utf-8")
+        result = perform_string_replacement(current, old_string, new_string, replace_all)
+        if isinstance(result, str):
+            raise ValueError(result)
+        new_content, occurrences = result
+        full_path.write_text(new_content, encoding="utf-8")
+        return int(occurrences)
+
+    def delete_code(self, path: str) -> None:
+        full_path = self._resolve_path(path)
+        if not full_path.exists():
+            raise FileNotFoundError(path)
+        if full_path.is_dir():
+            raise IsADirectoryError(path)
+        full_path.unlink()
+
     async def asave_code(self, artifact: CodeArtifact, code: str) -> str:
         return await asyncio.to_thread(self.save_code, artifact, code)
 
@@ -101,6 +140,25 @@ class LocalCodeStorage:
 
     async def alist_paths(self) -> list[str]:
         return await asyncio.to_thread(self.list_paths)
+
+    async def aedit_code(
+        self,
+        path: str,
+        old_string: str,
+        new_string: str,
+        *,
+        replace_all: bool = False,
+    ) -> int:
+        return await asyncio.to_thread(
+            self.edit_code,
+            path,
+            old_string,
+            new_string,
+            replace_all=replace_all,
+        )
+
+    async def adelete_code(self, path: str) -> None:
+        await asyncio.to_thread(self.delete_code, path)
 
 
 class ModalVolumeCodeStorage:
@@ -165,6 +223,34 @@ class ModalVolumeCodeStorage:
         out.sort()
         return out
 
+    @staticmethod
+    def _run_sync_call(func, /, *args, **kwargs):
+        """
+        Run blocking Modal SDK calls off the event loop when sync APIs are invoked
+        from async request handling.
+        """
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return func(*args, **kwargs)
+
+        result: list[object] = []
+        error: list[BaseException] = []
+
+        def _runner() -> None:
+            try:
+                result.append(func(*args, **kwargs))
+            except BaseException as exc:  # pragma: no cover - exercised via re-raise.
+                error.append(exc)
+
+        worker = threading.Thread(target=_runner)
+        worker.start()
+        worker.join()
+
+        if error:
+            raise error[0]
+        return result[0] if result else None
+
     def _safe_reload(self) -> None:
         """
         Refresh the volume view when running inside a Modal function.
@@ -210,6 +296,14 @@ class ModalVolumeCodeStorage:
     def save_code(self, artifact: CodeArtifact, code: str) -> str:
         rel_path = Path(artifact.path.lstrip("/"))
         full_path = self._resolve_path(str(rel_path))
+        return self._run_sync_call(
+            self._save_code_sync,
+            rel_path,
+            full_path,
+            code,
+        )
+
+    def _save_code_sync(self, rel_path: Path, full_path: Path, code: str) -> str:
         with self._volume.batch_upload(force=True) as batch:
             batch.put_file(
                 BytesIO(code.encode("utf-8")),
@@ -230,6 +324,9 @@ class ModalVolumeCodeStorage:
     def load_code(self, path: str) -> str:
         rel_path = Path(path.lstrip("/"))
         full_path = self._resolve_path(str(rel_path))
+        return self._run_sync_call(self._load_code_sync, full_path)
+
+    def _load_code_sync(self, full_path: Path) -> str:
         self._safe_reload()
         chunks = list(self._volume.read_file(self._as_volume_path(full_path)))
         return b"".join(chunks).decode("utf-8")
@@ -244,6 +341,9 @@ class ModalVolumeCodeStorage:
         return b"".join(chunks).decode("utf-8")
 
     def list_paths(self) -> list[str]:
+        return self._run_sync_call(self._list_paths_sync)
+
+    def _list_paths_sync(self) -> list[str]:
         self._safe_reload()
         try:
             entries = self._volume.listdir(self._as_volume_path(self.base_dir), recursive=True)
@@ -265,6 +365,81 @@ class ModalVolumeCodeStorage:
                 raise
             return []
         return self._relative_file_paths(entries)
+
+    def edit_code(
+        self,
+        path: str,
+        old_string: str,
+        new_string: str,
+        *,
+        replace_all: bool = False,
+    ) -> int:
+        rel_path = Path(path.lstrip("/"))
+        full_path = self._resolve_path(str(rel_path))
+        return self._run_sync_call(
+            self._edit_code_sync,
+            full_path,
+            old_string,
+            new_string,
+            replace_all,
+        )
+
+    def _edit_code_sync(
+        self,
+        full_path: Path,
+        old_string: str,
+        new_string: str,
+        replace_all: bool,
+    ) -> int:
+        current = self._load_code_sync(full_path)
+        result = perform_string_replacement(current, old_string, new_string, replace_all)
+        if isinstance(result, str):
+            raise ValueError(result)
+        new_content, occurrences = result
+        with self._volume.batch_upload(force=True) as batch:
+            batch.put_file(
+                BytesIO(new_content.encode("utf-8")),
+                self._as_volume_path(full_path),
+            )
+        return int(occurrences)
+
+    def delete_code(self, path: str) -> None:
+        rel_path = Path(path.lstrip("/"))
+        full_path = self._resolve_path(str(rel_path))
+        self._run_sync_call(self._delete_code_sync, full_path)
+
+    def _delete_code_sync(self, full_path: Path) -> None:
+        self._safe_reload()
+        self._volume.remove_file(self._as_volume_path(full_path))
+
+    async def aedit_code(
+        self,
+        path: str,
+        old_string: str,
+        new_string: str,
+        *,
+        replace_all: bool = False,
+    ) -> int:
+        rel_path = Path(path.lstrip("/"))
+        full_path = self._resolve_path(str(rel_path))
+        await self._asafe_reload()
+        current = await self.aload_code(path)
+        result = perform_string_replacement(current, old_string, new_string, replace_all)
+        if isinstance(result, str):
+            raise ValueError(result)
+        new_content, occurrences = result
+        async with self._volume.batch_upload.aio(force=True) as batch:
+            batch.put_file(
+                BytesIO(new_content.encode("utf-8")),
+                self._as_volume_path(full_path),
+            )
+        return int(occurrences)
+
+    async def adelete_code(self, path: str) -> None:
+        rel_path = Path(path.lstrip("/"))
+        full_path = self._resolve_path(str(rel_path))
+        await self._asafe_reload()
+        await self._volume.remove_file.aio(self._as_volume_path(full_path))
 
 
 _STORAGE_CACHE: dict[tuple[bool, str | None], CodeStorage] = {}

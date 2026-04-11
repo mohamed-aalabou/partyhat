@@ -14,6 +14,7 @@ from agents.contract_identity import (
     enrich_artifact_with_plan_contract_ids,
     validate_artifact_for_save,
 )
+from agents.artifact_mutation_tools import edit_code_artifact, delete_code_artifact
 from schemas.coding_schema import CodeArtifact, CodeGenerationRequest
 from agents.code_storage import get_code_storage
 from agents.task_tools import TASK_TOOLS
@@ -318,6 +319,8 @@ CODING_TOOLS = [
     get_current_artifacts,
     generate_solidity_code,
     save_code_artifact,
+    edit_code_artifact,
+    delete_code_artifact,
     save_coding_note,
     load_code_artifact,
     ensure_chainlink_contracts,

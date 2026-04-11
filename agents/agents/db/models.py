@@ -416,6 +416,8 @@ class Deployment(Base):
     stderr_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     exit_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
     trace_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    deployed_contracts: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    executed_calls: Mapped[list | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),

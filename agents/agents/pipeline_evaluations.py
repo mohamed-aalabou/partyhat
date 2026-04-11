@@ -12,6 +12,7 @@ from agents.deployment_manifest import (
     load_deployment_manifest,
     validate_deploy_script_against_manifest,
 )
+from agents.deployment_tools import preflight_compile_deploy_script
 from agents.memory_manager import MemoryManager
 from schemas.coding_schema import CodeArtifact
 
@@ -27,6 +28,14 @@ def _upsert_agent_artifact(mm: MemoryManager, agent_name: str, artifact: dict[st
 
 def _memory_manager(project_id: str, user_id: str) -> MemoryManager:
     return MemoryManager(user_id=user_id, project_id=project_id)
+
+
+def _first_preflight_error_line(preflight: dict[str, Any]) -> str:
+    for key in ("stderr", "stdout"):
+        text = str(preflight.get(key) or "").strip()
+        if text:
+            return text.splitlines()[0].strip()
+    return str(preflight.get("error") or preflight.get("summary") or "Unknown error")
 
 
 def _artifact_link_issues(
@@ -202,6 +211,19 @@ def evaluate_deployment_prepare(
         }
 
     issues = validate_deploy_script_against_manifest(manifest, script_code)
+    preflight: dict[str, Any] | None = None
+    if not issues:
+        target = manifest.deployment_target
+        preflight = preflight_compile_deploy_script(
+            script_path=script_path,
+            project_id=project_id,
+            private_key_env_var=target.private_key_env_var or "FUJI_PRIVATE_KEY",
+            rpc_url_env_var=target.rpc_url_env_var or "FUJI_RPC_URL",
+        )
+        if not preflight.get("success"):
+            issues.append(
+                f"Compile preflight failed: {_first_preflight_error_line(preflight)}"
+            )
     return {
         "status": "failed" if issues else "passed",
         "blocking": True,
@@ -209,9 +231,17 @@ def evaluate_deployment_prepare(
         "summary": (
             "Deployment script matches the deployment manifest."
             if not issues
-            else "Deployment script does not match the deployment manifest."
+            else (
+                f"Deployment script failed compile preflight: {_first_preflight_error_line(preflight)}"
+                if preflight and not preflight.get("success")
+                else "Deployment script does not match the deployment manifest."
+            )
         ),
-        "details": {"issues": issues, "script_path": script_path},
+        "details": {
+            "issues": issues,
+            "script_path": script_path,
+            "compile_preflight": preflight,
+        },
         "artifact_revision": int(
             _memory_manager(project_id, user_id)
             .get_agent_state("coding")

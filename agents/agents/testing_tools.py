@@ -24,6 +24,11 @@ from agents.coding_tools import (
     load_code_artifact as coding_load_code_artifact,
     ensure_chainlink_contracts as coding_ensure_chainlink_contracts,
 )
+from agents.artifact_mutation_tools import (
+    get_current_test_artifacts,
+    edit_test_artifact,
+    delete_test_artifact,
+)
 from agents.modal_runtime import (
     build_foundry_bootstrap_cmd,
     build_project_volume_name,
@@ -611,10 +616,13 @@ def save_testing_note(note: str) -> Dict[str, Any]:
 TESTING_TOOLS = [
     planning_get_current_plan,
     coding_get_current_artifacts,
+    get_current_test_artifacts,
     coding_load_code_artifact,
     coding_ensure_chainlink_contracts,
     generate_foundry_tests,
     save_test_artifact,
+    edit_test_artifact,
+    delete_test_artifact,
     run_foundry_tests,
     save_testing_note,
 ] + TASK_TOOLS

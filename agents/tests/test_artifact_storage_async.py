@@ -1,4 +1,5 @@
 import asyncio
+import threading
 from types import SimpleNamespace
 
 import api
@@ -18,6 +19,20 @@ class FakeAsyncBatchUpload:
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    def put_file(self, file_obj, remote_path: str) -> None:
+        self._uploads.append((remote_path, file_obj.read()))
+
+
+class FakeSyncBatchUpload:
+    def __init__(self, uploads: list[tuple[str, bytes]]):
+        self._uploads = uploads
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
         return False
 
     def put_file(self, file_obj, remote_path: str) -> None:
@@ -79,6 +94,17 @@ class BlockingBatchUploadFactory:
         return FakeAsyncBatchUpload(self._uploads)
 
 
+class BlockingRemoveFile:
+    def __init__(self):
+        self.calls: list[str] = []
+
+    def __call__(self, path: str):
+        raise AssertionError("blocking remove_file() should not be used")
+
+    async def aio(self, path: str):
+        self.calls.append(path)
+
+
 class FakeModalVolume:
     def __init__(self):
         entries = [
@@ -100,6 +126,85 @@ class FakeModalVolume:
         self.read_file = BlockingReadFile([b"contract Foo {}", b"\n"])
         self.uploads: list[tuple[str, bytes]] = []
         self.batch_upload = BlockingBatchUploadFactory(self.uploads)
+        self.remove_file = BlockingRemoveFile()
+
+
+class ThreadRecordingReload:
+    def __init__(self):
+        self.thread_ids: list[int] = []
+
+    def __call__(self):
+        self.thread_ids.append(threading.get_ident())
+
+
+class ThreadRecordingListdir:
+    def __init__(self, entries: list[SimpleNamespace]):
+        self._entries = entries
+        self.thread_ids: list[int] = []
+        self.calls: list[tuple[str, bool]] = []
+
+    def __call__(self, path: str, recursive: bool = False):
+        self.thread_ids.append(threading.get_ident())
+        self.calls.append((path, recursive))
+        return self._entries
+
+
+class ThreadRecordingReadFile:
+    def __init__(self, chunks: list[bytes]):
+        self._chunks = chunks
+        self.thread_ids: list[int] = []
+        self.calls: list[str] = []
+
+    def __call__(self, path: str):
+        self.thread_ids.append(threading.get_ident())
+        self.calls.append(path)
+        return iter(self._chunks)
+
+
+class ThreadRecordingBatchUploadFactory:
+    def __init__(self, uploads: list[tuple[str, bytes]]):
+        self._uploads = uploads
+        self.thread_ids: list[int] = []
+        self.calls: list[bool] = []
+
+    def __call__(self, force: bool = False):
+        self.thread_ids.append(threading.get_ident())
+        self.calls.append(force)
+        return FakeSyncBatchUpload(self._uploads)
+
+
+class ThreadRecordingRemoveFile:
+    def __init__(self):
+        self.thread_ids: list[int] = []
+        self.calls: list[str] = []
+
+    def __call__(self, path: str):
+        self.thread_ids.append(threading.get_ident())
+        self.calls.append(path)
+
+
+class ThreadRecordingModalVolume:
+    def __init__(self):
+        entries = [
+            SimpleNamespace(
+                path="generated_contracts/contracts/Foo.sol",
+                type=1,
+                size=42,
+                mtime=0,
+            ),
+            SimpleNamespace(
+                path="generated_contracts/contracts",
+                type=2,
+                size=0,
+                mtime=0,
+            ),
+        ]
+        self.reload = ThreadRecordingReload()
+        self.listdir = ThreadRecordingListdir(entries)
+        self.read_file = ThreadRecordingReadFile([b"contract Foo {}", b"\n"])
+        self.uploads: list[tuple[str, bytes]] = []
+        self.batch_upload = ThreadRecordingBatchUploadFactory(self.uploads)
+        self.remove_file = ThreadRecordingRemoveFile()
 
 
 class AsyncOnlyStorage:
@@ -156,6 +261,49 @@ def test_modal_volume_code_storage_async_methods_use_modal_aio(monkeypatch):
     assert fake_volume.reload.async_calls == 2
 
 
+def test_modal_volume_sync_methods_offload_when_called_from_async_context(monkeypatch):
+    fake_volume = ThreadRecordingModalVolume()
+    monkeypatch.setattr(code_storage, "get_modal_volume", lambda volume_name: fake_volume)
+
+    storage = code_storage.ModalVolumeCodeStorage(
+        volume_name="partyhat-foundry-artifacts",
+        base_dir="generated_contracts",
+    )
+    artifact = CodeArtifact(path="contracts/Foo.sol", language="solidity")
+
+    async def _run():
+        caller_thread = threading.get_ident()
+        saved_path = storage.save_code(artifact, "contract Foo {}")
+        storage._last_reload_at = 0.0
+        content = storage.load_code("contracts/Foo.sol")
+        storage._last_reload_at = 0.0
+        paths = storage.list_paths()
+        return caller_thread, saved_path, content, paths
+
+    caller_thread, saved_path, content, paths = asyncio.run(_run())
+
+    assert saved_path == "contracts/Foo.sol"
+    assert content == "contract Foo {}\n"
+    assert paths == ["contracts/Foo.sol"]
+    assert fake_volume.uploads == [
+        ("generated_contracts/contracts/Foo.sol", b"contract Foo {}")
+    ]
+    assert fake_volume.batch_upload.calls == [True]
+    assert fake_volume.read_file.calls == ["generated_contracts/contracts/Foo.sol"]
+    assert fake_volume.listdir.calls == [("generated_contracts", True)]
+    assert fake_volume.reload.thread_ids == [
+        fake_volume.read_file.thread_ids[0],
+        fake_volume.listdir.thread_ids[0],
+    ]
+    assert len(fake_volume.batch_upload.thread_ids) == 1
+    assert len(fake_volume.read_file.thread_ids) == 1
+    assert len(fake_volume.listdir.thread_ids) == 1
+    assert all(thread_id != caller_thread for thread_id in fake_volume.batch_upload.thread_ids)
+    assert all(thread_id != caller_thread for thread_id in fake_volume.read_file.thread_ids)
+    assert all(thread_id != caller_thread for thread_id in fake_volume.listdir.thread_ids)
+    assert all(thread_id != caller_thread for thread_id in fake_volume.reload.thread_ids)
+
+
 def test_local_code_storage_async_methods_round_trip(tmp_path):
     storage = code_storage.LocalCodeStorage(base_dir=tmp_path)
     artifact = CodeArtifact(path="contracts/Local.sol", language="solidity")
@@ -167,6 +315,28 @@ def test_local_code_storage_async_methods_round_trip(tmp_path):
     assert saved_path == "contracts/Local.sol"
     assert content == "contract Local {}"
     assert paths == ["contracts/Local.sol"]
+
+
+def test_modal_volume_code_storage_async_edit_and_delete_use_modal_aio(monkeypatch):
+    fake_volume = FakeModalVolume()
+    monkeypatch.setattr(code_storage, "get_modal_volume", lambda volume_name: fake_volume)
+
+    storage = code_storage.ModalVolumeCodeStorage(
+        volume_name="partyhat-foundry-artifacts",
+        base_dir="generated_contracts",
+    )
+
+    occurrences = asyncio.run(
+        storage.aedit_code("contracts/Foo.sol", "Foo", "Bar")
+    )
+    asyncio.run(storage.adelete_code("contracts/Foo.sol"))
+
+    assert occurrences == 1
+    assert fake_volume.uploads == [
+        ("generated_contracts/contracts/Foo.sol", b"contract Bar {}\n")
+    ]
+    assert fake_volume.read_file.calls == ["generated_contracts/contracts/Foo.sol"]
+    assert fake_volume.remove_file.calls == ["generated_contracts/contracts/Foo.sol"]
 
 
 def test_get_artifact_tree_uses_async_storage(monkeypatch):

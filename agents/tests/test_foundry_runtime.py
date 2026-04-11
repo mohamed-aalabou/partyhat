@@ -1,5 +1,8 @@
+import asyncio
+import uuid
 from types import SimpleNamespace
 
+from agents.db.crud import save_deployment as db_save_deployment
 from agents.context import (
     clear_project_context,
     set_pipeline_run_id,
@@ -10,6 +13,7 @@ from agents.deployment_tools import (
     _evaluate_deploy_success,
     _parse_broadcast_deploy_output,
     _parse_deploy_output,
+    generate_foundry_deploy_script_direct,
     run_foundry_deploy,
 )
 from agents.pipeline_specs import default_deployment_target_payload
@@ -17,7 +21,10 @@ from agents.modal_runtime import (
     build_foundry_bootstrap_cmd,
     default_foundry_remappings,
 )
-from schemas.deployment_schema import FoundryDeployRequest
+from schemas.deployment_schema import (
+    FoundryDeployRequest,
+    FoundryDeployScriptGenerationRequest,
+)
 
 
 def test_default_foundry_remappings_include_openzeppelin_upgradeable():
@@ -38,6 +45,77 @@ def test_bootstrap_configures_upgradeable_remapping_file():
         in command
     )
     assert "touch remappings.txt" in command
+
+
+def test_generate_foundry_deploy_script_quotes_manifest_string_defaults():
+    manifest = {
+        "deployment_target": default_deployment_target_payload(),
+        "contracts": [
+            {
+                "plan_contract_id": "pc_helper",
+                "name": "Helper",
+                "role": "supporting",
+                "deploy_order": 1,
+                "source_path": "contracts/Helper.sol",
+                "constructor_args_schema": [],
+            },
+            {
+                "plan_contract_id": "pc_partcredits",
+                "name": "PartCredits",
+                "role": "primary_deployable",
+                "deploy_order": 2,
+                "source_path": "contracts/PartCredits.sol",
+                "constructor_args_schema": [
+                    {
+                        "name": "treasury",
+                        "type": "address",
+                        "source": "deployer",
+                        "default_value": "deployer",
+                    },
+                    {
+                        "name": "name_",
+                        "type": "string",
+                        "source": "plan_default",
+                        "default_value": "PartCredits",
+                    },
+                    {
+                        "name": "symbol_",
+                        "type": "string",
+                        "source": "plan_default",
+                        "default_value": "PART",
+                    },
+                    {
+                        "name": "helper",
+                        "type": "address",
+                        "source": "plan_default",
+                        "default_value": "<deployed:Helper.address>",
+                    },
+                    {
+                        "name": "paused",
+                        "type": "bool",
+                        "source": "plan_default",
+                        "default_value": "TRUE",
+                    },
+                ],
+            },
+        ],
+        "post_deploy_calls": [],
+    }
+
+    result = generate_foundry_deploy_script_direct(
+        FoundryDeployScriptGenerationRequest(
+            goal="Deploy PartCredits.",
+            contract_name="PartCredits",
+            script_name="DeployPartCredits",
+            deployment_manifest=manifest,
+        )
+    )
+
+    assert result.get("error") is None
+    assert (
+        'PartCredits partCredits = new PartCredits(deployer, "PartCredits", "PART", address(helper), true);'
+        in result["generated_script"]
+    )
 
 
 def test_run_foundry_deploy_records_tagged_preflight_failure(monkeypatch):
@@ -66,6 +144,15 @@ def test_run_foundry_deploy_records_tagged_preflight_failure(monkeypatch):
 
         def _serialize(self, data):
             return data
+
+        def get_agent_state(self, agent_name: str):
+            return self.data.setdefault("agents", {}).setdefault(agent_name, {})
+
+        def set_agent_state(self, agent_name: str, state: dict):
+            self.data.setdefault("agents", {})[agent_name] = state
+
+        def save_deployment(self, **kwargs):
+            return None
 
     fake_mm = FakeMemoryManager()
 
@@ -101,6 +188,60 @@ def test_run_foundry_deploy_records_tagged_preflight_failure(monkeypatch):
     assert history[0]["exit_code"] == 1
     assert history[0]["stderr_path"] == "logs/run/task/stderr.log"
     assert fake_mm.data["agents"]["deployment"]["last_deploy_status"] == "failed"
+
+
+def test_save_deployment_accepts_structured_metadata():
+    class FakeSession:
+        def __init__(self):
+            self.added = None
+            self.committed = False
+            self.refreshed = None
+
+        def add(self, obj):
+            self.added = obj
+
+        async def commit(self):
+            self.committed = True
+
+        async def refresh(self, obj):
+            self.refreshed = obj
+
+    session = FakeSession()
+    deployed_contracts = [
+        {
+            "contract_name": "PartCredits",
+            "plan_contract_id": "pc_partcredits",
+            "tx_hash": "0x" + "a" * 64,
+            "deployed_address": "0x" + "1" * 40,
+        }
+    ]
+    executed_calls = [
+        {
+            "target_contract_name": "PartCredits",
+            "function_name": "setTreasury",
+            "args": ["0x" + "2" * 40],
+            "status": "success",
+        }
+    ]
+
+    deployment = asyncio.run(
+        db_save_deployment(
+            session,
+            uuid.uuid4(),
+            status="failed",
+            contract_name="PartCredits",
+            pipeline_run_id=uuid.uuid4(),
+            pipeline_task_id=uuid.uuid4(),
+            deployed_contracts=deployed_contracts,
+            executed_calls=executed_calls,
+        )
+    )
+
+    assert session.added is deployment
+    assert session.committed is True
+    assert session.refreshed is deployment
+    assert deployment.deployed_contracts == deployed_contracts
+    assert deployment.executed_calls == executed_calls
 
 
 def test_parse_broadcast_deploy_output_uses_receipt_address_for_matching_contract():
@@ -378,6 +519,12 @@ def test_run_foundry_deploy_marks_exit_zero_without_deploy_metadata_as_failed(mo
         def _serialize(self, data):
             return data
 
+        def get_agent_state(self, agent_name: str):
+            return self.data.setdefault("agents", {}).setdefault(agent_name, {})
+
+        def set_agent_state(self, agent_name: str, state: dict):
+            self.data.setdefault("agents", {})[agent_name] = state
+
         def save_deployment(self, **kwargs):
             self.saved.append(kwargs)
 
@@ -445,3 +592,244 @@ def test_run_foundry_deploy_marks_exit_zero_without_deploy_metadata_as_failed(mo
     assert "produced no deployment transaction hash or confirmed contract address" in result["error"]
     assert fake_mm.data["agents"]["deployment"]["last_deploy_status"] == "failed"
     assert fake_mm.saved[-1]["status"] == "failed"
+
+
+def test_run_foundry_deploy_surfaces_authoritative_record_persistence_failure(monkeypatch):
+    class FakeMemoryManager:
+        def __init__(self):
+            self.client = SimpleNamespace(
+                blocks=SimpleNamespace(update=lambda block_id, value: None)
+            )
+            self.data = {
+                "agents": {
+                    "deployment": {
+                        "last_deploy_results": [],
+                        "last_deploy_status": None,
+                    }
+                }
+            }
+            self.logged = []
+
+        def _read_user_block(self):
+            return self.data, SimpleNamespace(id="block-1")
+
+        def _ensure_agents_structure(self, data):
+            agents = data.setdefault("agents", {})
+            deployment = agents.setdefault("deployment", {})
+            deployment.setdefault("last_deploy_results", [])
+            deployment.setdefault("last_deploy_status", None)
+
+        def _serialize(self, data):
+            return data
+
+        def get_agent_state(self, agent_name: str):
+            return self.data.setdefault("agents", {}).setdefault(agent_name, {})
+
+        def set_agent_state(self, agent_name: str, state: dict):
+            self.data.setdefault("agents", {})[agent_name] = state
+
+        def save_deployment(self, **kwargs):
+            raise RuntimeError("db write failed")
+
+        def log_agent_action(self, **kwargs):
+            self.logged.append(kwargs)
+
+    class FakeStream:
+        def __init__(self, text: str):
+            self._text = text
+
+        def read(self):
+            return self._text
+
+    class FakeSandbox:
+        def __init__(self):
+            self.stdout = FakeStream("Broadcasting script...\n")
+            self.stderr = FakeStream("")
+            self.returncode = 0
+
+        def wait(self, raise_on_termination=False):
+            return None
+
+    class FakeVolume:
+        def reload(self):
+            return None
+
+    fake_mm = FakeMemoryManager()
+
+    monkeypatch.setenv("FUJI_RPC_URL", "https://rpc.example")
+    monkeypatch.setenv(
+        "FUJI_PRIVATE_KEY",
+        "1111111111111111111111111111111111111111111111111111111111111111",
+    )
+    monkeypatch.setattr("agents.deployment_tools._get_memory_manager", lambda: fake_mm)
+    monkeypatch.setattr(
+        "agents.deployment_tools.save_execution_logs",
+        lambda **kwargs: ("logs/run/task/stdout.log", "logs/run/task/stderr.log"),
+    )
+    monkeypatch.setattr("agents.deployment_tools.get_modal_app", lambda app_name: object())
+    monkeypatch.setattr(
+        "agents.deployment_tools.get_modal_volume", lambda volume_name: FakeVolume()
+    )
+    monkeypatch.setattr(
+        "agents.deployment_tools.modal.Sandbox.create",
+        lambda *args, **kwargs: FakeSandbox(),
+    )
+    monkeypatch.setattr(
+        "agents.deployment_tools._extract_deploy_metadata",
+        lambda **kwargs: {
+            "tx_hash": "0x" + "a" * 64,
+            "deployed_address": "0x" + "1" * 40,
+            "deployed_contracts": [
+                {
+                    "contract_name": "PartCredits",
+                    "plan_contract_id": "pc_partcredits",
+                    "tx_hash": "0x" + "a" * 64,
+                    "deployed_address": "0x" + "1" * 40,
+                }
+            ],
+            "executed_calls": [],
+        },
+    )
+
+    set_project_context("project-123", "user-123")
+    set_pipeline_run_id("run-123")
+    set_pipeline_task_id("task-456")
+    try:
+        result = run_foundry_deploy.func(
+            FoundryDeployRequest(script_path="script/DeployPartCredits.s.sol")
+        )
+    finally:
+        clear_project_context()
+
+    assert result["success"] is False
+    assert (
+        result["error"]
+        == "Deployment executed but authoritative deployment record could not be persisted: db write failed"
+    )
+    assert (
+        result["authoritative_record_error"]
+        == "Authoritative deployment record could not be persisted: db write failed"
+    )
+    assert fake_mm.logged[-1]["error"] == result["error"]
+
+
+def test_run_foundry_deploy_persists_structured_deploy_metadata(monkeypatch):
+    class FakeMemoryManager:
+        def __init__(self):
+            self.client = SimpleNamespace(
+                blocks=SimpleNamespace(update=lambda block_id, value: None)
+            )
+            self.data = {
+                "agents": {
+                    "deployment": {
+                        "last_deploy_results": [],
+                        "last_deploy_status": None,
+                    }
+                }
+            }
+            self.saved = []
+            self.logged = []
+
+        def _read_user_block(self):
+            return self.data, SimpleNamespace(id="block-1")
+
+        def _ensure_agents_structure(self, data):
+            agents = data.setdefault("agents", {})
+            deployment = agents.setdefault("deployment", {})
+            deployment.setdefault("last_deploy_results", [])
+            deployment.setdefault("last_deploy_status", None)
+
+        def _serialize(self, data):
+            return data
+
+        def get_agent_state(self, agent_name: str):
+            return self.data.setdefault("agents", {}).setdefault(agent_name, {})
+
+        def set_agent_state(self, agent_name: str, state: dict):
+            self.data.setdefault("agents", {})[agent_name] = state
+
+        def save_deployment(self, **kwargs):
+            self.saved.append(kwargs)
+
+        def log_agent_action(self, **kwargs):
+            self.logged.append(kwargs)
+
+    class FakeStream:
+        def __init__(self, text: str):
+            self._text = text
+
+        def read(self):
+            return self._text
+
+    class FakeSandbox:
+        def __init__(self):
+            self.stdout = FakeStream("Broadcasting script...\n")
+            self.stderr = FakeStream("")
+            self.returncode = 0
+
+        def wait(self, raise_on_termination=False):
+            return None
+
+    class FakeVolume:
+        def reload(self):
+            return None
+
+    fake_mm = FakeMemoryManager()
+    deployed_contracts = [
+        {
+            "contract_name": "PartCredits",
+            "plan_contract_id": "pc_partcredits",
+            "tx_hash": "0x" + "a" * 64,
+            "deployed_address": "0x" + "1" * 40,
+        }
+    ]
+    executed_calls = [
+        {
+            "target_contract_name": "PartCredits",
+            "function_name": "setTreasury",
+            "args": ["0x" + "2" * 40],
+            "status": "success",
+        }
+    ]
+
+    monkeypatch.setenv("FUJI_RPC_URL", "https://rpc.example")
+    monkeypatch.setenv(
+        "FUJI_PRIVATE_KEY",
+        "1111111111111111111111111111111111111111111111111111111111111111",
+    )
+    monkeypatch.setattr("agents.deployment_tools._get_memory_manager", lambda: fake_mm)
+    monkeypatch.setattr(
+        "agents.deployment_tools.save_execution_logs",
+        lambda **kwargs: ("logs/run/task/stdout.log", "logs/run/task/stderr.log"),
+    )
+    monkeypatch.setattr("agents.deployment_tools.get_modal_app", lambda app_name: object())
+    monkeypatch.setattr(
+        "agents.deployment_tools.get_modal_volume", lambda volume_name: FakeVolume()
+    )
+    monkeypatch.setattr(
+        "agents.deployment_tools.modal.Sandbox.create",
+        lambda *args, **kwargs: FakeSandbox(),
+    )
+    monkeypatch.setattr(
+        "agents.deployment_tools._extract_deploy_metadata",
+        lambda **kwargs: {
+            "tx_hash": "0x" + "a" * 64,
+            "deployed_address": "0x" + "1" * 40,
+            "deployed_contracts": deployed_contracts,
+            "executed_calls": executed_calls,
+        },
+    )
+
+    set_project_context("project-123", "user-123")
+    set_pipeline_run_id("run-123")
+    set_pipeline_task_id("task-789")
+    try:
+        result = run_foundry_deploy.func(
+            FoundryDeployRequest(script_path="script/DeployPartCredits.s.sol")
+        )
+    finally:
+        clear_project_context()
+
+    assert result["success"] is True
+    assert fake_mm.saved[-1]["deployed_contracts"] == deployed_contracts
+    assert fake_mm.saved[-1]["executed_calls"] == executed_calls

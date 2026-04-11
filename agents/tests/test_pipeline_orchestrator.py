@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 from agents.deployment_manifest import load_deployment_manifest
 from agents import pipeline_orchestrator as orchestrator
+from agents import pipeline_evaluations
 from agents.pipeline_specs import (
     default_deployment_target_payload,
     retry_budget_key_for_task,
@@ -1435,6 +1436,181 @@ def test_handle_prepare_script_passes_full_manifest_and_all_contract_ids(monkeyp
     assert next_task["context"]["plan_contract_ids"] == ["pc_vesting", "pc_token"]
 
 
+def test_handle_prepare_script_compile_preflight_failure_does_not_enqueue_execute(monkeypatch):
+    manifest = _multi_contract_manifest()
+    captured: dict[str, object] = {}
+    stored_scripts: dict[str, str] = {}
+
+    class MinimalMemoryManager:
+        def __init__(self, user_id: str, project_id: str):
+            self.user_id = user_id
+            self.project_id = project_id
+
+        def get_agent_state(self, agent_name: str) -> dict:
+            if agent_name == "coding":
+                return {
+                    "artifacts": [
+                        {
+                            "path": "contracts/AvaVestVesting.sol",
+                            "contract_names": ["AvaVestVesting"],
+                            "plan_contract_ids": ["pc_vesting"],
+                        },
+                        {
+                            "path": "contracts/AvaVestToken.sol",
+                            "contract_names": ["AvaVestToken"],
+                            "plan_contract_ids": ["pc_token"],
+                        },
+                    ]
+                }
+            if agent_name == "planning":
+                return {
+                    "plan_summary": {
+                        "project_name": "AvaVest",
+                        "plan_contracts": [
+                            {
+                                "plan_contract_id": "pc_vesting",
+                                "name": "AvaVestVesting",
+                                "deployment_role": "primary_deployable",
+                                "deploy_order": 1,
+                            },
+                            {
+                                "plan_contract_id": "pc_token",
+                                "name": "AvaVestToken",
+                                "deployment_role": "supporting",
+                                "deploy_order": 2,
+                            },
+                        ],
+                    },
+                    "latest_artifact_revision": 3,
+                }
+            return {}
+
+        def get_plan(self) -> dict:
+            return {
+                "project_name": "AvaVest",
+                "contracts": [
+                    {"name": "AvaVestVesting"},
+                    {"name": "AvaVestToken"},
+                ],
+            }
+
+    class FakeStorage:
+        def load_code(self, path: str) -> str:
+            return stored_scripts[path]
+
+    task = FakeTask(
+        id=uuid.uuid4(),
+        pipeline_run_id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        assigned_to="deployment",
+        created_by="testing",
+        task_type="deployment.prepare_script",
+        description="Prepare deployment script",
+        status="in_progress",
+        context={},
+        artifact_revision=3,
+    )
+
+    monkeypatch.setattr(orchestrator, "MemoryManager", MinimalMemoryManager)
+    monkeypatch.setattr(
+        pipeline_evaluations,
+        "_memory_manager",
+        lambda project_id, user_id: MinimalMemoryManager(user_id, project_id),
+    )
+    monkeypatch.setattr(orchestrator, "load_saved_manifest", lambda project_id: (manifest, None))
+    monkeypatch.setattr(
+        pipeline_evaluations,
+        "load_saved_manifest",
+        lambda project_id: (manifest, None),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "load_code_artifact",
+        SimpleNamespace(
+            func=lambda path: {
+                "code": f"contract {path.split('/')[-1].replace('.sol', '')} {{}}"
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        pipeline_evaluations,
+        "get_code_storage",
+        lambda project_id: FakeStorage(),
+    )
+    monkeypatch.setattr(
+        pipeline_evaluations,
+        "preflight_compile_deploy_script",
+        lambda **kwargs: {
+            "success": False,
+            "exit_code": 1,
+            "stdout": "",
+            "stderr": "Error: Undeclared identifier.\n  --> script/DeployAvaVestVesting.s.sol:10:20:",
+            "summary": "exit_code=1: Error: Undeclared identifier.",
+            "command": "forge script script/DeployAvaVestVesting.s.sol",
+        },
+    )
+
+    def fake_save_artifact(artifact):
+        stored_scripts[artifact.path] = artifact.code or ""
+        captured["artifact"] = artifact
+        return {"success": True}
+
+    async def fake_record_pipeline_evaluation(**kwargs):
+        captured["evaluation"] = kwargs["evaluation"]
+        return uuid.uuid4()
+
+    async def fake_create_gate_for_task(**kwargs):
+        raise AssertionError("pre-deploy gate should not be created after compile preflight failure")
+
+    async def fake_next_task_payload(*args, **kwargs):
+        return {
+            "assigned_to": kwargs["assigned_to"],
+            "task_type": kwargs["task_type"],
+            "description": kwargs["description"],
+            "parent_task_id": str(task.id),
+            "sequence_index": 0,
+            "artifact_revision": kwargs["artifact_revision"],
+            "retry_budget_key": "deployment.prepare",
+            "retry_attempt": 1,
+            "status": kwargs.get("status", "pending"),
+            "gate_id": kwargs.get("gate_id"),
+            "context": kwargs["context"],
+        }
+
+    async def fake_finalize_direct_task(**kwargs):
+        captured["finalize"] = kwargs
+
+    monkeypatch.setattr(
+        orchestrator,
+        "save_deploy_artifact",
+        SimpleNamespace(func=fake_save_artifact),
+    )
+    monkeypatch.setattr(orchestrator, "_record_pipeline_evaluation", fake_record_pipeline_evaluation)
+    monkeypatch.setattr(orchestrator, "_create_gate_for_task", fake_create_gate_for_task)
+    monkeypatch.setattr(orchestrator, "_next_task_payload", fake_next_task_payload)
+    monkeypatch.setattr(orchestrator, "_finalize_direct_task", fake_finalize_direct_task)
+
+    events = asyncio.run(
+        orchestrator._handle_prepare_script(
+            task,
+            project_id=str(task.project_id),
+            user_id=str(uuid.uuid4()),
+            pipeline_run_id=str(task.pipeline_run_id),
+        )
+    )
+
+    assert events[0]["tool"] == "generate_foundry_deploy_script_direct"
+    assert captured["evaluation"]["status"] == "failed"
+    assert "failed compile preflight" in captured["evaluation"]["summary"]
+    assert (
+        captured["evaluation"]["details"]["compile_preflight"]["stderr"]
+        .startswith("Error: Undeclared identifier.")
+    )
+    assert captured["finalize"]["task_status"] == "failed"
+    assert captured["finalize"]["next_tasks"][0]["task_type"] == "deployment.prepare_script"
+    assert captured["finalize"]["next_tasks"][0]["task_type"] != "deployment.execute_deploy"
+
+
 def test_handle_execute_deploy_records_multi_contract_results(monkeypatch):
     manifest = _multi_contract_manifest()
     captured: dict[str, object] = {}
@@ -1540,3 +1716,34 @@ def test_handle_execute_deploy_records_multi_contract_results(monkeypatch):
     assert len(captured["record"].deployed_contracts) == 2
     assert captured["record"].executed_calls[0].function_name == "setToken"
     assert captured["finalize"]["task_status"] == "completed"
+
+
+def test_validate_execution_result_surfaces_persistence_failure_summary(monkeypatch):
+    task = FakeTask(
+        id=uuid.uuid4(),
+        pipeline_run_id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        assigned_to="deployment",
+        created_by="deployment",
+        task_type="deployment.execute_deploy",
+        description="Execute deployment",
+        status="failed",
+        result_summary=(
+            "Deployment executed but authoritative deployment record could not be "
+            "persisted: db write failed"
+        ),
+    )
+
+    async def fake_get_deployment_for_task(session, pipeline_run_id, pipeline_task_id):
+        return None
+
+    monkeypatch.setattr(orchestrator, "async_session_factory", lambda: DummySessionManager())
+    monkeypatch.setattr(orchestrator, "get_deployment_for_task", fake_get_deployment_for_task)
+
+    valid, error, execution = asyncio.run(
+        orchestrator._validate_execution_result(str(task.pipeline_run_id), task)
+    )
+
+    assert valid is False
+    assert error == task.result_summary
+    assert execution is None

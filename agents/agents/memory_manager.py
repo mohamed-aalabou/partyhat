@@ -815,11 +815,12 @@ class MemoryManager:
         Letta block updated with deployed_address + tx_hash only.
         """
         project_uuid = self._project_uuid()
+        dep = None
 
         if project_uuid and self._db_available:
             from agents.db.crud import save_deployment as db_save_dep
 
-            self._db_call(
+            dep = self._db_call(
                 lambda session: db_save_dep(
                     session,
                     project_uuid,
@@ -845,6 +846,10 @@ class MemoryManager:
                     executed_calls=executed_calls,
                 )
             )
+            if dep is None:
+                raise RuntimeError(
+                    "Authoritative deployment record could not be persisted."
+                )
 
         deployment = self.get_agent_state("deployment")
         deployment["last_deploy_status"] = status

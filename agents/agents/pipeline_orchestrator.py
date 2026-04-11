@@ -59,6 +59,7 @@ from agents.pipeline_evaluations import (
 from agents.deployment_tools import (
     generate_foundry_deploy_script_direct,
     record_deployment,
+    render_manifest_constructor_argument,
     run_foundry_deploy,
     save_deploy_artifact,
 )
@@ -392,14 +393,7 @@ def _constructor_literals(contract_plan: dict | None) -> list[str]:
 def _constructor_literals_from_manifest(contract_manifest) -> list[str]:
     literals: list[str] = []
     for item in getattr(contract_manifest, "constructor_args_schema", []) or []:
-        source = str(getattr(item, "source", "") or "")
-        default_value = getattr(item, "default_value", None)
-        if source == "deployer":
-            literals.append("deployer")
-        elif isinstance(default_value, str) and default_value.strip():
-            literals.append(default_value)
-        else:
-            literals.append(_default_constructor_literal(getattr(item, "type", "string")))
+        literals.append(render_manifest_constructor_argument(item))
     return literals
 
 
@@ -705,6 +699,14 @@ async def _validate_execution_result(
             return True, None, None
 
     if row is None:
+        task_summary = str(getattr(task, "result_summary", "") or "").strip()
+        if (
+            task.task_type in TERMINAL_SUCCESS_TASK_TYPES
+            and task.status == "failed"
+            and "authoritative deployment record could not be persisted"
+            in task_summary.lower()
+        ):
+            return False, task_summary, None
         return (
             False,
             f"Task '{task.task_type}' finished without an authoritative execution record.",
@@ -1008,7 +1010,6 @@ async def _handle_prepare_script(task, project_id: str, user_id: str, pipeline_r
             goal=f"Deploy {contract_name} to Avalanche Fuji.",
             contract_name=contract_name,
             script_name=script_name,
-            constructor_args=_constructor_literals_from_manifest(primary_contract),
             constraints=_deployment_constraints(None),
             plan_summary=json.dumps(_current_plan_summary(mm, task.context), indent=2),
             contract_sources=_load_contract_sources(
@@ -1366,6 +1367,25 @@ async def _handle_execute_deploy(task, project_id: str, user_id: str, pipeline_r
         )
         return events
 
+    failure_summary = (
+        str(deploy_result.get("error") or "").strip()
+        or compact_execution_summary(
+            deploy_result.get("exit_code", 1),
+            deploy_result.get("stdout", ""),
+            deploy_result.get("stderr", ""),
+        )
+    )
+    if deploy_result.get("authoritative_record_error"):
+        await _finalize_direct_task(
+            project_id=project_id,
+            pipeline_run_id=pipeline_run_id,
+            task=task,
+            task_status="failed",
+            result_summary=failure_summary,
+            next_tasks=[],
+        )
+        return events
+
     events.append(
         {
             "type": "tool_call",
@@ -1405,11 +1425,7 @@ async def _handle_execute_deploy(task, project_id: str, user_id: str, pipeline_r
         "plan_contract_id": plan_contract_id,
         "plan_contract_ids": task_context.get("plan_contract_ids"),
         "failure_context": {
-            "summary": compact_execution_summary(
-                deploy_result.get("exit_code", 1),
-                deploy_result.get("stdout", ""),
-                deploy_result.get("stderr", ""),
-            ),
+            "summary": failure_summary,
             "stdout_path": deploy_result.get("stdout_path"),
             "stderr_path": deploy_result.get("stderr_path"),
             "exit_code": deploy_result.get("exit_code"),
@@ -1421,7 +1437,7 @@ async def _handle_execute_deploy(task, project_id: str, user_id: str, pipeline_r
             pipeline_run_id=pipeline_run_id,
             task=task,
             task_status="failed",
-            result_summary=reason,
+            result_summary=failure_summary,
             next_tasks=[],
         )
         gate = await _create_gate_for_task(
@@ -1473,7 +1489,7 @@ async def _handle_execute_deploy(task, project_id: str, user_id: str, pipeline_r
         pipeline_run_id=pipeline_run_id,
         task=task,
         task_status="failed",
-        result_summary=reason,
+        result_summary=failure_summary,
         next_tasks=[next_task],
     )
     return events

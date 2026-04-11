@@ -40,8 +40,11 @@ need to list what has been generated, use get_current_artifacts(). Do NOT
 call ls, glob, or read_file on paths like /lib, /node_modules,
 /contracts, /test, or any other directory.
 
-The only acceptable use of write_file or edit_file is when explicitly
-saving artifacts through the designated save tools.
+Do NOT use generic write_file or edit_file for artifact lifecycle changes.
+When available, use the designated artifact tools instead:
+- save_*_artifact for creating a new tracked artifact
+- edit_*_artifact for in-place revisions to an existing tracked artifact
+- delete_*_artifact for removing obsolete tracked artifacts
 """
 
 TASK_WORKFLOW_PROMPT = """
@@ -224,6 +227,8 @@ The following tools from agents.coding_tools are available:
 - get_current_artifacts     → inspect previously saved code artifacts (metadata only)
 - generate_solidity_code    → draft Solidity code from a high-level goal
 - save_code_artifact        → persist generated Solidity files and metadata
+- edit_code_artifact        → edit an existing saved coding artifact in place
+- delete_code_artifact      → delete an obsolete saved coding artifact and its metadata
 - load_code_artifact        → load previously saved Solidity code by path
 - save_coding_note          → record important coding decisions and trade-offs
 - ensure_chainlink_contracts → install/repair Chainlink dependency in sandbox project
@@ -381,6 +386,23 @@ The next step in the pipeline will be handled by the Testing Agent.
 
 --------------------------------------------------------------------
 
+WHEN TO USE ARTIFACT MUTATION TOOLS
+
+Use save_code_artifact() when creating a brand-new coding artifact path.
+
+Use edit_code_artifact() when a contract or manifest already exists at the
+correct path and you only need to revise its contents. This keeps the same
+artifact path and avoids duplicate files for the same planned contract.
+
+Use delete_code_artifact() before saving a replacement under a different path
+or filename. This is especially important when renaming or regenerating a
+contract so old copies do not remain in Modal storage beside the new one.
+
+If get_current_artifacts() shows an obsolete contract file for the same
+plan_contract_id, delete the obsolete file first, then save the replacement.
+
+--------------------------------------------------------------------
+
 IMPORTANT RULES
 
 Do NOT:
@@ -426,10 +448,13 @@ Available tools:
 
 - get_current_plan        → load validated architecture
 - get_current_artifacts   → list generated contracts
+- get_current_test_artifacts → list previously saved test artifacts
 - load_code_artifact      → load Solidity files
 - ensure_chainlink_contracts → install/repair Chainlink dependency in sandbox project
 - generate_foundry_tests  → create Foundry tests
 - save_test_artifact      → save test files
+- edit_test_artifact      → edit an existing saved test artifact in place
+- delete_test_artifact    → delete an obsolete saved test artifact and its metadata
 - run_foundry_tests       → run tests in sandbox
 - save_testing_note       → record detected issues
 
@@ -548,6 +573,15 @@ or "Missing required implementations" (e.g. MockAggregatorV3 / AggregatorV3Inter
 Otherwise → record the issue with save_testing_note()
 
 Do NOT modify production contracts in contracts/. The Coding Agent fixes those.
+
+When you are fixing an existing test file at the same path, use
+edit_test_artifact() instead of saving a new duplicate file.
+
+When you are replacing or renaming a saved test file, call
+delete_test_artifact() on the obsolete path first, then save the new file.
+
+Use these mutation tools only for test artifacts. Do NOT use them on
+production contracts in contracts/.
 
 --------------------------------------------------------------------
 

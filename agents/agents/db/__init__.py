@@ -476,6 +476,22 @@ async def _migrate_test_runs_runtime_fields(conn) -> None:
                 ) THEN
                   ALTER TABLE test_runs ADD COLUMN trace_id TEXT;
                 END IF;
+                IF NOT EXISTS (
+                  SELECT 1 FROM information_schema.columns
+                  WHERE table_schema = 'public'
+                    AND table_name = 'test_runs'
+                    AND column_name = 'deployed_contracts'
+                ) THEN
+                  ALTER TABLE test_runs ADD COLUMN deployed_contracts JSONB;
+                END IF;
+                IF NOT EXISTS (
+                  SELECT 1 FROM information_schema.columns
+                  WHERE table_schema = 'public'
+                    AND table_name = 'test_runs'
+                    AND column_name = 'executed_calls'
+                ) THEN
+                  ALTER TABLE test_runs ADD COLUMN executed_calls JSONB;
+                END IF;
 
                 UPDATE test_runs
                 SET artifact_revision = 0

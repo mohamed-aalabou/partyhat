@@ -154,6 +154,43 @@ def _normalize_solidity_literal(value: Any) -> str:
     return str(value)
 
 
+def _looks_like_quoted_solidity_string(value: str) -> bool:
+    trimmed = value.strip()
+    return len(trimmed) >= 2 and trimmed[0] == trimmed[-1] and trimmed[0] in {'"', "'"}
+
+
+def render_manifest_constructor_argument(item: Any) -> str:
+    source = str(getattr(item, "source", "") or "")
+    arg_type = str(getattr(item, "type", "") or "")
+    default_value = getattr(item, "default_value", None)
+
+    if source == "deployer":
+        return "deployer"
+    if default_value in (None, ""):
+        return _default_constructor_expression(arg_type)
+    if isinstance(default_value, bool):
+        return "true" if default_value else "false"
+    if not isinstance(default_value, str):
+        return _normalize_solidity_literal(default_value)
+
+    literal = default_value.strip()
+    if not literal:
+        return _default_constructor_expression(arg_type)
+    if "<deployed:" in literal:
+        return literal
+
+    lowered_type = arg_type.strip().lower()
+    if lowered_type == "string":
+        if _looks_like_quoted_solidity_string(literal):
+            return literal
+        return json.dumps(literal)
+    if lowered_type == "bool":
+        lowered_literal = literal.lower()
+        if lowered_literal in {"true", "false"}:
+            return lowered_literal
+    return literal
+
+
 def _default_constructor_expression(arg_type: str) -> str:
     lowered = (arg_type or "").strip().lower()
     if lowered == "address":
@@ -208,19 +245,12 @@ def _build_manifest_deploy_script(
     for contract in contracts:
         args: list[str] = []
         for item in contract.constructor_args_schema:
-            if str(item.source or "") == "deployer":
-                args.append("deployer")
-            else:
-                args.append(
-                    _resolve_deployment_expression(
-                        _normalize_solidity_literal(
-                            item.default_value
-                            if item.default_value not in (None, "")
-                            else _default_constructor_expression(item.type)
-                        ),
-                        instance_names=instance_names,
-                    )
+            args.append(
+                _resolve_deployment_expression(
+                    render_manifest_constructor_argument(item),
+                    instance_names=instance_names,
                 )
+            )
         deploy_args = ", ".join(args)
         deploy_lines.append(
             f"        // deploy-order:{contract.deploy_order} {contract.name}\n"
@@ -876,6 +906,35 @@ def _cap_deploy_response(response: Dict[str, Any]) -> Dict[str, Any]:
     )
 
 
+def _persist_authoritative_deployment_record(mm, **kwargs) -> str | None:
+    try:
+        mm.save_deployment(**kwargs)
+        return None
+    except Exception as exc:
+        return f"Authoritative deployment record could not be persisted: {exc}"
+
+
+def _combine_deployment_errors(
+    base_error: str | None,
+    authoritative_record_error: str | None,
+    *,
+    executed: bool,
+) -> str | None:
+    if base_error and authoritative_record_error:
+        return f"{base_error}; {authoritative_record_error}"
+    if base_error:
+        return base_error
+    if authoritative_record_error and executed:
+        detail = authoritative_record_error.removeprefix(
+            "Authoritative deployment record could not be persisted: "
+        ).strip()
+        return (
+            "Deployment executed but authoritative deployment record could not be "
+            f"persisted: {detail}"
+        )
+    return authoritative_record_error
+
+
 def _parse_deploy_output(stdout: str, stderr: str) -> Dict[str, Optional[str]]:
     combined = f"{stdout}\n{stderr}"
     tx_hash = _extract_first(
@@ -998,6 +1057,95 @@ def generate_foundry_deploy_script_direct(
     }
 
 
+def preflight_compile_deploy_script(
+    *,
+    script_path: str,
+    project_id: str | None = None,
+    project_root: Optional[str] = None,
+    private_key_env_var: str = "FUJI_PRIVATE_KEY",
+    rpc_url_env_var: str = "FUJI_RPC_URL",
+) -> Dict[str, Any]:
+    default_root = os.getenv("FOUNDRY_ARTIFACT_ROOT", "generated_contracts")
+    if project_id:
+        default_root = f"{default_root.rstrip('/')}/{project_id}"
+    root = project_root or os.getenv("FOUNDRY_PROJECT_ROOT") or default_root
+    app_name = os.getenv("MODAL_APP_NAME", "partyhat-foundry-tests")
+    sandbox_workdir = "/workspace/project"
+    timeout = int(os.getenv("FOUNDRY_SANDBOX_TIMEOUT", "900"))
+    base_volume_name = os.getenv(
+        "FOUNDRY_ARTIFACT_VOLUME_NAME", "partyhat-foundry-artifacts"
+    )
+    volume_name = build_project_volume_name(base_volume_name, project_id)
+    vol = get_modal_volume(volume_name)
+    forge_cmd = [
+        "forge",
+        "script",
+        script_path,
+        *default_foundry_remappings(),
+    ]
+    forge_cmd_str = " ".join(shlex.quote(str(part)) for part in forge_cmd)
+    bootstrap_cmd = build_foundry_bootstrap_cmd(root, forge_cmd_str)
+
+    try:
+        sandbox = modal.Sandbox.create(
+            "bash",
+            "-lc",
+            bootstrap_cmd,
+            image=foundry_image,
+            app=get_modal_app(app_name),
+            workdir=sandbox_workdir,
+            timeout=timeout,
+            volumes={sandbox_workdir: vol},
+            env={
+                private_key_env_var: "1" * 64,
+                rpc_url_env_var: "https://example.invalid",
+            },
+        )
+        cancelled = _wait_for_sandbox_completion(sandbox, None)
+        stdout = _safe_stream_read(getattr(sandbox, "stdout", None))
+        stderr = _safe_stream_read(getattr(sandbox, "stderr", None))
+        exit_code = getattr(sandbox, "returncode", None)
+        if cancelled:
+            exit_code = 130 if exit_code is None else exit_code
+        normalized_exit_code = exit_code if exit_code is not None else 1
+
+        response = {
+            "success": normalized_exit_code == 0 and not cancelled,
+            "cancelled": cancelled,
+            "exit_code": normalized_exit_code,
+            "stdout": stdout,
+            "stderr": stderr,
+            "project_root": root,
+            "sandbox_workdir": sandbox_workdir,
+            "modal_app": app_name,
+            "script_path": script_path,
+            "command": " ".join(forge_cmd),
+            "summary": compact_execution_summary(normalized_exit_code, stdout, stderr),
+        }
+        if cancelled:
+            response["error"] = "Deployment script compile preflight was cancelled."
+        elif normalized_exit_code != 0:
+            response["error"] = "Deployment script compile preflight failed."
+        return _cap_deploy_response(response)
+    except Exception as exc:
+        return _cap_deploy_response(
+            {
+                "success": False,
+                "cancelled": False,
+                "exit_code": 1,
+                "stdout": "",
+                "stderr": str(exc),
+                "project_root": root,
+                "sandbox_workdir": sandbox_workdir,
+                "modal_app": app_name,
+                "script_path": script_path,
+                "command": " ".join(forge_cmd),
+                "summary": compact_execution_summary(1, "", str(exc)),
+                "error": f"Could not run deployment script compile preflight: {exc}",
+            }
+        )
+
+
 @tool
 def generate_foundry_deploy_script(
     request: FoundryDeployScriptGenerationRequest,
@@ -1114,6 +1262,10 @@ def run_foundry_deploy(
         app_name = os.getenv("MODAL_APP_NAME", "partyhat-foundry-tests")
         sandbox_workdir = "/workspace/project"
         if request.network != "avalanche_fuji":
+            base_error = (
+                "Unsupported network. This deployment tool currently supports "
+                "only avalanche_fuji."
+            )
             entry = _record_deploy_result(
                 project_id=project_id_ctx,
                 pipeline_run_id=pipeline_run_id,
@@ -1124,37 +1276,29 @@ def run_foundry_deploy(
                 command=f"forge script {request.script_path}",
                 exit_code=1,
                 stdout="",
-                stderr=(
-                    "Unsupported network. This deployment tool currently supports "
-                    "only avalanche_fuji."
-                ),
+                stderr=base_error,
                 modal_app=app_name,
             )
-            try:
-                mm.save_deployment(
-                    status="failed",
-                    contract_name=request.contract_name,
-                    plan_contract_id=request.plan_contract_id,
-                    network=request.network,
-                    pipeline_run_id=pipeline_run_id,
-                    pipeline_task_id=pipeline_task_id,
-                    stdout_path=entry["stdout_path"],
-                    stderr_path=entry["stderr_path"],
-                    exit_code=1,
-                    trace_id=trace_id,
-                )
-            except Exception:
-                pass
+            authoritative_record_error = _persist_authoritative_deployment_record(
+                mm,
+                status="failed",
+                contract_name=request.contract_name,
+                plan_contract_id=request.plan_contract_id,
+                network=request.network,
+                pipeline_run_id=pipeline_run_id,
+                pipeline_task_id=pipeline_task_id,
+                stdout_path=entry["stdout_path"],
+                stderr_path=entry["stderr_path"],
+                exit_code=1,
+                trace_id=trace_id,
+            )
             return {
                 "success": False,
                 "exit_code": 1,
                 "pipeline_run_id": pipeline_run_id,
                 "pipeline_task_id": pipeline_task_id,
                 "stdout": "",
-                "stderr": (
-                    "Unsupported network. This deployment tool currently supports "
-                    "only avalanche_fuji."
-                ),
+                "stderr": base_error,
                 "stdout_path": entry["stdout_path"],
                 "stderr_path": entry["stderr_path"],
                 "project_root": root,
@@ -1164,15 +1308,18 @@ def run_foundry_deploy(
                 "chain_id": request.chain_id,
                 "script_path": request.script_path,
                 "command": f"forge script {request.script_path}",
-                "error": (
-                    "Unsupported network. This deployment tool currently supports "
-                    "only avalanche_fuji."
+                "error": _combine_deployment_errors(
+                    base_error,
+                    authoritative_record_error,
+                    executed=False,
                 ),
+                "authoritative_record_error": authoritative_record_error,
             }
 
         rpc_url = os.getenv(request.rpc_url_env_var)
         private_key = os.getenv(request.private_key_env_var)
         if not rpc_url:
+            base_error = f"Missing required env var: {request.rpc_url_env_var}"
             entry = _record_deploy_result(
                 project_id=project_id_ctx,
                 pipeline_run_id=pipeline_run_id,
@@ -1183,31 +1330,29 @@ def run_foundry_deploy(
                 command=f"forge script {request.script_path}",
                 exit_code=1,
                 stdout="",
-                stderr=f"Missing required env var: {request.rpc_url_env_var}",
+                stderr=base_error,
                 modal_app=app_name,
             )
-            try:
-                mm.save_deployment(
-                    status="failed",
-                    contract_name=request.contract_name,
-                    plan_contract_id=request.plan_contract_id,
-                    network=request.network,
-                    pipeline_run_id=pipeline_run_id,
-                    pipeline_task_id=pipeline_task_id,
-                    stdout_path=entry["stdout_path"],
-                    stderr_path=entry["stderr_path"],
-                    exit_code=1,
-                    trace_id=trace_id,
-                )
-            except Exception:
-                pass
+            authoritative_record_error = _persist_authoritative_deployment_record(
+                mm,
+                status="failed",
+                contract_name=request.contract_name,
+                plan_contract_id=request.plan_contract_id,
+                network=request.network,
+                pipeline_run_id=pipeline_run_id,
+                pipeline_task_id=pipeline_task_id,
+                stdout_path=entry["stdout_path"],
+                stderr_path=entry["stderr_path"],
+                exit_code=1,
+                trace_id=trace_id,
+            )
             return {
                 "success": False,
                 "exit_code": 1,
                 "pipeline_run_id": pipeline_run_id,
                 "pipeline_task_id": pipeline_task_id,
                 "stdout": "",
-                "stderr": f"Missing required env var: {request.rpc_url_env_var}",
+                "stderr": base_error,
                 "stdout_path": entry["stdout_path"],
                 "stderr_path": entry["stderr_path"],
                 "project_root": root,
@@ -1217,9 +1362,15 @@ def run_foundry_deploy(
                 "chain_id": request.chain_id,
                 "script_path": request.script_path,
                 "command": f"forge script {request.script_path}",
-                "error": f"Missing required env var: {request.rpc_url_env_var}",
+                "error": _combine_deployment_errors(
+                    base_error,
+                    authoritative_record_error,
+                    executed=False,
+                ),
+                "authoritative_record_error": authoritative_record_error,
             }
         if not private_key:
+            base_error = f"Missing required env var: {request.private_key_env_var}"
             entry = _record_deploy_result(
                 project_id=project_id_ctx,
                 pipeline_run_id=pipeline_run_id,
@@ -1230,31 +1381,29 @@ def run_foundry_deploy(
                 command=f"forge script {request.script_path}",
                 exit_code=1,
                 stdout="",
-                stderr=f"Missing required env var: {request.private_key_env_var}",
+                stderr=base_error,
                 modal_app=app_name,
             )
-            try:
-                mm.save_deployment(
-                    status="failed",
-                    contract_name=request.contract_name,
-                    plan_contract_id=request.plan_contract_id,
-                    network=request.network,
-                    pipeline_run_id=pipeline_run_id,
-                    pipeline_task_id=pipeline_task_id,
-                    stdout_path=entry["stdout_path"],
-                    stderr_path=entry["stderr_path"],
-                    exit_code=1,
-                    trace_id=trace_id,
-                )
-            except Exception:
-                pass
+            authoritative_record_error = _persist_authoritative_deployment_record(
+                mm,
+                status="failed",
+                contract_name=request.contract_name,
+                plan_contract_id=request.plan_contract_id,
+                network=request.network,
+                pipeline_run_id=pipeline_run_id,
+                pipeline_task_id=pipeline_task_id,
+                stdout_path=entry["stdout_path"],
+                stderr_path=entry["stderr_path"],
+                exit_code=1,
+                trace_id=trace_id,
+            )
             return {
                 "success": False,
                 "exit_code": 1,
                 "pipeline_run_id": pipeline_run_id,
                 "pipeline_task_id": pipeline_task_id,
                 "stdout": "",
-                "stderr": f"Missing required env var: {request.private_key_env_var}",
+                "stderr": base_error,
                 "stdout_path": entry["stdout_path"],
                 "stderr_path": entry["stderr_path"],
                 "project_root": root,
@@ -1264,7 +1413,12 @@ def run_foundry_deploy(
                 "chain_id": request.chain_id,
                 "script_path": request.script_path,
                 "command": f"forge script {request.script_path}",
-                "error": f"Missing required env var: {request.private_key_env_var}",
+                "error": _combine_deployment_errors(
+                    base_error,
+                    authoritative_record_error,
+                    executed=False,
+                ),
+                "authoritative_record_error": authoritative_record_error,
             }
         private_key = _normalize_private_key_hex(private_key)
 
@@ -1389,26 +1543,33 @@ def run_foundry_deploy(
         )
         stdout_path = entry["stdout_path"]
         stderr_path = entry["stderr_path"]
-        try:
-            mm.save_deployment(
-                status="cancelled" if cancelled else ("success" if success else "failed"),
-                contract_name=request.contract_name,
-                plan_contract_id=request.plan_contract_id,
-                deployed_address=parsed.get("deployed_address"),
-                tx_hash=parsed.get("tx_hash"),
-                snowtrace_url=None,
-                network=request.network,
-                pipeline_run_id=pipeline_run_id,
-                pipeline_task_id=pipeline_task_id,
-                stdout_path=stdout_path,
-                stderr_path=stderr_path,
-                exit_code=exit_code,
-                trace_id=trace_id,
-                deployed_contracts=parsed.get("deployed_contracts") or [],
-                executed_calls=parsed.get("executed_calls") or [],
-            )
-        except Exception:
-            pass
+        authoritative_record_error = _persist_authoritative_deployment_record(
+            mm,
+            status="cancelled" if cancelled else ("success" if success else "failed"),
+            contract_name=request.contract_name,
+            plan_contract_id=request.plan_contract_id,
+            deployed_address=parsed.get("deployed_address"),
+            tx_hash=parsed.get("tx_hash"),
+            snowtrace_url=None,
+            network=request.network,
+            pipeline_run_id=pipeline_run_id,
+            pipeline_task_id=pipeline_task_id,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            exit_code=exit_code,
+            trace_id=trace_id,
+            deployed_contracts=parsed.get("deployed_contracts") or [],
+            executed_calls=parsed.get("executed_calls") or [],
+        )
+        combined_error = _combine_deployment_errors(
+            deploy_error,
+            authoritative_record_error,
+            executed=bool(
+                parsed.get("tx_hash")
+                or parsed.get("deployed_address")
+                or success
+            ),
+        )
 
         mm.log_agent_action(
             agent_name="deployment",
@@ -1416,11 +1577,11 @@ def run_foundry_deploy(
             output_produced=entry,
             why="Deployment agent executed forge script broadcast in Modal Sandbox",
             how="run_foundry_deploy tool (Modal Sandbox)",
-            error=deploy_error,
+            error=combined_error,
         )
 
         response = {
-            "success": success and not cancelled,
+            "success": success and not cancelled and authoritative_record_error is None,
             "cancelled": cancelled,
             "exit_code": exit_code,
             "pipeline_run_id": pipeline_run_id,
@@ -1440,9 +1601,10 @@ def run_foundry_deploy(
             "deployed_address": parsed.get("deployed_address"),
             "deployed_contracts": parsed.get("deployed_contracts") or [],
             "executed_calls": parsed.get("executed_calls") or [],
+            "authoritative_record_error": authoritative_record_error,
         }
-        if deploy_error:
-            response["error"] = deploy_error
+        if combined_error:
+            response["error"] = combined_error
         return _cap_deploy_response(response)
     except Exception as e:
         try:
@@ -1474,21 +1636,24 @@ def run_foundry_deploy(
                 stderr=str(e),
                 modal_app=app_name,
             )
-            try:
-                _get_memory_manager().save_deployment(
-                    status="failed",
-                    contract_name=request.contract_name,
-                    plan_contract_id=request.plan_contract_id,
-                    network=request.network,
-                    pipeline_run_id=pipeline_run_id,
-                    pipeline_task_id=pipeline_task_id,
-                    stdout_path=entry["stdout_path"],
-                    stderr_path=entry["stderr_path"],
-                    exit_code=1,
-                    trace_id=current_trace_id(),
-                )
-            except Exception:
-                pass
+            authoritative_record_error = _persist_authoritative_deployment_record(
+                _get_memory_manager(),
+                status="failed",
+                contract_name=request.contract_name,
+                plan_contract_id=request.plan_contract_id,
+                network=request.network,
+                pipeline_run_id=pipeline_run_id,
+                pipeline_task_id=pipeline_task_id,
+                stdout_path=entry["stdout_path"],
+                stderr_path=entry["stderr_path"],
+                exit_code=1,
+                trace_id=current_trace_id(),
+            )
+            combined_error = _combine_deployment_errors(
+                f"Could not run forge deployment in Modal Sandbox: {str(e)}",
+                authoritative_record_error,
+                executed=False,
+            )
             return _cap_deploy_response(
                 {
                     "success": False,
@@ -1508,7 +1673,8 @@ def run_foundry_deploy(
                     "command": f"forge script {request.script_path}",
                     "tx_hash": None,
                     "deployed_address": None,
-                    "error": f"Could not run forge deployment in Modal Sandbox: {str(e)}",
+                    "authoritative_record_error": authoritative_record_error,
+                    "error": combined_error,
                 }
             )
         except Exception:
