@@ -90,6 +90,7 @@ origins = [
     "http://localhost:3001",
     "https://partyhat-app.vercel.app",
     "https://partyhat-backend.onrender.com",
+    "https://app.partyhat.dev",
 ]
 
 app.add_middleware(
