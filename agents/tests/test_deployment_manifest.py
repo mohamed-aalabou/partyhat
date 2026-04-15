@@ -1,5 +1,7 @@
 from agents.deployment_manifest import (
     build_deployment_manifest,
+    load_deployment_manifest,
+    remediate_manifest_post_deploy_calls,
     validate_deploy_script_against_manifest,
 )
 from agents.deployment_tools import generate_foundry_deploy_script_direct
@@ -21,7 +23,18 @@ def _avavest_plan() -> dict:
                 "deployment_role": "primary_deployable",
                 "deploy_order": 1,
                 "constructor": {"inputs": [], "description": "Default constructor"},
-                "functions": [{"name": "setToken"}],
+                "functions": [
+                    {
+                        "name": "setToken",
+                        "inputs": [
+                            {
+                                "name": "token",
+                                "type": "address",
+                                "description": "Token contract",
+                            }
+                        ],
+                    }
+                ],
             },
             {
                 "plan_contract_id": "pc_token",
@@ -40,7 +53,18 @@ def _avavest_plan() -> dict:
                     ],
                     "description": "Store vesting address",
                 },
-                "functions": [{"name": "mint"}],
+                "functions": [
+                    {
+                        "name": "mint",
+                        "inputs": [
+                            {
+                                "name": "to",
+                                "type": "address",
+                                "description": "Recipient",
+                            }
+                        ],
+                    }
+                ],
             },
         ],
         "post_deploy_calls": [
@@ -105,6 +129,127 @@ def test_build_deployment_manifest_rejects_unknown_placeholder_and_duplicate_cal
     assert manifest is None
     assert any("unknown deployed contract 'MissingToken'" in issue for issue in issues)
     assert any("Duplicate post_deploy_calls call_order 1" in issue for issue in issues)
+
+
+def test_build_deployment_manifest_rejects_typed_invalid_post_deploy_args():
+    plan = {
+        "project_name": "Publishing",
+        "description": "Publishing editions",
+        "status": "ready",
+        "deployment_target": default_deployment_target_payload(),
+        "contracts": [
+            {
+                "plan_contract_id": "pc_publish",
+                "name": "PublishingEditions1155",
+                "description": "Primary contract",
+                "deployment_role": "primary_deployable",
+                "deploy_order": 1,
+                "constructor": {"inputs": [], "description": "Default constructor"},
+                "functions": [
+                    {
+                        "name": "createEdition",
+                        "inputs": [
+                            {"name": "tokenId", "type": "uint256", "description": "Token id"},
+                            {"name": "key", "type": "string", "description": "Edition key"},
+                            {"name": "maxSupply", "type": "uint256", "description": "Cap"},
+                            {"name": "uri", "type": "string", "description": "URI"},
+                        ],
+                    }
+                ],
+            }
+        ],
+        "post_deploy_calls": [
+            {
+                "target_contract_name": "PublishingEditions1155",
+                "function_name": "createEdition",
+                "args": ["1", "pass:supporter", "TBD", "TBD"],
+                "call_order": 1,
+                "description": "Create supporter pass",
+            }
+        ],
+    }
+    artifacts = [
+        {
+            "path": "contracts/PublishingEditions1155.sol",
+            "contract_names": ["PublishingEditions1155"],
+            "plan_contract_ids": ["pc_publish"],
+        }
+    ]
+
+    manifest, issues = build_deployment_manifest(plan, artifacts)
+
+    assert manifest is None
+    assert any("arg 2" in issue and "quoted string literal" in issue for issue in issues)
+    assert any("arg 3" in issue and "unresolved value 'TBD'" in issue for issue in issues)
+    assert any("arg 4" in issue and "unresolved value 'TBD'" in issue for issue in issues)
+
+
+def test_remediate_manifest_post_deploy_calls_only_quotes_safe_string_args():
+    plan = {
+        "project_name": "Publishing",
+        "description": "Publishing editions",
+        "status": "ready",
+        "deployment_target": default_deployment_target_payload(),
+        "contracts": [
+            {
+                "plan_contract_id": "pc_publish",
+                "name": "PublishingEditions1155",
+                "description": "Primary contract",
+                "deployment_role": "primary_deployable",
+                "deploy_order": 1,
+                "constructor": {"inputs": [], "description": "Default constructor"},
+                "functions": [
+                    {
+                        "name": "createEdition",
+                        "inputs": [
+                            {"name": "tokenId", "type": "uint256", "description": "Token id"},
+                            {"name": "key", "type": "string", "description": "Edition key"},
+                            {"name": "maxSupply", "type": "uint256", "description": "Cap"},
+                            {"name": "uri", "type": "string", "description": "URI"},
+                        ],
+                    }
+                ],
+            }
+        ],
+    }
+    manifest = load_deployment_manifest(
+        {
+            "deployment_target": default_deployment_target_payload(),
+            "contracts": [
+                {
+                    "plan_contract_id": "pc_publish",
+                    "name": "PublishingEditions1155",
+                    "role": "primary_deployable",
+                    "deploy_order": 1,
+                    "source_path": "contracts/PublishingEditions1155.sol",
+                    "constructor_args_schema": [],
+                }
+            ],
+            "post_deploy_calls": [
+                {
+                    "target_contract_name": "PublishingEditions1155",
+                    "target_plan_contract_id": "pc_publish",
+                    "function_name": "createEdition",
+                    "args": ["1", "pass:supporter", "TBD", "TBD"],
+                    "call_order": 1,
+                    "description": "Create supporter pass",
+                }
+            ],
+        }
+    )
+
+    remediated, notes, issues, changed = remediate_manifest_post_deploy_calls(plan, manifest)
+
+    assert changed is True
+    assert remediated.post_deploy_calls[0].args == [
+        "1",
+        '"pass:supporter"',
+        "TBD",
+        "TBD",
+    ]
+    assert any("arg 2" in note and '"pass:supporter"' in note for note in notes)
+    assert any("arg 3" in issue and "unresolved value 'TBD'" in issue for issue in issues)
+    assert any("arg 4" in issue and "unresolved value 'TBD'" in issue for issue in issues)
 
 
 def test_generate_foundry_deploy_script_direct_builds_multi_contract_script_from_manifest():

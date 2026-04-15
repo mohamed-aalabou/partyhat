@@ -5,6 +5,7 @@ from schemas.plan_schema import (
     ContractFunction,
     ContractPlan,
     FunctionInput,
+    PostDeployCall,
     SmartContractPlan,
 )
 
@@ -143,7 +144,7 @@ def test_clear_pending_questions_also_clears_approval_request(monkeypatch):
     assert planning_tools.get_approval_request() is None
 
 
-def _build_plan(*, constructor_inputs):
+def _build_plan(*, constructor_inputs, functions=None, post_deploy_calls=None):
     return SmartContractPlan(
         project_name="PartyToken",
         description="Token plan",
@@ -164,17 +165,21 @@ def _build_plan(*, constructor_inputs):
                     description="Initializes the token",
                     inputs=list(constructor_inputs),
                 ),
-                functions=[
-                    ContractFunction(
-                        name="mint",
-                        description="Mint tokens",
-                        inputs=[],
-                        outputs=[],
-                        conditions=["Caller must be owner"],
-                    )
-                ],
+                functions=list(
+                    functions
+                    or [
+                        ContractFunction(
+                            name="mint",
+                            description="Mint tokens",
+                            inputs=[],
+                            outputs=[],
+                            conditions=["Caller must be owner"],
+                        )
+                    ]
+                ),
             )
         ],
+        post_deploy_calls=list(post_deploy_calls or []),
     )
 
 
@@ -211,3 +216,39 @@ def test_validate_plan_accepts_constructor_address_deployer_fallback():
     result = planning_tools.validate_plan.func(plan)
 
     assert result["valid"] is True
+
+
+def test_validate_plan_rejects_invalid_post_deploy_args_for_single_contract_plan():
+    plan = _build_plan(
+        constructor_inputs=[],
+        functions=[
+            ContractFunction(
+                name="createEdition",
+                description="Create a new edition",
+                inputs=[
+                    FunctionInput(name="tokenId", type="uint256", description="Token id"),
+                    FunctionInput(name="key", type="string", description="Edition key"),
+                    FunctionInput(name="maxSupply", type="uint256", description="Cap"),
+                    FunctionInput(name="uri", type="string", description="Token URI"),
+                ],
+                outputs=[],
+                conditions=["Caller must be owner"],
+            )
+        ],
+        post_deploy_calls=[
+            PostDeployCall(
+                target_contract_name="PartyToken",
+                function_name="createEdition",
+                args=["1", "pass:supporter", "TBD", "TBD"],
+                call_order=1,
+                description="Create supporter pass",
+            )
+        ],
+    )
+
+    result = planning_tools.validate_plan.func(plan)
+
+    assert result["valid"] is False
+    assert any("arg 2" in issue and "quoted string literal" in issue for issue in result["issues"])
+    assert any("arg 3" in issue and "unresolved value 'TBD'" in issue for issue in result["issues"])
+    assert any("arg 4" in issue and "unresolved value 'TBD'" in issue for issue in result["issues"])

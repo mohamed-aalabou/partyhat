@@ -20,7 +20,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
-from agents.deployment_manifest import validate_deployed_placeholders
+from agents.deployment_manifest import validate_post_deploy_calls
 from schemas.plan_schema import SmartContractPlan, PlanStatus
 
 
@@ -217,50 +217,26 @@ def _deployment_manifest_issues(plan: SmartContractPlan) -> List[str]:
     if not target.private_key_env_var:
         issues.append("deployment_target.private_key_env_var is required.")
 
-    if len(plan.contracts) <= 1:
-        return issues
-
-    primary = [c for c in plan.contracts if c.deployment_role == "primary_deployable"]
-    if len(primary) != 1:
-        issues.append(
-            "Multi-contract plans must mark exactly one contract as deployment_role='primary_deployable'."
-        )
-
-    deploy_orders = [
-        c.deploy_order for c in plan.contracts if c.deployment_role and c.deploy_order
-    ]
-    if len(deploy_orders) != len(
-        [c for c in plan.contracts if c.deployment_role and c.deploy_order is not None]
-    ):
-        issues.append(
-            "Every deployable contract in a multi-contract plan must define deploy_order."
-        )
-    if len(deploy_orders) != len(set(deploy_orders)):
-        issues.append("deploy_order values must be unique across deployable contracts.")
-
-    known_contract_names = {contract.name for contract in plan.contracts}
-    seen_call_orders: set[int] = set()
-    for index, call in enumerate(plan.post_deploy_calls, start=1):
-        if call.target_contract_name not in known_contract_names:
+    if len(plan.contracts) > 1:
+        primary = [c for c in plan.contracts if c.deployment_role == "primary_deployable"]
+        if len(primary) != 1:
             issues.append(
-                f"post_deploy_calls[{index}] references unknown target_contract_name '{call.target_contract_name}'."
+                "Multi-contract plans must mark exactly one contract as deployment_role='primary_deployable'."
             )
-        if call.call_order in seen_call_orders:
+
+        deploy_orders = [
+            c.deploy_order for c in plan.contracts if c.deployment_role and c.deploy_order
+        ]
+        if len(deploy_orders) != len(
+            [c for c in plan.contracts if c.deployment_role and c.deploy_order is not None]
+        ):
             issues.append(
-                f"post_deploy_calls has duplicate call_order {call.call_order}."
+                "Every deployable contract in a multi-contract plan must define deploy_order."
             )
-        seen_call_orders.add(call.call_order)
-        for arg_index, arg in enumerate(call.args, start=1):
-            issues.extend(
-                validate_deployed_placeholders(
-                    arg,
-                    context=(
-                        f"post_deploy_calls[{index}] arg {arg_index} for "
-                        f"{call.target_contract_name}.{call.function_name}"
-                    ),
-                    known_contract_names=known_contract_names,
-                )
-            )
+        if len(deploy_orders) != len(set(deploy_orders)):
+            issues.append("deploy_order values must be unique across deployable contracts.")
+
+    issues.extend(validate_post_deploy_calls(plan))
     return issues
 
 

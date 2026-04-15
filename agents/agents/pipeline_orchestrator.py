@@ -14,6 +14,7 @@ from agents.coding_tools import (
     ensure_chainlink_contracts,
     load_code_artifact,
 )
+from agents.code_storage import get_code_storage
 from agents.db import async_session_factory
 from agents.db.crud import (
     cancel_pending_followup_tasks,
@@ -49,7 +50,11 @@ from agents.pipeline_status import (
     serialize_run,
     serialize_task,
 )
-from agents.deployment_manifest import MANIFEST_PATH
+from agents.deployment_manifest import (
+    MANIFEST_PATH,
+    dump_deployment_manifest,
+    remediate_manifest_post_deploy_calls,
+)
 from agents.pipeline_evaluations import (
     evaluate_code_generation,
     evaluate_deployment_prepare,
@@ -291,12 +296,22 @@ async def _next_task_payload(
             "result_summary": result_summary,
         }
     retry_budget_key = retry_budget_key_for_task(task_type)
+    current_retry_key = getattr(task, "retry_budget_key", None) or retry_budget_key_for_task(
+        task.task_type
+    )
+    retry_floor = -1
+    if current_retry_key == retry_budget_key:
+        current_retry_attempt = getattr(task, "retry_attempt", None)
+        if current_retry_attempt is None:
+            current_retry_attempt = -1
+        retry_floor = int(current_retry_attempt) + 1
     async with async_session_factory() as session:
         retry_attempt = await get_next_retry_attempt(
             session,
             uuid.UUID(pipeline_run_id),
             retry_budget_key,
         )
+    retry_attempt = max(retry_attempt, retry_floor)
     return {
         "assigned_to": assigned_to,
         "task_type": task_type,
@@ -678,6 +693,34 @@ async def _enqueue_task(
         )
 
 
+async def _pause_task_for_gate(
+    *,
+    task,
+    gate,
+    result_summary: str,
+    failure_class: str = "human_gate",
+) -> None:
+    async with async_session_factory() as session:
+        await update_pipeline_task(
+            session,
+            task.id,
+            status="waiting_for_approval",
+            result_summary=result_summary,
+            failure_class=failure_class,
+            gate_id=gate.id,
+        )
+
+
+def _deployment_manifest_artifact(manifest) -> CodeArtifact:
+    return CodeArtifact(
+        path=MANIFEST_PATH,
+        language="json",
+        description="Authoritative deployment manifest",
+        contract_names=[contract.name for contract in manifest.contracts],
+        plan_contract_ids=[contract.plan_contract_id for contract in manifest.contracts],
+    )
+
+
 async def _validate_execution_result(
     pipeline_run_id: str,
     task,
@@ -913,6 +956,10 @@ async def _handle_prepare_script(task, project_id: str, user_id: str, pipeline_r
     ]
     mm = MemoryManager(user_id=user_id, project_id=project_id)
     snapshot = _artifact_snapshot(mm)
+    get_plan = getattr(mm, "get_plan", None)
+    plan = get_plan() if callable(get_plan) else {}
+    if not isinstance(plan, dict):
+        plan = {}
     manifest, manifest_error = load_saved_manifest(project_id)
     if manifest is None:
         evaluation = {
@@ -952,6 +999,85 @@ async def _handle_prepare_script(task, project_id: str, user_id: str, pipeline_r
             next_tasks=[next_task],
         )
         return events
+
+    remediated_manifest, remediation_notes, remediation_issues, remediation_changed = (
+        remediate_manifest_post_deploy_calls(plan, manifest)
+    )
+    if remediation_issues:
+        result_summary = (
+            "Deployment manifest contains unresolved post-deploy inputs that need operator input."
+        )
+        evaluation = {
+            "status": "failed",
+            "blocking": True,
+            "evaluation_type": "deployment_prepare",
+            "summary": result_summary,
+            "details": {
+                "issues": remediation_issues,
+                "remediations": remediation_notes,
+                "manifest_path": MANIFEST_PATH,
+            },
+            "artifact_revision": task.artifact_revision,
+        }
+        evaluation_row = await _record_pipeline_evaluation(
+            project_id=project_id,
+            pipeline_run_id=pipeline_run_id,
+            task=task,
+            stage="deployment",
+            evaluation=evaluation,
+        )
+        gate = await _create_gate_for_task(
+            project_id=project_id,
+            pipeline_run_id=pipeline_run_id,
+            task=task,
+            gate_type="override",
+            requested_reason=result_summary,
+            requested_payload=evaluation["details"],
+            evaluation_id=evaluation_row,
+        )
+        await _pause_task_for_gate(
+            task=task,
+            gate=gate,
+            result_summary=result_summary,
+        )
+        return events
+
+    if remediation_changed:
+        try:
+            get_code_storage(project_id=project_id).save_code(
+                _deployment_manifest_artifact(remediated_manifest),
+                dump_deployment_manifest(remediated_manifest),
+            )
+        except Exception as exc:
+            result_summary = (
+                "Deployment manifest remediation could not be persisted before script generation."
+            )
+            next_task = await _next_task_payload(
+                pipeline_run_id,
+                task,
+                assigned_to="coding",
+                task_type="coding.generate_contracts",
+                description=result_summary,
+                context={
+                    "failure_context": {
+                        "summary": f"{result_summary} {exc}",
+                    }
+                },
+                artifact_revision=task.artifact_revision,
+                task_status="failed",
+                result_summary=f"{result_summary} {exc}",
+                failure_class="artifact_contract_mismatch",
+            )
+            await _finalize_direct_task(
+                project_id=project_id,
+                pipeline_run_id=pipeline_run_id,
+                task=task,
+                task_status="failed",
+                result_summary=f"{result_summary} {exc}",
+                next_tasks=[next_task],
+            )
+            return events
+        manifest = remediated_manifest
 
     primary_contract = next(
         (
@@ -1096,37 +1222,6 @@ async def _handle_prepare_script(task, project_id: str, user_id: str, pipeline_r
 
     if evaluation["status"] != "passed":
         result_summary = evaluation["summary"]
-        if _retry_available(task):
-            next_task = await _next_task_payload(
-                pipeline_run_id,
-                task,
-                assigned_to="deployment",
-                task_type="deployment.prepare_script",
-                description="Regenerate the deployment script so it matches the authoritative deployment manifest.",
-                context={"failure_context": {"summary": result_summary}},
-                artifact_revision=task.artifact_revision,
-                task_status="failed",
-                result_summary=result_summary,
-                failure_class="evaluation_failed",
-            )
-            await _finalize_direct_task(
-                project_id=project_id,
-                pipeline_run_id=pipeline_run_id,
-                task=task,
-                task_status="failed",
-                result_summary=result_summary,
-                next_tasks=[next_task],
-            )
-            return events
-
-        await _finalize_direct_task(
-            project_id=project_id,
-            pipeline_run_id=pipeline_run_id,
-            task=task,
-            task_status="failed",
-            result_summary=result_summary,
-            next_tasks=[],
-        )
         gate = await _create_gate_for_task(
             project_id=project_id,
             pipeline_run_id=pipeline_run_id,
@@ -1136,25 +1231,10 @@ async def _handle_prepare_script(task, project_id: str, user_id: str, pipeline_r
             requested_payload=evaluation.get("details"),
             evaluation_id=evaluation_row,
         )
-        next_task = await _next_task_payload(
-            pipeline_run_id,
-            task,
-            assigned_to="deployment",
-            task_type="deployment.prepare_script",
-            description="Operator override requested for deployment preparation remediation.",
-            context={"failure_context": {"summary": result_summary}},
-            artifact_revision=task.artifact_revision,
-            task_status="failed",
+        await _pause_task_for_gate(
+            task=task,
+            gate=gate,
             result_summary=result_summary,
-            failure_class="human_gate",
-            status="waiting_for_approval",
-            gate_id=str(gate.id),
-        )
-        await _enqueue_task(
-            project_id=project_id,
-            pipeline_run_id=pipeline_run_id,
-            payload=next_task,
-            created_by=task.assigned_to,
         )
         return events
 

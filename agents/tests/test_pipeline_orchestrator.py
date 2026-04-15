@@ -1560,35 +1560,30 @@ def test_handle_prepare_script_compile_preflight_failure_does_not_enqueue_execut
         return uuid.uuid4()
 
     async def fake_create_gate_for_task(**kwargs):
-        raise AssertionError("pre-deploy gate should not be created after compile preflight failure")
+        captured["gate"] = kwargs
+        return FakeGate(
+            id=uuid.uuid4(),
+            pipeline_run_id=uuid.UUID(kwargs["pipeline_run_id"]),
+            pipeline_task_id=kwargs["task"].id,
+            gate_type="override",
+        )
 
-    async def fake_next_task_payload(*args, **kwargs):
-        return {
-            "assigned_to": kwargs["assigned_to"],
-            "task_type": kwargs["task_type"],
-            "description": kwargs["description"],
-            "parent_task_id": str(task.id),
-            "sequence_index": 0,
-            "artifact_revision": kwargs["artifact_revision"],
-            "retry_budget_key": "deployment.prepare",
-            "retry_attempt": 1,
-            "status": kwargs.get("status", "pending"),
-            "gate_id": kwargs.get("gate_id"),
-            "context": kwargs["context"],
+    async def fake_update_pipeline_task(session, task_id, **fields):
+        captured["task_update"] = {
+            "task_id": task_id,
+            **fields,
         }
-
-    async def fake_finalize_direct_task(**kwargs):
-        captured["finalize"] = kwargs
+        return SimpleNamespace(id=task_id, **fields)
 
     monkeypatch.setattr(
         orchestrator,
         "save_deploy_artifact",
         SimpleNamespace(func=fake_save_artifact),
     )
+    monkeypatch.setattr(orchestrator, "async_session_factory", lambda: DummySessionManager())
     monkeypatch.setattr(orchestrator, "_record_pipeline_evaluation", fake_record_pipeline_evaluation)
     monkeypatch.setattr(orchestrator, "_create_gate_for_task", fake_create_gate_for_task)
-    monkeypatch.setattr(orchestrator, "_next_task_payload", fake_next_task_payload)
-    monkeypatch.setattr(orchestrator, "_finalize_direct_task", fake_finalize_direct_task)
+    monkeypatch.setattr(orchestrator, "update_pipeline_task", fake_update_pipeline_task)
 
     events = asyncio.run(
         orchestrator._handle_prepare_script(
@@ -1606,9 +1601,199 @@ def test_handle_prepare_script_compile_preflight_failure_does_not_enqueue_execut
         captured["evaluation"]["details"]["compile_preflight"]["stderr"]
         .startswith("Error: Undeclared identifier.")
     )
-    assert captured["finalize"]["task_status"] == "failed"
-    assert captured["finalize"]["next_tasks"][0]["task_type"] == "deployment.prepare_script"
-    assert captured["finalize"]["next_tasks"][0]["task_type"] != "deployment.execute_deploy"
+    assert captured["gate"]["gate_type"] == "override"
+    assert captured["task_update"]["status"] == "waiting_for_approval"
+    assert captured["task_update"]["failure_class"] == "human_gate"
+    assert captured["task_update"]["result_summary"] == captured["evaluation"]["summary"]
+
+
+def test_handle_prepare_script_pauses_for_unresolved_post_deploy_inputs(monkeypatch):
+    captured: dict[str, object] = {"generated": False}
+    manifest = load_deployment_manifest(
+        {
+            "deployment_target": default_deployment_target_payload(),
+            "contracts": [
+                {
+                    "plan_contract_id": "pc_publish",
+                    "name": "PublishingEditions1155",
+                    "role": "primary_deployable",
+                    "deploy_order": 1,
+                    "source_path": "contracts/PublishingEditions1155.sol",
+                    "constructor_args_schema": [],
+                }
+            ],
+            "post_deploy_calls": [
+                {
+                    "target_contract_name": "PublishingEditions1155",
+                    "target_plan_contract_id": "pc_publish",
+                    "function_name": "createEdition",
+                    "args": ["1", "pass:supporter", "TBD", "TBD"],
+                    "call_order": 1,
+                    "description": "Create supporter pass",
+                }
+            ],
+        }
+    )
+
+    class MinimalMemoryManager:
+        def __init__(self, user_id: str, project_id: str):
+            self.user_id = user_id
+            self.project_id = project_id
+
+        def get_agent_state(self, agent_name: str) -> dict:
+            if agent_name == "planning":
+                return {
+                    "plan_summary": {
+                        "project_name": "Publishing",
+                        "plan_contracts": [
+                            {
+                                "plan_contract_id": "pc_publish",
+                                "name": "PublishingEditions1155",
+                                "deployment_role": "primary_deployable",
+                                "deploy_order": 1,
+                            }
+                        ],
+                    }
+                }
+            return {"artifacts": []}
+
+        def get_plan(self) -> dict:
+            return {
+                "project_name": "Publishing",
+                "contracts": [
+                    {
+                        "plan_contract_id": "pc_publish",
+                        "name": "PublishingEditions1155",
+                        "functions": [
+                            {
+                                "name": "createEdition",
+                                "inputs": [
+                                    {"name": "tokenId", "type": "uint256"},
+                                    {"name": "key", "type": "string"},
+                                    {"name": "maxSupply", "type": "uint256"},
+                                    {"name": "uri", "type": "string"},
+                                ],
+                            }
+                        ],
+                    }
+                ],
+            }
+
+    task = FakeTask(
+        id=uuid.uuid4(),
+        pipeline_run_id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        assigned_to="deployment",
+        created_by="testing",
+        task_type="deployment.prepare_script",
+        description="Prepare deployment script",
+        status="in_progress",
+        context={},
+        artifact_revision=3,
+    )
+
+    async def fake_record_pipeline_evaluation(**kwargs):
+        captured["evaluation"] = kwargs["evaluation"]
+        return uuid.uuid4()
+
+    async def fake_create_gate_for_task(**kwargs):
+        captured["gate"] = kwargs
+        return FakeGate(
+            id=uuid.uuid4(),
+            pipeline_run_id=uuid.UUID(kwargs["pipeline_run_id"]),
+            pipeline_task_id=kwargs["task"].id,
+            gate_type="override",
+        )
+
+    async def fake_update_pipeline_task(session, task_id, **fields):
+        captured["task_update"] = {"task_id": task_id, **fields}
+        return SimpleNamespace(id=task_id, **fields)
+
+    def fake_generate(request):
+        captured["generated"] = True
+        return {"generated_script": "// should not run"}
+
+    monkeypatch.setattr(orchestrator, "MemoryManager", MinimalMemoryManager)
+    monkeypatch.setattr(orchestrator, "load_saved_manifest", lambda project_id: (manifest, None))
+    monkeypatch.setattr(orchestrator, "generate_foundry_deploy_script_direct", fake_generate)
+    monkeypatch.setattr(orchestrator, "_record_pipeline_evaluation", fake_record_pipeline_evaluation)
+    monkeypatch.setattr(orchestrator, "_create_gate_for_task", fake_create_gate_for_task)
+    monkeypatch.setattr(orchestrator, "async_session_factory", lambda: DummySessionManager())
+    monkeypatch.setattr(orchestrator, "update_pipeline_task", fake_update_pipeline_task)
+
+    events = asyncio.run(
+        orchestrator._handle_prepare_script(
+            task,
+            project_id=str(task.project_id),
+            user_id=str(uuid.uuid4()),
+            pipeline_run_id=str(task.pipeline_run_id),
+        )
+    )
+
+    assert events == [
+        {
+            "type": "tool_call",
+            "stage": "deployment",
+            "tool": "generate_foundry_deploy_script_direct",
+            "args": "{}",
+        }
+    ]
+    assert captured["generated"] is False
+    assert captured["evaluation"]["status"] == "failed"
+    assert "unresolved post-deploy inputs" in captured["evaluation"]["summary"]
+    assert any(
+        "arg 2" in note and '"pass:supporter"' in note
+        for note in captured["evaluation"]["details"]["remediations"]
+    )
+    assert any(
+        "arg 3" in issue and "unresolved value 'TBD'" in issue
+        for issue in captured["evaluation"]["details"]["issues"]
+    )
+    assert captured["gate"]["gate_type"] == "override"
+    assert captured["task_update"]["status"] == "waiting_for_approval"
+    assert captured["task_update"]["failure_class"] == "human_gate"
+
+
+def test_next_task_payload_increments_same_retry_key_even_if_db_attempt_is_stale(monkeypatch):
+    task = FakeTask(
+        id=uuid.uuid4(),
+        pipeline_run_id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        assigned_to="deployment",
+        created_by="testing",
+        task_type="deployment.prepare_script",
+        description="Prepare deployment script",
+        status="in_progress",
+        context={},
+        artifact_revision=3,
+        retry_budget_key="deployment.prepare",
+        retry_attempt=0,
+    )
+
+    monkeypatch.setattr(orchestrator, "async_session_factory", lambda: DummySessionManager())
+
+    async def fake_get_next_retry_attempt(session, pipeline_run_id, retry_budget_key):
+        return 0
+
+    monkeypatch.setattr(orchestrator, "get_next_retry_attempt", fake_get_next_retry_attempt)
+
+    payload = asyncio.run(
+        orchestrator._next_task_payload(
+            str(task.pipeline_run_id),
+            task,
+            assigned_to="deployment",
+            task_type="deployment.prepare_script",
+            description="Retry prepare script",
+            context=None,
+            artifact_revision=task.artifact_revision,
+            task_status="failed",
+            result_summary="compile preflight failed",
+            failure_class="evaluation_failed",
+        )
+    )
+
+    assert payload["retry_budget_key"] == "deployment.prepare"
+    assert payload["retry_attempt"] == 1
 
 
 def test_handle_execute_deploy_records_multi_contract_results(monkeypatch):

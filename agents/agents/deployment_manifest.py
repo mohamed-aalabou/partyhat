@@ -17,6 +17,346 @@ from schemas.deployment_schema import (
 MANIFEST_PATH = "manifests/deployment.json"
 _DEPLOYED_TOKEN_PATTERN = re.compile(r"<deployed:(?P<name>[A-Za-z_][A-Za-z0-9_]*)\.address>")
 _ANY_DEPLOYED_TOKEN_PATTERN = re.compile(r"<deployed:[^>]+>")
+_HEX_ADDRESS_PATTERN = re.compile(r"^0x[a-fA-F0-9]{40}$")
+_QUOTED_STRING_PATTERN = re.compile(r"""^(['"]).*\1$""", re.DOTALL)
+_UNSIGNED_NUMERIC_PATTERN = re.compile(
+    r"^(?:0|[1-9][0-9_]*)(?:\s+(?:wei|gwei|szabo|finney|ether|seconds|minutes|hours|days|weeks))?$"
+)
+_SIGNED_NUMERIC_PATTERN = re.compile(
+    r"^-?(?:0|[1-9][0-9_]*)(?:\s+(?:wei|gwei|szabo|finney|ether|seconds|minutes|hours|days|weeks))?$"
+)
+_UNRESOLVED_DEPLOY_ARG_TOKENS = {
+    "tbd",
+    "todo",
+    "replace_me",
+    "replace-me",
+    "changeme",
+    "change_me",
+    "unknown",
+}
+
+
+def _field(value: Any, key: str, default: Any = None) -> Any:
+    if isinstance(value, dict):
+        return value.get(key, default)
+    return getattr(value, key, default)
+
+
+def _string_field(value: Any, key: str) -> str:
+    return str(_field(value, key, "") or "").strip()
+
+
+def _plan_contracts(plan: Any) -> list[Any]:
+    contracts = _field(plan, "contracts", []) or []
+    return list(contracts)
+
+
+def _plan_post_deploy_calls(plan: Any) -> list[Any]:
+    calls = _field(plan, "post_deploy_calls", []) or []
+    return list(calls)
+
+
+def _call_arg_strings(call: Any) -> tuple[list[str], list[str]]:
+    issues: list[str] = []
+    args: list[str] = []
+    for index, arg in enumerate(_field(call, "args", []) or [], start=1):
+        if isinstance(arg, bool):
+            args.append("true" if arg else "false")
+        elif isinstance(arg, (str, int, float)):
+            args.append(str(arg))
+        else:
+            issues.append(
+                f"post_deploy_calls arg {index} must be a scalar string/number/bool literal."
+            )
+    return args, issues
+
+
+def _is_quoted_string_literal(value: str) -> bool:
+    return _QUOTED_STRING_PATTERN.fullmatch(value.strip()) is not None
+
+
+def _is_unresolved_deploy_arg(value: str) -> bool:
+    normalized = value.strip().lower()
+    return normalized in _UNRESOLVED_DEPLOY_ARG_TOKENS
+
+
+def _is_bool_literal(value: str) -> bool:
+    return value.strip().lower() in {"true", "false"}
+
+
+def _is_numeric_literal(value: str, *, signed: bool) -> bool:
+    pattern = _SIGNED_NUMERIC_PATTERN if signed else _UNSIGNED_NUMERIC_PATTERN
+    return pattern.fullmatch(value.strip()) is not None
+
+
+def _function_inputs_for_post_deploy_call(
+    plan: Any,
+    *,
+    target_contract_name: str,
+    function_name: str,
+    arg_count: int,
+    context: str,
+    strict: bool = True,
+) -> tuple[list[str] | None, list[str]]:
+    issues: list[str] = []
+    target_contract = next(
+        (
+            contract
+            for contract in _plan_contracts(plan)
+            if _string_field(contract, "name") == target_contract_name
+        ),
+        None,
+    )
+    if target_contract is None:
+        return None, issues
+
+    matching_functions = [
+        function
+        for function in (_field(target_contract, "functions", []) or [])
+        if _string_field(function, "name") == function_name
+    ]
+    if not matching_functions:
+        if not strict:
+            return None, issues
+        issues.append(
+            f"{context} references unknown function '{target_contract_name}.{function_name}'."
+        )
+        return None, issues
+
+    exact_match = next(
+        (
+            function
+            for function in matching_functions
+            if len(_field(function, "inputs", []) or []) == arg_count
+        ),
+        None,
+    )
+    selected = exact_match or matching_functions[0]
+    input_types = [
+        _string_field(item, "type")
+        for item in (_field(selected, "inputs", []) or [])
+    ]
+    if len(input_types) != arg_count:
+        if len(matching_functions) == 1:
+            issues.append(
+                f"{context} expects {len(input_types)} arg(s) for "
+                f"'{target_contract_name}.{function_name}' but got {arg_count}."
+            )
+        else:
+            counts = ", ".join(
+                str(len(_field(function, "inputs", []) or []))
+                for function in matching_functions
+            )
+            issues.append(
+                f"{context} has no overload for '{target_contract_name}.{function_name}' "
+                f"accepting {arg_count} arg(s). Available counts: {counts}."
+            )
+    return input_types, issues
+
+
+def _typed_post_deploy_arg_issues(
+    value: str,
+    *,
+    expected_type: str,
+    context: str,
+    known_contract_names: set[str],
+) -> list[str]:
+    issues = validate_deployed_placeholders(
+        value,
+        context=context,
+        known_contract_names=known_contract_names,
+    )
+    if issues:
+        return issues
+
+    literal = value.strip()
+    if not literal:
+        return [f"{context} must not be empty."]
+    if _is_unresolved_deploy_arg(literal):
+        return [f"{context} contains unresolved value '{literal}'."]
+
+    lowered_type = expected_type.strip().lower()
+    if lowered_type == "string":
+        if _is_quoted_string_literal(literal):
+            return []
+        return [f"{context} must be a quoted string literal for Solidity type 'string'."]
+
+    if lowered_type == "bool":
+        if _is_bool_literal(literal):
+            return []
+        return [f"{context} must be 'true' or 'false' for Solidity type 'bool'."]
+
+    if lowered_type == "address":
+        if literal == "deployer":
+            return []
+        if _HEX_ADDRESS_PATTERN.fullmatch(literal):
+            return []
+        if _DEPLOYED_TOKEN_PATTERN.fullmatch(literal):
+            return []
+        return [
+            f"{context} must be 'deployer', a 0x-prefixed address, or "
+            "<deployed:Contract.address> for Solidity type 'address'."
+        ]
+
+    if lowered_type.startswith("uint"):
+        if _is_numeric_literal(literal, signed=False):
+            return []
+        return [f"{context} must be a numeric literal for Solidity type '{expected_type}'."]
+
+    if lowered_type.startswith("int"):
+        if _is_numeric_literal(literal, signed=True):
+            return []
+        return [f"{context} must be a numeric literal for Solidity type '{expected_type}'."]
+
+    return [
+        f"{context} uses unsupported Solidity type '{expected_type}' for post-deploy arg validation."
+    ]
+
+
+def validate_post_deploy_calls(plan: Any) -> list[str]:
+    issues: list[str] = []
+    known_contract_names = {
+        _string_field(contract, "name")
+        for contract in _plan_contracts(plan)
+        if _string_field(contract, "name")
+    }
+    seen_call_orders: set[int] = set()
+
+    for index, call in enumerate(_plan_post_deploy_calls(plan), start=1):
+        target_contract_name = _string_field(call, "target_contract_name")
+        function_name = _string_field(call, "function_name")
+        context = f"post_deploy_calls[{index}]"
+        args, arg_issues = _call_arg_strings(call)
+        issues.extend(f"{context} {issue}" for issue in arg_issues)
+
+        if not target_contract_name:
+            issues.append(f"{context} is missing target_contract_name.")
+        elif target_contract_name not in known_contract_names:
+            issues.append(
+                f"{context} references unknown target_contract_name '{target_contract_name}'."
+            )
+
+        if not function_name:
+            issues.append(f"{context} is missing function_name.")
+
+        call_order = _field(call, "call_order")
+        if call_order is None:
+            issues.append(f"{context} is missing call_order.")
+        else:
+            try:
+                normalized_order = int(call_order)
+            except (TypeError, ValueError):
+                issues.append(f"{context} has non-integer call_order '{call_order}'.")
+            else:
+                if normalized_order in seen_call_orders:
+                    issues.append(
+                        f"Duplicate post_deploy_calls call_order {normalized_order}."
+                    )
+                seen_call_orders.add(normalized_order)
+
+        if not target_contract_name or not function_name:
+            continue
+
+        input_types, lookup_issues = _function_inputs_for_post_deploy_call(
+            plan,
+            target_contract_name=target_contract_name,
+            function_name=function_name,
+            arg_count=len(args),
+            context=context,
+        )
+        issues.extend(lookup_issues)
+        if not input_types:
+            continue
+
+        for arg_index, arg in enumerate(args, start=1):
+            expected_type = (
+                input_types[arg_index - 1]
+                if arg_index - 1 < len(input_types)
+                else ""
+            )
+            if not expected_type:
+                continue
+            issues.extend(
+                _typed_post_deploy_arg_issues(
+                    arg,
+                    expected_type=expected_type,
+                    context=(
+                        f"{context} arg {arg_index} for "
+                        f"{target_contract_name}.{function_name}"
+                    ),
+                    known_contract_names=known_contract_names,
+                )
+            )
+    return issues
+
+
+def remediate_manifest_post_deploy_calls(
+    plan: Any,
+    manifest: DeploymentManifest,
+) -> tuple[DeploymentManifest, list[str], list[str], bool]:
+    remediated = manifest.model_copy(deep=True)
+    known_contract_names = {contract.name for contract in remediated.contracts}
+    notes: list[str] = []
+    issues: list[str] = []
+    changed = False
+
+    for index, call in enumerate(remediated.post_deploy_calls, start=1):
+        context = f"post_deploy_calls[{index}]"
+        input_types, lookup_issues = _function_inputs_for_post_deploy_call(
+            plan,
+            target_contract_name=call.target_contract_name,
+            function_name=call.function_name,
+            arg_count=len(call.args),
+            context=context,
+            strict=False,
+        )
+        issues.extend(lookup_issues)
+        if not input_types:
+            continue
+
+        normalized_args: list[str] = []
+        for arg_index, arg in enumerate(call.args, start=1):
+            expected_type = (
+                input_types[arg_index - 1]
+                if arg_index - 1 < len(input_types)
+                else ""
+            )
+            literal = str(arg or "").strip()
+            arg_context = (
+                f"{context} arg {arg_index} for "
+                f"{call.target_contract_name}.{call.function_name}"
+            )
+            updated_literal = literal
+
+            if expected_type.strip().lower() == "string":
+                placeholder_issues = validate_deployed_placeholders(
+                    literal,
+                    context=arg_context,
+                    known_contract_names=known_contract_names,
+                )
+                if (
+                    literal
+                    and not placeholder_issues
+                    and not _is_unresolved_deploy_arg(literal)
+                    and not _is_quoted_string_literal(literal)
+                ):
+                    updated_literal = json.dumps(literal)
+                    changed = True
+                    notes.append(f"{arg_context} was normalized to {updated_literal}.")
+
+            normalized_args.append(updated_literal)
+            issues.extend(
+                _typed_post_deploy_arg_issues(
+                    updated_literal,
+                    expected_type=expected_type,
+                    context=arg_context,
+                    known_contract_names=known_contract_names,
+                )
+            )
+
+        call.args = normalized_args
+
+    return remediated, notes, issues, changed
 
 
 def _contract_artifact_lookup(
@@ -142,64 +482,25 @@ def _build_post_deploy_calls(
     plan: dict[str, Any],
     manifest_contracts: list[DeploymentManifestContract],
 ) -> tuple[list[DeploymentManifestPostDeployCall], list[str]]:
-    issues: list[str] = []
+    issues: list[str] = list(validate_post_deploy_calls(plan))
     calls: list[DeploymentManifestPostDeployCall] = []
     contracts_by_name = {contract.name: contract for contract in manifest_contracts}
-    known_names = set(contracts_by_name)
-    seen_orders: set[int] = set()
 
     for index, entry in enumerate(plan.get("post_deploy_calls") or [], start=1):
         if not isinstance(entry, dict):
-            issues.append(f"post_deploy_calls[{index}] must be an object.")
             continue
 
         target_contract_name = str(entry.get("target_contract_name") or "").strip()
         function_name = str(entry.get("function_name") or "").strip()
         description = str(entry.get("description") or "").strip()
         call_order = entry.get("call_order")
-        raw_args = entry.get("args") or []
-        args = [str(arg) for arg in raw_args if isinstance(arg, (str, int, float))]
-
-        if not target_contract_name:
-            issues.append(f"post_deploy_calls[{index}] is missing target_contract_name.")
-        if not function_name:
-            issues.append(f"post_deploy_calls[{index}] is missing function_name.")
-        if call_order is None:
-            issues.append(
-                f"post_deploy_calls[{index}] is missing call_order."
-            )
-        else:
-            try:
-                call_order = int(call_order)
-            except (TypeError, ValueError):
-                issues.append(
-                    f"post_deploy_calls[{index}] has non-integer call_order '{call_order}'."
-                )
-                call_order = None
-        if call_order is not None:
-            if call_order in seen_orders:
-                issues.append(f"Duplicate post_deploy_calls call_order {call_order}.")
-            seen_orders.add(call_order)
+        args, _ = _call_arg_strings(entry)
+        try:
+            call_order = int(call_order)
+        except (TypeError, ValueError):
+            call_order = None
 
         target_contract = contracts_by_name.get(target_contract_name)
-        if target_contract is None and target_contract_name:
-            issues.append(
-                f"post_deploy_calls[{index}] references unknown target contract '{target_contract_name}'."
-            )
-
-        for arg_index, arg in enumerate(args, start=1):
-            context = (
-                f"post_deploy_calls[{index}] arg {arg_index} for "
-                f"{target_contract_name or '<unknown>'}.{function_name or '<unknown>'}"
-            )
-            issues.extend(
-                validate_deployed_placeholders(
-                    arg,
-                    context=context,
-                    known_contract_names=known_names,
-                )
-            )
-
         if (
             target_contract is not None
             and target_contract_name
